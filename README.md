@@ -69,8 +69,9 @@ buttonpanel Shortcuts add cootmode command "cootmode"
 buttonpanel Shortcuts add mark_cofr command "marker #10000 position cofr"
 buttonpanel Shortcuts add hidemaps command "hidemaps"
 buttonpanel Shortcuts add showmaps command "showmaps"
+```
 
-Thw first line will create a 3x4 panel of buttons that may be docked to a position of your choosing (I prefer the upper right), with useful shortcuts. I prefer to operate ChimeraX with all panels undocked by default, as I find this is the best way to make use of screen real estate on a laptop (which is how I mostly work). So I have a button panel that allows me to quickly access the volume viewer, model panel and log, as well as other shortcuts that I find useful to have on hand. Here is what this looks like in practice:
+The first line will create a 3x4 panel of buttons that may be docked to a position of your choosing (I prefer the upper right), with useful shortcuts. I prefer to operate ChimeraX with all panels undocked by default, as I find this is the best way to make use of screen real estate on a laptop (which is how I mostly work). So I have a button panel that allows me to quickly access the volume viewer, model panel and log, as well as other shortcuts that I find useful to have on hand. Here is what this looks like in practice:
 <img width="1624" alt="image" src="https://github.com/olibclarke/chimeras-trimmings/assets/19766818/7f8f578a-48a3-4474-9526-72da8e7a4472">
 
 And here is what it looks like in action:
