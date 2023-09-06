@@ -1,5 +1,5 @@
 # chimerax-trimmings
-Useful aliases and startup settings for UCSF ChimeraX [https://www.cgl.ucsf.edu/chimerax/]. Add these to the "Startup" section of the "Preferences" pane and restart ChimeraX in order to have them take effect. Note that some of these will only work with the daily build. I would also recommend (if you are using a laptop) going through each tool in the "Tools" menu, launching it, right clicking on the relevant window and **unchecking** "Dockable tool" - this will ensure that each tool acts as a separate window and does not try to "snap" to the main GUI when you move it around, which I find undesirable on smaller screens.
+Useful aliases and startup settings for UCSF ChimeraX \(https://www.cgl.ucsf.edu/chimerax/). Add these to the "Startup" section of the "Preferences" pane and restart ChimeraX in order to have them take effect. Note that some of these will only work with the daily build. I would also recommend (if you are using a laptop) going through each tool in the "Tools" menu, launching it, right clicking on the relevant window and **unchecking** "Dockable tool" - this will ensure that each tool acts as a separate window and does not try to "snap" to the main GUI when you move it around, which I find undesirable on smaller screens.
 
 Here is my current startup section for ChimeraX, broken down with descriptions of each section:
 
