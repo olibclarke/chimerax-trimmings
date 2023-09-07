@@ -67,6 +67,12 @@ alias showmaps surface unzone ##~num_residues
 `hidemaps` and `showmaps` allow quick toggling of the display of the current maps, in order to view or interact with the atomic model underneath. Most useful bound to buttons (see below)
 
 ```
+alias caps_off surface cap false
+alias caps_on suface cap true
+```
+I like having aliases to quickly switch surface caps on and off, as displaying caps can be useful for figures, but dramatically slows down rotation/translation of large maps (especially with `full` lighting).
+
+```
 alias selbetween ks ri
 ```
 Selects all residues (inclusive) between the selected residues. Temporary I think (until this is officially added as a selection mode in ChimeraX).
