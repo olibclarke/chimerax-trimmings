@@ -42,6 +42,12 @@ alias cootmode_mesh surface cap false; surface style mesh; lighting flat; graphi
 `cootmode` and `cootmode_mesh` give what I find to be pleasing and performant settings for inspecting atomic models in the context of density maps. By default, hydrogens are not displayed, as I find them irritating under most circumstances.
 
 ```
+alias ca_and_sidechains ~rib $1; ~surf $1; ~disp $1; disp @CA&protein&$1; disp @P&nucleic&$1; style $1 stick; disp sidechain&$1; disp ~backbone&nucleic&$1; size stickradius 0.1; size pseudobondradius 0.1
+alias ca_trace ~rib $1; ~surf $1; ~disp $1; disp @CA&protein&$1; disp @P&nucleic&$1; style $1 stick; size stickradius 0.1; size pseudobondradius 0.1
+```
+`ca_and_sidechains` will display the selected model (executed as e.g. `ca_and_sidechains #1`) as a C-alpha (or phosphate for nucleic acids) backbone with attached sidechains/bases. `ca_trace` will do the same, just without the sidechains/bases.
+
+```
 alias map_sphere_15 surface unzone ##~num_residues; sel; close #10000; marker #10000 position cofr; sel ~sel; surface zone ##~num_residues nearAtoms sel distance 15; close #10000
 alias map_unsphere surface unzone ##~num_residues
 ```
