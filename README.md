@@ -20,7 +20,9 @@ mousemode right clip
 mousemode alt right contour
 mousemode alt left "move picked models"
 ```
-These make some alterations to the mouse modes, setting right-mouse-click-drag to move the front clip plane (shift-right-mouse-click-drag will move both clip planes in the same direction), setting alt-right-mouse-click-drag to adjust the contour level of the currently displayed map, and setting alt/option-left-click-drag to reposition the picked/selected model.
+These make some alterations to the mouse modes, setting right-mouse-click-drag to move the front clip plane (shift-right-mouse-click-drag will move both clip planes in the same direction), setting alt-right-mouse-click-drag to adjust the contour level of the currently displayed map, and setting alt/option-left-click-drag to reposition the picked/selected model. 
+
+I would also suggest enabling "Mouse clipping enables screen planes" in the "clipping" section of preferences, rather than the default of altering scene planes, which in my experience can lead to unexpected results.
 
 
 **Aliases**
