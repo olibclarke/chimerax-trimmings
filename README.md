@@ -13,6 +13,7 @@ volume defaultvalues limitVoxelCount false voxelLimitForPlane 1000000000000000 v
 ```
 `camera ortho` sets the default camera mode to orthographic (which I prefer to perspective, and which allows for accurate scale bars). `cofr centerofview` sets the center of rotation midway between the two clip planes (`near` and `far`). The last line sets some defaults for displaying new volumes (this currently ony works in the daily build), setting the default step to 1 and switching off plane display of large volumes.
 
+
 **Mouse mode settings**
 ```
 mousemode right clip
@@ -20,6 +21,7 @@ mousemode alt right contour
 mousemode alt left "move picked models"
 ```
 These make some alterations to the mouse modes, setting right-mouse-click-drag to move the front clip plane (shift-right-mouse-click-drag will move both clip planes in the same direction), setting alt-right-mouse-click-drag to adjust the contour level of the currently displayed map, and setting alt/option-left-click-drag to reposition the picked/selected model.
+
 
 **Aliases**
 ```
@@ -55,6 +57,7 @@ alias hidemaps surface unzone ##~num_residues; sel; close #10000; marker #10000 
 alias showmaps surface unzone ##~num_residues
 ```
 `hidemaps` and `showmaps` allow quick toggling of the display of the current maps, in order to view or interact with the atomic model underneath. Most useful bound to buttons (see below)
+
 
 **Shortcut buttons**
 ```
