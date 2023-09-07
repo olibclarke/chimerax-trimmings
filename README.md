@@ -68,7 +68,7 @@ alias showmaps surface unzone ##~num_residues
 
 ```
 alias caps_off surface cap false
-alias caps_on suface cap true
+alias caps_on surface cap true
 ```
 I like having aliases to quickly switch surface caps on and off, as displaying caps can be useful for figures, but dramatically slows down rotation/translation of large maps (especially with `full` lighting).
 
