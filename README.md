@@ -36,8 +36,8 @@ alias symclip cofr centerofview; clip near -$1 far $1 position cofr
 `symclip` sets the near and far clip planes symmetrically with respect to the center of rotation. So `symclip 5` would set the near clip plane 5 Å from the CoFR, and the far clip plane 5Å in the other direction, giving a 10 Å slab.
 
 ```
-alias cootmode surface cap false; surface style solid; lighting flat; graphics silhouettes false; style stick; ~rib; color ##num_residues gold; color byhet ; disp;  ~disp @H*; style solvent ball; size ballscale 0.1;  size stickradius 0.07; transparency 70; symclip 10; color ##~num_residues cornflower blue
-alias cootmode_mesh surface cap false; surface style mesh; lighting flat; graphics silhouettes false; style stick; ~rib; color ##num_residues gold; color byhet ; disp;  ~disp @H*; style solvent ball; size ballscale 0.1;  size stickradius 0.07; symclip 10; color ##~num_residues #3d60ffff; transparency 50;
+alias cootmode surface cap false; surface style solid; lighting flat; graphics silhouettes false; style stick; ~rib; color ##num_residues gold; color byhet ; disp;  ~disp @H*; style solvent ball; size ballscale 0.1;  size stickradius 0.07; transparency 70; cofr centerofview; clip near -10 far 10 position cofr; color ##~num_residues cornflower blue
+alias cootmode_mesh surface cap false; surface style mesh; lighting flat; graphics silhouettes false; style stick; ~rib; color ##num_residues gold; color byhet ; disp;  ~disp @H*; style solvent ball; size ballscale 0.1;  size stickradius 0.07; cofr centerofview; clip near -10 far 10 position cofr; color ##~num_residues #3d60ffff; transparency 50
 ```
 `cootmode` and `cootmode_mesh` give what I find to be pleasing and performant settings for inspecting atomic models in the context of density maps. By default, hydrogens are not displayed, as I find them irritating under most circumstances.
 
