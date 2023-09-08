@@ -18,11 +18,12 @@ volume defaultvalues limitVoxelCount false voxelLimitForPlane 1000000000000000 v
 ```
 mousemode right clip
 mousemode alt right contour
-mousemode alt left "move picked models"
+mousemode alt left "translate selected models"
+mousemode shift left "rotate selected models"
 ```
-These make some alterations to the mouse modes, setting right-mouse-click-drag to move the front clip plane (shift-right-mouse-click-drag will move both clip planes in the same direction), setting alt-right-mouse-click-drag to adjust the contour level of the currently displayed map, and setting alt/option-left-click-drag to reposition the picked/selected model. 
+These make some alterations to the mouse modes, setting right-mouse-click-drag to move the front clip plane (shift-right-mouse-click-drag will move both clip planes in the same direction), setting alt-right-mouse-click-drag to adjust the contour level of the currently displayed map, and setting alt/option-left-click-drag to reposition the _selected_ model(s) (shift+alt/option-left-click-drag will rotate the _selected_ model(s)). 
 
-I would also suggest enabling "Mouse clipping enables screen planes" in the "clipping" section of preferences, rather than the default of altering scene planes, which in my experience can lead to unexpected results.
+I would also suggest enabling "Mouse clipping enables _screen planes_" in the "clipping" section of preferences, rather than the default of altering _scene planes_, which in my experience can lead to unexpected results.
 
 
 **Aliases**
