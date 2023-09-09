@@ -21,7 +21,19 @@ mousemode alt right contour
 mousemode alt left "translate selected models"
 mousemode shift left "rotate selected models"
 ```
-These make some alterations to the mouse modes, setting right-mouse-click-drag to move the front clip plane (shift-right-mouse-click-drag will move both clip planes in the same direction), setting alt-right-mouse-click-drag to adjust the contour level of the currently displayed map, and setting alt/option-left-click-drag to reposition the _selected_ model(s) (shift+alt/option-left-click-drag will rotate the _selected_ model(s)). 
+These make some alterations to the mouse modes:
+
+Right-click-drag: Moves front clip plane
+
+**Shift**-right-click-drag: Moves both clip planes
+
+**Alt/option**-right-click-drag: Adjusts map threshold
+
+**Alt/option**-left-click-drag: Translates the _selected_ model(s) in x-y plane
+
+**Ctrl+Alt/option**-left-click-drag: Translates the _selected_ model(s) along z axis (in and out of screen) (_Only in daily builds Sept 8 & later_)
+
+**Shift+Alt/option**-left-click-drag: Rotates the _selected_ model(s)
 
 I would also suggest enabling "Mouse clipping enables _screen planes_" in the "clipping" section of preferences, rather than the default of altering _scene planes_, which in my experience can lead to unexpected results.
 
