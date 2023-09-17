@@ -90,6 +90,12 @@ alias selbetween ks ri
 ```
 Selects all residues (inclusive) between the selected residues. Temporary I think (until this is officially added as a selection mode in ChimeraX).
 
+```
+alias helix setattr $1 res is_helix true
+alias strand setattr $1 res is_strand true
+alias coil setattr $1 res is_strand false; setattr $1 res is_helix false
+```
+Aliases for changing secondary structure assignment by selection. For example, `helix sel` will set the selected residues as helical, even if they were automatically assigned as strand or coil. Use with caution, and always check _why_ the automated assignment is failing.
 
 **Shortcut buttons**
 ```
