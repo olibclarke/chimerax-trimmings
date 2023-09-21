@@ -20,6 +20,7 @@ mousemode right clip
 mousemode alt right contour
 mousemode alt left "translate selected models"
 mousemode shift left "rotate selected models"
+mousemode alt control left "pick blobs"
 ```
 These make some alterations to the mouse modes:
 
@@ -34,6 +35,8 @@ Right-click-drag: Moves front clip plane
 **Ctrl+Alt/option**-left-click-drag: Translates the _selected_ model(s) along z axis (in and out of screen) (_Only in daily builds Sept 8 & later_)
 
 **Shift+Alt/option**-left-click-drag: Rotates the _selected_ model(s)
+
+**Ctrl+Alt**-left-click: Picks & colors clicked blob (launches "Measure and Color Blobs" tool.
 
 I would also suggest enabling "Mouse clipping enables _screen planes_" in the "clipping" section of preferences, rather than the default of altering _scene planes_, which in my experience can lead to unexpected results.
 
