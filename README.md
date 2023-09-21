@@ -36,7 +36,7 @@ Right-click-drag: Moves front clip plane
 
 **Shift+Alt/option**-left-click-drag: Rotates the _selected_ model(s)
 
-**Ctrl+Alt**-left-click: Picks & colors clicked blob (launches "Measure and Color Blobs" tool.
+**Ctrl+Alt**-left-click: Picks & colors clicked blob (launches "Measure and Color Blobs" tool).
 
 I would also suggest enabling "Mouse clipping enables _screen planes_" in the "clipping" section of preferences, rather than the default of altering _scene planes_, which in my experience can lead to unexpected results.
 
