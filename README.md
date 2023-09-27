@@ -102,6 +102,11 @@ alias coil setattr $1 res is_strand false; setattr $1 res is_helix false
 ```
 Aliases for changing secondary structure assignment by selection. For example, `helix sel` will set the selected residues as helical, even if they were automatically assigned as strand or coil. Use with caution, and always check _why_ the automated assignment is failing.
 
+```
+alias rock_movie cofr showpivot false; movie record; rock y 30; wait 136; movie encode ~/Desktop/rock_movie.mp4; stop
+```
+Makes a simple rocking movie, which can be seamlessly looped, e.g. for use in a presentation to show map/model fit. Hides center of rotation indicator if shown.
+
 **Shortcut buttons**
 ```
 buttonpanel Shortcuts rows 3 columns 4
