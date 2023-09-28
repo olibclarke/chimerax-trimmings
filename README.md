@@ -119,7 +119,7 @@ buttonpanel Shortcuts add map_unsphere command "map_unsphere"
 buttonpanel Shortcuts add cofron command "cofron"
 buttonpanel Shortcuts add cofroff command "cofroff"
 buttonpanel Shortcuts add cootmode command "cootmode"
-buttonpanel Shortcuts add mark_cofr command "marker #10000 position cofr"
+buttonpanel Shortcuts add mark_cofr command "marker #20000 position cofr"
 buttonpanel Shortcuts add hidemaps command "hidemaps"
 buttonpanel Shortcuts add showmaps command "showmaps"
 ```
