@@ -105,7 +105,12 @@ Aliases for changing secondary structure assignment by selection. For example, `
 ```
 alias rock_movie cofr showpivot false; movie record; rock y 30; wait 136; movie encode ~/Desktop/rock_movie.mp4; stop
 ```
-Makes a simple rocking movie, which can be seamlessly looped, e.g. for use in a presentation to show map/model fit. Hides center of rotation indicator if shown.  
+Makes a simple rocking movie, which can be seamlessly looped, e.g. for use in a presentation to show map/model fit. Hides center of rotation indicator if shown.
+
+```
+alias open_vseries "open browse vseries true"
+```
+Creates a volume series using files selected from the file browser GUI.
 
 **Shortcut buttons**
 ```
