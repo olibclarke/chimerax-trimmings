@@ -45,7 +45,7 @@ One other note - certain Mac accessibility settings may interfere with trackpad 
 
 **Aliases**
 ```
-alias cofron cofr centerofview showpivot true
+alias cofron cofr centerofview showpivot 7,0.25
 alias cofroff cofr centerofview showpivot false
 ```
 `cofron` sets the center of rotation midway between the two clip planes, and adds a 3D marker for the center of rotation with orthogonal red, green and blue arrows (where R,G,B=X,Y,Z). `cofroff` does the same thing, but switches off the marker.  
