@@ -32,8 +32,6 @@ Right-click-drag: Moves front clip plane
 
 **Alt/option**-left-click-drag: Translates the _selected_ model(s) in x-y plane
 
-**Ctrl+Alt/option**-left-click-drag: Translates the _selected_ model(s) along z axis (in and out of screen) (_Only in daily builds Sept 8 & later_)
-
 **Shift+Alt/option**-left-click-drag: Rotates the _selected_ model(s)
 
 **Ctrl+Alt**-left-click: Picks & colors clicked blob (launches "Measure and Color Blobs" tool).
