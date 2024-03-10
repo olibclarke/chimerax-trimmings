@@ -6,7 +6,7 @@ Right-click-drag: Moves front clip plane
 
 **Alt/option**-left-click-drag: Translates the selected model(s) in x-y plane
 
-**Ctrl+Alt/option**-left-click-drag: Translates the selected model(s) along z axis (in and out of screen) (Only in daily builds Sept 8 & later)
+**Ctrl+Alt/option**-left-click-drag: Translates the selected model(s) along z axis (in and out of screen) (_Only in daily builds Sept 8 2023 & later_)
 
 **Shift+Alt/option**-left-click-drag: Rotates the selected model(s)
 
