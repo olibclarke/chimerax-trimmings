@@ -54,8 +54,8 @@ alias symclip cofr centerofview; clip near -$1 far $1 position cofr
 `symclip` sets the near and far clip planes symmetrically with respect to the center of rotation. So `symclip 5` would set the near clip plane 5 Å from the CoFR, and the far clip plane 5Å in the other direction, giving a 10 Å slab.  
 
 ```
-alias cootmode set bgColor black; surface cap false; surface style solid; lighting flat; graphics silhouettes false; style stick; ~rib; color ##num_residues gold; color byhet ; disp;  ~disp @H*; style ions ball; style solvent ball; size ballscale 0.2;  size stickradius 0.07; transparency 70; cofr centerofview; clip near -10 far 10 position cofr; color ##~num_residues cornflower blue
-alias cootmode_mesh surface cap false; surface style mesh; lighting flat; graphics silhouettes false; style stick; ~rib; color ##num_residues gold; color byhet ; disp;  ~disp @H*; style solvent ball; style ions ball; size ballscale 0.2;  size stickradius 0.07; cofr centerofview; clip near -10 far 10 position cofr; color ##~num_residues #3d60ffff; transparency 50
+alias cootmode set bgColor black; surface cap false; surface style solid; lighting flat; graphics silhouettes false; style stick; ~rib; color ##num_residues gold; color byhet ; disp;  ~disp @H*; style ions ball; style solvent ball; size ballscale 0.2;  size stickradius 0.07; transparency 70; cofr centerofview; clip near -10 far 10 position cofr; color ~##num_residues cornflower blue
+alias cootmode_mesh surface cap false; surface style mesh; lighting flat; graphics silhouettes false; style stick; ~rib; color ##num_residues gold; color byhet ; disp;  ~disp @H*; style solvent ball; style ions ball; size ballscale 0.2;  size stickradius 0.07; cofr centerofview; clip near -10 far 10 position cofr; color ~##num_residues #3d60ffff; transparency 50
 ```
 `cootmode` and `cootmode_mesh` give what I find to be pleasing and performant settings for inspecting atomic models in the context of density maps. By default, hydrogens are not displayed, as I find them irritating under most circumstances.  
 
@@ -66,8 +66,8 @@ alias ca_trace ~rib $1; ~surf $1; ~disp $1; disp @CA&protein&$1; disp @P&nucleic
 `ca_and_sidechains` will display the selected model (executed as e.g. `ca_and_sidechains #1`) as a C-alpha (or phosphate for nucleic acids) backbone with attached sidechains/bases. `ca_trace` will do the same, just without the sidechains/bases.  
 
 ```
-alias map_sphere_15 volume unzone ##~num_residues; sel; close #10000; marker #10000 position cofr; sel ~sel; volume zone ##~num_residues nearAtoms sel minimalBounds true range 15; close #10000
-alias map_unsphere volume unzone ##~num_residues
+alias map_sphere_15 volume unzone ##~num_residues; sel; close #10000; marker #10000 position cofr; sel ~sel; volume zone ~##num_residues nearAtoms sel minimalBounds true range 15; close #10000
+alias map_unsphere volume unzone ~##num_residues
 ```
 `map_sphere_15` will limit display of all maps to a spherical 15Å zone around the center of rotation.  
 
@@ -77,8 +77,8 @@ alias default_mol_display ~disp; rib; rainbow chain palette RdYlBu-5; lighting s
 A nice default display setting for proteins.  
 
 ```
-alias hidemaps surface unzone ##~num_residues; sel; close #10000; marker #10000 position cofr; sel ~sel; surface zone ##~num_residues nearAtoms sel distance 0; close #10000
-alias showmaps surface unzone ##~num_residues
+alias hidemaps surface unzone ##~num_residues; sel; close #10000; marker #10000 position cofr; sel ~sel; surface zone ~##num_residues nearAtoms sel distance 0; close #10000
+alias showmaps surface unzone ~##num_residues
 ```
 `hidemaps` and `showmaps` allow quick toggling of the display of the current maps, in order to view or interact with the atomic model underneath. Most useful bound to buttons (see below)  
 
