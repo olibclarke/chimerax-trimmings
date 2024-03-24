@@ -137,7 +137,7 @@ buttonpanel Shortcuts add previous_model command "prevmodel"
 buttonpanel Shortcuts add next_model command "nextmodel"
 ```
 Startup script:
-```
+```python
 def next_model(session):
     from chimerax.model_panel.tool import model_panel
     mp = model_panel(session, "Model Panel")
