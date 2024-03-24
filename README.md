@@ -130,12 +130,37 @@ buttonpanel Shortcuts add reset_mouse command "mousemode alt right contour ; mou
 
 The first line will create a 3x5 panel of buttons that may be docked to a position of your choosing (I prefer the upper right - remember to right-click and check "Save tool position" & "Dockable tool" to make this persist), with useful shortcuts. Most are documented above; the only one that isn't is `mark cofr`, which places a marker at the center of rotation (useful for measurements of map features).
 
-There are two additional buttons that I use **which will only work with the daily build**, when sequential model display controls are activated in the model panel:
+There are two additional buttons that I use **which will only work with the daily build**, when sequential model display controls are activated in the model panel, and when an additional startup script is provided:
 
 ```
 buttonpanel Shortcuts add previous_model command "prevmodel"
 buttonpanel Shortcuts add next_model command "nextmodel"
 ```
+Startup script:
+```
+def next_model(session):
+    from chimerax.model_panel.tool import model_panel
+    mp = model_panel(session, "Model Panel")
+    mp._next_model()
+
+def previous_model(session):
+    from chimerax.model_panel.tool import model_panel
+    mp = model_panel(session, "Model Panel")
+    mp._previous_model()
+def register_command(logger):
+    from chimerax.core.commands import register, CmdDesc
+    register('nextmodel', CmdDesc(synopsis="show next model"), next_model, logger=logger)
+    register('prevmodel', CmdDesc(synopsis="show previous model"), previous_model, logger=logger)
+
+register_command(session.logger)
+```
+
+The above text needs to be placed in a `.py` file, and sourced at startup, by adding a line with the location of the script to the startup section of the preferences, e.g.:
+
+```
+runscript "/home/chimera_startup/chimerax_startup.py"
+```
+
 These nextmodel/prevmodel buttons will allow for quick switching between models, without needing to activate the model panel.
 
 I prefer to operate ChimeraX with all panels undocked by default (except for this button panel!), as I find this is the best way to make use of screen real estate on a laptop (which is how I mostly work). So I have a button panel that allows me to quickly access the volume viewer, model panel and log, as well as other shortcuts that I find useful to have on hand. Here is what this looks like in practice:
