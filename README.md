@@ -130,7 +130,7 @@ buttonpanel Shortcuts add reset_mouse command "mousemode alt right contour ; mou
 
 The first line will create a 3x5 panel of buttons that may be docked to a position of your choosing (I prefer the upper right - remember to right-click and check "Save tool position" & "Dockable tool" to make this persist), with useful shortcuts. Most are documented above; the only one that isn't is `mark cofr`, which places a marker at the center of rotation (useful for measurements of map features).
 
-There are two additional buttons that I use **which will only work with the daily build**, when sequential model display controls are activated in the model panel, and when an additional startup script is provided:
+There are two additional buttons that I use **which will only work with the current daily build (1.8x)**, when sequential model display controls are activated in the model panel, and when an additional startup script is provided:
 
 ```
 buttonpanel Shortcuts add previous_model command "prevmodel"
