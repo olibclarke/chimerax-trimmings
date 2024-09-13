@@ -110,6 +110,11 @@ alias open_vseries "open browse vseries true"
 ```
 Creates a volume series using files selected from the file browser GUI.
 
+```
+alias cubic_map shape sphere radius $1 modelid #10000; volume onesmask #10000 spacing 1 border -0.5
+```
+Creates a cubic map with a sphere of density, two times the entered value in both voxels and Å. So `cubic_map 128` will create a new map with 256px sides and 1Å spacing. Useful to create a new map to use for resampling another map.
+
 **Shortcut buttons**
 ```
 buttonpanel Shortcuts rows 3 columns 5
