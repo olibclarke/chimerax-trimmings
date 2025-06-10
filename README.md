@@ -115,6 +115,11 @@ alias cubic_map shape sphere radius $1 modelid #10000; volume onesmask #10000 sp
 ```
 Creates a cubic map with a sphere of density, two times the entered value in both voxels and Å. So `cubic_map 128` will create a new map with 256px sides and 1Å spacing. Useful to create a new map to use for resampling another map.
 
+```
+alias local_fitmap ~sel; close #10000-10001; marker #10000 position cofr; sel #10000; volume zone $2 nearAtoms sel range $3 newMap true modelid 10001 minimalbounds true; fitmap $1 inmap #10001 eachmodel true; close #10001; close sel; show $2
+```
+Fits model(s) or map(s) to a spherical zone of a single target map. The zone is defined by a radius in Å with respect to the center of rotation. Usage `local_fitmap #models_to_fit #target_map radius`.
+
 **Shortcut buttons**
 ```
 buttonpanel Shortcuts rows 3 columns 5
