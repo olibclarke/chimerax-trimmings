@@ -120,6 +120,11 @@ alias local_fitmap ~sel; close #10000-10001; marker #10000 position cofr; sel #1
 ```
 Fits model(s) or map(s) to a spherical zone of a single target map. The zone is defined by a radius in Å with respect to the center of rotation. Usage `local_fitmap #models_to_fit #target_map radius`.
 
+```
+alias centersel cofr fixed; clip near -300 position sel; clip far 300 position sel; cofr centerOfView; view sel; cofr sel; cofr fixed; clip near -10 position sel; clip far 10 position sel; cofr centerOfView
+```
+Centers the selection in the view, and moves the center of rotation to the center of the selection.
+
 **Shortcut buttons**
 ```
 buttonpanel Shortcuts rows 3 columns 5
