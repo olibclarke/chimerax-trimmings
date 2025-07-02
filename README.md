@@ -140,7 +140,7 @@ buttonpanel Shortcuts add cootmode command "cootmode"
 buttonpanel Shortcuts add mark_cofr command "marker #20000 position cofr radius 1"
 buttonpanel Shortcuts add hidemaps command "hidemaps"
 buttonpanel Shortcuts add showmaps command "showmaps"
-buttonpanel Shortcuts add reset_mouse command "mousemode alt right contour ; mousemode right clip ; mousemode alt left 'translate selected models' ; mousemode shift left 'rotate selected models' ; mousemode alt control left 'pick blobs'; help https://github.com/olibclarke/chimerax-trimmings/blob/main/default_mousemodes.md"
+buttonpanel Shortcuts add reset_mouse_and_help command "mousemode alt right contour ; mousemode right clip ; mousemode alt left 'translate selected models' ; mousemode shift left 'rotate selected models' ; mousemode alt control left 'pick blobs'; help https://github.com/olibclarke/chimerax-trimmings/blob/main/default_mousemodes.md"
 ```
 
 The first line will create a 3x5 panel of buttons that may be docked to a position of your choosing (I prefer the upper right - remember to right-click and check "Save tool position" & "Dockable tool" to make this persist), with useful shortcuts. Most are documented above; the only one that isn't is `mark cofr`, which places a marker at the center of rotation (useful for measurements of map features).
