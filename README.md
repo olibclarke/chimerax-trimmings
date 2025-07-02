@@ -121,7 +121,7 @@ alias local_fitmap ~sel; close #10000-10001; marker #10000 position cofr; sel #1
 Fits model(s) or map(s) to a spherical zone of a single target map. The zone is defined by a radius in Å with respect to the center of rotation. Usage `local_fitmap #models_to_fit #target_map radius`.
 
 ```
-alias centersel cofr fixed; clip near -300 position sel; clip far 300 position sel; cofr centerOfView; view sel; cofr sel; cofr fixed; clip near -10 position sel; clip far 10 position sel; cofr centerOfView
+alias centersel cofr sel; clip near 10 position cofr; clip far -10 position cofr; cofr centerOfView showpivot true; view sel
 ```
 Centers the selection in the view, and moves the center of rotation to the center of the selection.
 
@@ -151,7 +151,8 @@ There are two additional buttons that I use **which will only work with the curr
 buttonpanel Shortcuts add previous_model command "prevmodel"
 buttonpanel Shortcuts add next_model command "nextmodel"
 ```
-Startup script:
+**Startup script:**
+
 ```python
 def next_model(session):
     from chimerax.model_panel.tool import model_panel
@@ -177,6 +178,18 @@ runscript "/home/chimera_startup/chimerax_startup.py"
 ```
 
 These nextmodel/prevmodel buttons will allow for quick switching between models, without needing to activate the model panel.
+
+**Function Key Bindings**
+
+In ChimeraX, commands can be bound to function keys (F1-F12). I like to bind F1 & F2 to next/previous model, F3 to centersel, and F4 to view all, as so (just add to the startup section of preferences):
+
+```
+fun F1 prevmodel
+fun F2 nextmodel
+fun F3 centersel
+fun F4 view all
+```
+
 
 I prefer to operate ChimeraX with all panels undocked by default (except for this button panel!), as I find this is the best way to make use of screen real estate on a laptop (which is how I mostly work). So I have a button panel that allows me to quickly access the volume viewer, model panel and log, as well as other shortcuts that I find useful to have on hand. Here is what this looks like in practice:
 
