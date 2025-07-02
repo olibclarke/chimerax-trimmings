@@ -1,4 +1,4 @@
-Right-click-drag: Moves front clip plane
+**Right-click-drag**: Moves front clip plane
 
 **Shift**-right-click-drag: Moves both clip planes
 
@@ -11,3 +11,13 @@ Right-click-drag: Moves front clip plane
 **Shift+Alt/option**-left-click-drag: Rotates the selected model(s)
 
 **Ctrl+Alt**-left-click: Picks & colors clicked blob (launches "Measure and Color Blobs" tool).
+
+_**Function keys:**_
+
+**F1** - previous model
+
+**F2** - next model
+
+**F3** - center selection
+
+**F4** - view all
