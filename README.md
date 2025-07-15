@@ -125,6 +125,11 @@ alias centersel cofr sel; clip near 10 position cofr; clip far -10 position cofr
 ```
 Centers the selection in the view, and moves the center of rotation to the center of the selection.
 
+```
+alias fit_by_chain split $1; fitmap $1.* inmap $2 eachmodel true; combine $1.* close true
+```
+Fits the model (with modelID $1) into map with mapID $2 by rigid body fitting each chain.
+
 **Shortcut buttons**
 ```
 buttonpanel Shortcuts rows 3 columns 5
