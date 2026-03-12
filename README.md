@@ -66,7 +66,7 @@ alias ca_trace ~rib $1; ~surf $1; ~disp $1; disp @CA&protein&$1; disp @P&nucleic
 `ca_and_sidechains` will display the selected model (executed as e.g. `ca_and_sidechains #1`) as a C-alpha (or phosphate for nucleic acids) backbone with attached sidechains/bases. `ca_trace` will do the same, just without the sidechains/bases.  
 
 ```
-alias map_sphere_15 volume unzone ##~num_residues; sel; close #10000; marker #10000 position cofr; sel ~sel; volume zone ~##num_residues nearAtoms sel minimalBounds true range 15; close #10000
+alias map_sphere_15 volume unzone ~##num_residues; sel; close #10000; marker #10000 position cofr; sel ~sel; volume zone ~##num_residues nearAtoms sel minimalBounds true range 15; close #10000
 alias map_unsphere volume unzone ~##num_residues
 ```
 `map_sphere_15` will limit display of all maps to a spherical 15Å zone around the center of rotation.  
