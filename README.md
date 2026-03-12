@@ -72,12 +72,12 @@ alias map_unsphere volume unzone ~##num_residues
 `map_sphere_15` will limit display of all maps to a spherical 15Å zone around the center of rotation.  
 
 ```
-alias default_mol_display ~disp; rib; rainbow chain palette RdYlBu-5; lighting soft
+alias default_mol_display ~disp target a; rib; rainbow chain palette RdYlBu-5; lighting soft
 ```
 A nice default display setting for proteins.  
 
 ```
-alias hidemaps surface unzone ##~num_residues; sel; close #10000; marker #10000 position cofr; sel ~sel; surface zone ~##num_residues nearAtoms sel distance 0; close #10000
+alias hidemaps surface unzone ~##num_residues; sel; close #10000; marker #10000 position cofr; sel ~sel; surface zone ~##num_residues nearAtoms sel distance 0; close #10000
 alias showmaps surface unzone ~##num_residues
 ```
 `hidemaps` and `showmaps` allow quick toggling of the display of the current maps, in order to view or interact with the atomic model underneath. Most useful bound to buttons (see below)  
