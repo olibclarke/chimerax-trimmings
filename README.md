@@ -130,6 +130,11 @@ alias fit_by_chain split $1; fitmap $1.* inmap $2 eachmodel true; combine $1.* c
 ```
 Fits the model (with modelID $1) into map with mapID $2 by rigid body fitting each chain.
 
+```
+alias volume_project set bgColor black; volume $1 step 1 sd_level 0,0 sd_level 50,1 color white color white style image projection_mode auto maximum_intensity_projection true bt_correction true linear_interpolation true; lighting depth_cue false
+```
+Displays the map with `#map_id` as a projection, rather than surface. Can be useful for membrane proteins in micelles.
+
 **Shortcut buttons**
 ```
 buttonpanel Shortcuts rows 3 columns 5
