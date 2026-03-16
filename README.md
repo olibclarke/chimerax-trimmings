@@ -38,7 +38,7 @@ Right-click-drag: Moves front clip plane
 
 I would also suggest enabling "Mouse clipping enables _screen planes_" in the "clipping" section of preferences, rather than the default of altering _scene planes_, which in my experience can lead to unexpected results.
 
-One other note - certain Mac accessibility settings may interfere with trackpad behavior in ChimeraX, so if you are seeing something weird, check the accessibility settings (e.g. the "use trackpad gesture to zoom" setting cn cause problems).
+One other note - certain Mac accessibility settings may interfere with trackpad behavior in ChimeraX, so if you are seeing something weird, check the accessibility settings (e.g. the "use trackpad gesture to zoom" setting can cause problems).
 
 
 **Aliases**
