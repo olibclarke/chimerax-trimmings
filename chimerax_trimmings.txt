@@ -1,4 +1,4 @@
-runscript "/Users/oc2188/Documents/Codex_coding/chimerax-trimmings/chimerax_trimmings.py"
+runscript "~/chimerax_trimmings.py"
 camera ortho
 cofr centerofview
 mousemode alt right contour
