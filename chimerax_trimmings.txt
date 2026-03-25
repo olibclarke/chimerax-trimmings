@@ -16,6 +16,10 @@ alias selmodel sel ##num_residues
 alias usage selmodel synopsis "Select atomic models"
 alias selmap sel ~##num_residues
 alias usage selmap synopsis "Select non-atomic models such as maps"
+alias selside sel sidechain & $1 | ~backbone & nucleic & $1
+alias usage selside synopsis "Select protein sidechains and nucleic-acid bases" $1 "atom-spec"
+alias dispside sel sidechain & $1 | ~backbone & nucleic & $1; disp sel
+alias usage dispside synopsis "Display protein sidechains and nucleic-acid bases" $1 "atom-spec"
 alias cootmode_white set bgColor white; surface cap false; surface style solid; nucleotides #* atoms; lighting flat; graphics silhouettes false; style stick; ~rib; color ##num_residues orange; color byhet ; disp;  ~disp @H*; style ions sphere; style solvent ball; size ballscale 0.2;  size stickradius 0.07; transparency 85; cofr centerofview; clip near -10 far 10 position cofr; color ~##num_residues medium blue
 alias usage cootmode_white synopsis "Apply the white-background Coot-style display preset"
 alias cootmode set bgColor black; surface cap false; surface style solid; nucleotides #* atoms; lighting flat; graphics silhouettes false; style stick; ~rib; color ##num_residues gold; color byhet ; disp;  ~disp @H*; style ions sphere; style solvent ball; size ballscale 0.2;  size stickradius 0.07; transparency 70; cofr centerofview; clip near -10 far 10 position cofr; color ~##num_residues cornflower blue
@@ -70,6 +74,20 @@ alias split_diff_map volume scale $1 rms 1 modelId $2; close $1; volume $2 capFa
 alias usage split_diff_map synopsis "Replace a map with a scaled positive and negative mesh difference map" $1 "input map" $2 "output model-id"
 alias local_diff_map view name tmp; close #1001,1002,1003,1004,1005; fitmap $1 inMap $2; vol zone $2 near $1 range 5 newMap true modelId 1000 minimalBounds true; fitmap $1 inMap $3; vol zone $3 near $1 range 5 newMap true modelId 1001 minimalBounds true; volume scale #1000 sd 0.1 modelId 1002; volume scale #1001 sd 0.1 modelId 1003; fitmap #1003 inMap #1002; volume resample #1003 onGrid #1002 modelId 1004; volume subtract #1002 #1004 modelId 1005 minRms true; volume #1005 step 1; split_diff_map #1005 #1006; close #1000,1001,1002,1003,1004,1005; view tmp
 alias usage local_diff_map synopsis "Build a local difference map between two fitted maps around a model" $1 "model-spec" $2 "first map" $3 "second map"
+alias local_diff_map_sphere ~sel; close #10000,#1001,#1002,#1003,#1004,#1005; marker #10000 position cofr; sel #10000; vol zone $1 near sel range $3 newMap true modelId 1000 minimalBounds true; vol zone $2 near sel range $3 newMap true modelId 1001 minimalBounds true; volume scale #1000 sd 0.1 modelId 1002; volume scale #1001 sd 0.1 modelId 1003; fitmap #1003 inMap #1002; volume resample #1003 onGrid #1002 modelId 1004; volume subtract #1002 #1004 modelId 1005 minRms true; volume #1005 step 1; split_diff_map #1005 #1006; close #10000,#1000,#1001,#1002,#1003,#1004,#1005
+alias usage local_diff_map_sphere synopsis "Build a local difference map between two maps around the center of rotation" $1 "first map" $2 "second map" $3 "radius"
+alias binary_mask volume threshold $1 minimum $2 set 0 maximum $2 setMaximum 1 modelId 2000; volume #2000 level 0.5
+alias usage binary_mask synopsis "Create a binary mask map at a chosen contour level" $1 "map-spec" $2 "contour level"
+alias soft_mask volume threshold $1 minimum $2 set 0 maximum $2 setMaximum 1 modelId 2000; volume falloff #2000 iterations 20 modelId 2001; volume #2001 level 0.5; close #2000
+alias usage soft_mask synopsis "Create a soft-edged mask map at a chosen contour level" $1 "map-spec" $2 "contour level"
+alias delh delete @H*
+alias usage delh synopsis "Delete all hydrogen atoms"
+alias delh_sel delete sel & @H*
+alias usage delh_sel synopsis "Delete hydrogen atoms from the current selection"
+alias carve surface zone ~##num_residues nearAtoms sel distance $1
+alias usage carve synopsis "Carve displayed map surfaces to the current selection" $1 "distance"
+alias uncarve surface unzone ~##num_residues
+alias usage uncarve synopsis "Remove surface carving from displayed map surfaces"
 fun F1 prevmodel
 fun F2 nextmodel
 fun F3 centersel
@@ -77,6 +95,7 @@ fun F4 view all
 fun F5 togglemaps
 fun F6 togglemodels
 fun F7 cyclelighting
+fun F8 cyclemodeldisplay
 buttonpanel Shortcuts rows 3 columns 5
 buttonpanel Shortcuts add Vol_Viewer command "tool show 'Volume Viewer'"
 buttonpanel Shortcuts add Model_Panel command "tool show Models"
@@ -94,4 +113,3 @@ buttonpanel Shortcuts add reset_mouse_and_help command "mousemode alt right cont
 buttonpanel Shortcuts add previous_model command "prevmodel"
 buttonpanel Shortcuts add next_model command "nextmodel"
 volume defaultvalues limitVoxelCount false voxelLimitForPlane 1000000000000000 voxelLimitForOpen 1000000000000000 saveSettings true
-
