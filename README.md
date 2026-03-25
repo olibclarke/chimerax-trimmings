@@ -373,6 +373,108 @@ alias local_diff_map view name tmp; close #1001,1002,1003,1004,1005; fitmap $1 i
 alias usage local_diff_map synopsis "Build a local difference map between two fitted maps around a model" $1 "model-spec" $2 "first map" $3 "second map"
 ```
 
+### `selside`
+
+Selects protein sidechains and nucleic-acid bases for the given atom specification.
+
+Usage: `selside <atom-spec>`
+
+```chimerax
+alias selside sel sidechain & $1 | ~backbone & nucleic & $1
+alias usage selside synopsis "Select protein sidechains and nucleic-acid bases" $1 "atom-spec"
+```
+
+### `dispside`
+
+Displays protein sidechains and nucleic-acid bases for the given atom specification.
+
+Usage: `dispside <atom-spec>`
+
+```chimerax
+alias dispside sel sidechain & $1 | ~backbone & nucleic & $1; disp sel
+alias usage dispside synopsis "Display protein sidechains and nucleic-acid bases" $1 "atom-spec"
+```
+
+### `local_diff_map_sphere`
+
+Builds a local difference map from two maps around the center of rotation.
+
+Usage: `local_diff_map_sphere <first-map> <second-map> <radius>`
+
+Depends on: `split_diff_map`
+
+```chimerax
+alias local_diff_map_sphere ~sel; close #10000,#1001,#1002,#1003,#1004,#1005; marker #10000 position cofr; sel #10000; vol zone $1 near sel range $3 newMap true modelId 1000 minimalBounds true; vol zone $2 near sel range $3 newMap true modelId 1001 minimalBounds true; volume scale #1000 sd 0.1 modelId 1002; volume scale #1001 sd 0.1 modelId 1003; fitmap #1003 inMap #1002; volume resample #1003 onGrid #1002 modelId 1004; volume subtract #1002 #1004 modelId 1005 minRms true; volume #1005 step 1; split_diff_map #1005 #1006; close #10000,#1000,#1001,#1002,#1003,#1004,#1005
+alias usage local_diff_map_sphere synopsis "Build a local difference map between two maps around the center of rotation" $1 "first map" $2 "second map" $3 "radius"
+```
+
+### `binary_mask`
+
+Creates a binary mask map at a chosen contour level.
+
+Usage: `binary_mask <map-spec> <contour-level>`
+
+```chimerax
+alias binary_mask volume threshold $1 minimum $2 set 0 maximum $2 setMaximum 1 modelId 2000; volume #2000 level 0.5
+alias usage binary_mask synopsis "Create a binary mask map at a chosen contour level" $1 "map-spec" $2 "contour level"
+```
+
+### `soft_mask`
+
+Creates a soft-edged mask map from a chosen contour level.
+
+Usage: `soft_mask <map-spec> <contour-level>`
+
+```chimerax
+alias soft_mask volume threshold $1 minimum $2 set 0 maximum $2 setMaximum 1 modelId 2000; volume falloff #2000 iterations 20 modelId 2001; volume #2001 level 0.5; close #2000
+alias usage soft_mask synopsis "Create a soft-edged mask map at a chosen contour level" $1 "map-spec" $2 "contour level"
+```
+
+### `delh`
+
+Deletes all hydrogen atoms.
+
+Usage: `delh`
+
+```chimerax
+alias delh delete @H*
+alias usage delh synopsis "Delete all hydrogen atoms"
+```
+
+### `delh_sel`
+
+Deletes hydrogen atoms from the current selection.
+
+Usage: `delh_sel`
+
+```chimerax
+alias delh_sel delete sel & @H*
+alias usage delh_sel synopsis "Delete hydrogen atoms from the current selection"
+```
+
+### `carve`
+
+Carves displayed map surfaces to the current selection by the given distance.
+
+Usage: `carve <distance>`
+
+```chimerax
+alias carve surface zone ~##num_residues nearAtoms sel distance $1
+alias usage carve synopsis "Carve displayed map surfaces to the current selection" $1 "distance"
+```
+
+### `uncarve`
+
+Removes surface carving from displayed map surfaces.
+
+Usage: `uncarve`
+
+```chimerax
+alias uncarve surface unzone ~##num_residues
+alias usage uncarve synopsis "Remove surface carving from displayed map surfaces"
+```
+
+
 ## Notes
 
 - The Python file is meant to be sourced inside ChimeraX with `runscript`; it is not a standalone Python program.
