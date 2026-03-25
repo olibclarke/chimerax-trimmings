@@ -1,0 +1,96 @@
+runscript "/Users/oc2188/Documents/Codex_coding/chimerax-trimmings/chimerax_trimmings.py"
+camera ortho
+cofr centerofview
+mousemode alt right contour
+mousemode right clip
+mousemode alt left "translate selected models"
+mousemode shift left "rotate selected models"
+mousemode alt control left "pick blobs"
+alias cofron cofr centerofview showpivot 7,0.25
+alias usage cofron synopsis "Center the rotation point on the view and show the pivot"
+alias cofroff cofr centerofview showpivot false
+alias usage cofroff synopsis "Recenter the rotation point on the view and hide the pivot marker"
+alias symclip cofr centerofview; clip near -$1 far $1 position cofr
+alias usage symclip synopsis "Set symmetric clip planes around the center of rotation" $1 "half-distance"
+alias selmodel sel ##num_residues
+alias usage selmodel synopsis "Select atomic models"
+alias selmap sel ~##num_residues
+alias usage selmap synopsis "Select non-atomic models such as maps"
+alias cootmode_white set bgColor white; surface cap false; surface style solid; nucleotides #* atoms; lighting flat; graphics silhouettes false; style stick; ~rib; color ##num_residues orange; color byhet ; disp;  ~disp @H*; style ions sphere; style solvent ball; size ballscale 0.2;  size stickradius 0.07; transparency 85; cofr centerofview; clip near -10 far 10 position cofr; color ~##num_residues medium blue
+alias usage cootmode_white synopsis "Apply the white-background Coot-style display preset"
+alias cootmode set bgColor black; surface cap false; surface style solid; nucleotides #* atoms; lighting flat; graphics silhouettes false; style stick; ~rib; color ##num_residues gold; color byhet ; disp;  ~disp @H*; style ions sphere; style solvent ball; size ballscale 0.2;  size stickradius 0.07; transparency 70; cofr centerofview; clip near -10 far 10 position cofr; color ~##num_residues cornflower blue
+alias usage cootmode synopsis "Apply the dark-background Coot-style display preset"
+alias cootmode_mesh surface cap false; surface style mesh; lighting flat; nucleotides #* atoms; graphics silhouettes false; style stick; ~rib; color ##num_residues gold; color byhet ; disp;  ~disp @H*; style solvent ball; style ions sphere; size ballscale 0.2;  size stickradius 0.07; cofr centerofview; clip near -10 far 10 position cofr; color ~##num_residues #3d60ffff; transparency 50
+alias usage cootmode_mesh synopsis "Apply the mesh Coot-style display preset"
+alias ca_and_sidechains ~rib $1; ~surf $1; ~disp $1; disp @CA&protein&$1; disp @P&nucleic&$1; style $1 stick; disp sidechain&$1; disp ~backbone&nucleic&$1; size stickradius 0.1; size pseudobondradius 0.1
+alias usage ca_and_sidechains synopsis "Show CA or phosphate trace plus sidechains or bases" $1 "model-spec"
+alias ca_trace ~rib $1; ~surf $1; ~disp $1; disp @CA&protein&$1; disp @P&nucleic&$1; style $1 stick; size stickradius 0.1; size pseudobondradius 0.1
+alias usage ca_trace synopsis "Show a CA or phosphate trace" $1 "model-spec"
+alias expand_sym ~disp $1; rib $1; sym $1 assembly 1 copies false newModel true
+alias usage expand_sym synopsis "Expand an asymmetric unit to biological assembly 1 as ribbon copies" $1 "model-spec"
+alias map_sphere_15 volume unzone ~##num_residues; sel; close #10000; marker #10000 position cofr; sel ~sel; volume zone ~##num_residues nearAtoms sel minimalBounds true range 15; close #10000
+alias usage map_sphere_15 synopsis "Zone maps to a 15 A sphere around the center of rotation"
+alias cubic_map shape sphere radius $1 modelid #10000; volume onesmask #10000 spacing 1 border -0.5
+alias usage cubic_map synopsis "Create a spherical mask map on a cubic grid" $1 "sphere radius"
+alias map_unsphere volume unzone ~##num_residues
+alias usage map_unsphere synopsis "Remove map zoning from all maps"
+alias fit_by_chain split $1; fitmap $1.* inmap $2 eachmodel true; combine $1.* close true
+alias usage fit_by_chain synopsis "Split a model by chain, fit each chain into a map, and recombine" $1 "model-spec" $2 "map-spec"
+alias rainbow_new rainbow palette RdYlBu-5
+alias usage rainbow_new synopsis "Color models by rainbow using the RdYlBu-5 palette"
+alias default_mol_display ~disp; rib; rainbow chain palette RdYlBu-5; lighting soft
+alias usage default_mol_display synopsis "Restore the default cartoon molecular display"
+alias local_fitmap ~sel; close #10000-10001; marker #10000 position cofr; sel #10000; volume zone $2 nearAtoms sel range $3 newMap true modelid 10001 minimalbounds true; fitmap $1 inmap #10001 eachmodel true; close #10001; close sel; show $2
+alias usage local_fitmap synopsis "Fit a model or map into a local zone around the center of rotation" $1 "model or map to fit" $2 "target map" $3 "zone radius"
+alias hidemodels hide ##num_residues models
+alias usage hidemodels synopsis "Hide all atomic models"
+alias showmodels show ##num_residues models
+alias usage showmodels synopsis "Show all atomic models"
+alias caps_off surface cap false
+alias usage caps_off synopsis "Turn clipped surface caps off"
+alias caps_on surface cap true
+alias usage caps_on synopsis "Turn clipped surface caps on"
+alias open_vseries "open browse vseries true"
+alias usage open_vseries synopsis "Open a file browser with volume series enabled"
+alias selbetween ks ri
+alias usage selbetween synopsis "Select residues between the current selection endpoints"
+alias helix setattr $1 res is_helix true
+alias usage helix synopsis "Mark residues as helix" $1 "residue-spec"
+alias strand setattr $1 res is_strand true
+alias usage strand synopsis "Mark residues as strand" $1 "residue-spec"
+alias coil setattr $1 res is_strand false; setattr $1 res is_helix false
+alias usage coil synopsis "Clear helix and strand assignment for residues" $1 "residue-spec"
+alias rock_movie cofr showpivot false; movie record; rock y 50; wait 600; movie encode ~/Desktop/rock_movie.mp4; stop
+alias usage rock_movie synopsis "Record a rocking movie and save it to the default Desktop file"
+alias centersel cofr sel; clip near 10 position cofr; clip far -10 position cofr; cofr centerOfView showpivot true; view sel
+alias usage centersel synopsis "Center the view on the selection and apply local clipping"
+alias volume_project set bgColor black; volume $1 step 1 sd_level 0,0 sd_level 50,1 color white color white style image projection_mode auto maximum_intensity_projection true bt_correction true linear_interpolation true; lighting depth_cue false
+alias usage volume_project synopsis "Display a map as a maximum-intensity projection" $1 "map-spec"
+alias split_diff_map volume scale $1 rms 1 modelId $2; close $1; volume $2 capFaces false meshLighting false squareMesh false level -3 color #da1200000000 level 3 color #0000bda00000; lighting depthCue true; volume $2 style mesh
+alias usage split_diff_map synopsis "Replace a map with a scaled positive and negative mesh difference map" $1 "input map" $2 "output model-id"
+alias local_diff_map view name tmp; close #1001,1002,1003,1004,1005; fitmap $1 inMap $2; vol zone $2 near $1 range 5 newMap true modelId 1000 minimalBounds true; fitmap $1 inMap $3; vol zone $3 near $1 range 5 newMap true modelId 1001 minimalBounds true; volume scale #1000 sd 0.1 modelId 1002; volume scale #1001 sd 0.1 modelId 1003; fitmap #1003 inMap #1002; volume resample #1003 onGrid #1002 modelId 1004; volume subtract #1002 #1004 modelId 1005 minRms true; volume #1005 step 1; split_diff_map #1005 #1006; close #1000,1001,1002,1003,1004,1005; view tmp
+alias usage local_diff_map synopsis "Build a local difference map between two fitted maps around a model" $1 "model-spec" $2 "first map" $3 "second map"
+fun F1 prevmodel
+fun F2 nextmodel
+fun F3 centersel
+fun F4 view all
+fun F5 togglemaps
+fun F6 togglemodels
+fun F7 cyclelighting
+buttonpanel Shortcuts rows 3 columns 5
+buttonpanel Shortcuts add Vol_Viewer command "tool show 'Volume Viewer'"
+buttonpanel Shortcuts add Model_Panel command "tool show Models"
+buttonpanel Shortcuts add Log command "tool show Log"
+buttonpanel Shortcuts add default_disp command "default_mol_display"
+buttonpanel Shortcuts add map_sphere command "map_sphere_15"
+buttonpanel Shortcuts add map_unsphere command "map_unsphere"
+buttonpanel Shortcuts add cofron command "cofron"
+buttonpanel Shortcuts add cofroff command "cofroff"
+buttonpanel Shortcuts add cootmode command "cootmode"
+buttonpanel Shortcuts add mark_cofr command "marker #20000 position cofr radius 1"
+buttonpanel Shortcuts add togglemaps command "togglemaps"
+buttonpanel Shortcuts add togglemodels command "togglemodels"
+buttonpanel Shortcuts add reset_mouse_and_help command "mousemode alt right contour ; mousemode right clip ; mousemode alt left 'translate selected models' ; mousemode shift left 'rotate selected models' ; mousemode alt control left 'pick blobs'; help https://github.com/olibclarke/chimerax-trimmings/blob/main/default_mousemodes.md"
+buttonpanel Shortcuts add previous_model command "prevmodel"
+buttonpanel Shortcuts add next_model command "nextmodel"
+volume defaultvalues limitVoxelCount false voxelLimitForPlane 1000000000000000 voxelLimitForOpen 1000000000000000 saveSettings true
