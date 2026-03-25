@@ -35,6 +35,14 @@ def _atomic_models_by_ids(session, model_ids):
     ]
 
 
+def _visible_map_models(session):
+    from chimerax.map import Volume
+
+    maps = list(session.models.list(type=Volume))
+    maps.sort(key=lambda m: tuple(m.id))
+    return [m for m in maps if m.display], maps
+
+
 def _toggle_model_set(session, model_type, state_key, empty_message):
     models = list(session.models.list(type=model_type))
     if not models:
@@ -205,6 +213,34 @@ def cycle_model_display(session):
     session._cyclemodeldisplay_state = state
 
 
+def _step_map_visibility(session, direction):
+    visible_maps, all_maps = _visible_map_models(session)
+    if not all_maps:
+        session.logger.info("No volume maps are open.")
+        return
+
+    if not visible_maps:
+        target = all_maps[0 if direction > 0 else -1]
+        target.display = True
+        return
+
+    current = visible_maps[-1] if direction > 0 else visible_maps[0]
+    current_index = all_maps.index(current)
+    next_index = (current_index + direction) % len(all_maps)
+
+    for map_model in visible_maps:
+        map_model.display = False
+    all_maps[next_index].display = True
+
+
+def next_map(session):
+    _step_map_visibility(session, 1)
+
+
+def previous_map(session):
+    _step_map_visibility(session, -1)
+
+
 def register_command(logger):
     from chimerax.core.commands import CmdDesc, register
 
@@ -218,6 +254,18 @@ def register_command(logger):
         "prevmodel",
         CmdDesc(synopsis="Show the previous model in the Model Panel"),
         previous_model,
+        logger=logger,
+    )
+    register(
+        "nextmap",
+        CmdDesc(synopsis="Show the next map and hide the current map"),
+        next_map,
+        logger=logger,
+    )
+    register(
+        "prevmap",
+        CmdDesc(synopsis="Show the previous map and hide the current map"),
+        previous_map,
         logger=logger,
     )
     register(
