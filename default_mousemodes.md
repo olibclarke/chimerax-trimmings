@@ -21,3 +21,5 @@ _**Function keys:**_
 **F3** - center selection
 
 **F4** - view all
+
+**For a description of chimerax-trimmings as a whole, see here:** [Readme](README.md)
