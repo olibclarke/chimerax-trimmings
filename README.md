@@ -5,7 +5,7 @@ I would also recommend (if you are using a laptop) going through each tool in th
 
 This repository contains:
 
-- `chimerax_trimmings.txt`: Startup commands, aliases, keybindings, and Shortcut buttonpanel setup
+- `chimerax_trimmings.txt`: Startup commands, aliases, keybindings, and Shortcut buttonpanel setup.
 - `chimerax_trimmings.py`: Companion ChimeraX Python script for a couple of things that are difficult or not possible to implement in ChimeraX command language.
 
 ## Installation
