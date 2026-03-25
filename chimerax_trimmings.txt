@@ -94,3 +94,4 @@ buttonpanel Shortcuts add reset_mouse_and_help command "mousemode alt right cont
 buttonpanel Shortcuts add previous_model command "prevmodel"
 buttonpanel Shortcuts add next_model command "nextmodel"
 volume defaultvalues limitVoxelCount false voxelLimitForPlane 1000000000000000 voxelLimitForOpen 1000000000000000 saveSettings true
+
