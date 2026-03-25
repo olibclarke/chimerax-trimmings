@@ -1,206 +1,383 @@
 # chimerax-trimmings
-Useful aliases and startup settings for UCSF ChimeraX \(https://www.cgl.ucsf.edu/chimerax/). Add these to the "Startup" section of the "Preferences" pane and restart ChimeraX in order to have them take effect. _(Note: Some of these will only work with the daily build)_. 
+Useful aliases and startup settings for UCSF ChimeraX \(https://www.cgl.ucsf.edu/chimerax/). Add these to the "Startup" section of the "Preferences" pane and restart ChimeraX in order to have them take effect. _(Note: Some of these will only work with recent builds of ChimeraX)_. 
 
 I would also recommend (if you are using a laptop) going through each tool in the "Tools" menu, launching it, right clicking on the relevant window and **unchecking** "Dockable tool" - this will ensure that each tool acts as a separate window and does not try to "snap" to the main GUI when you move it around, which I find undesirable on smaller screens (these settings will be persistent across restarts of ChimeraX).
 
-Here is my current startup section for ChimeraX, broken down with descriptions of each section:
+This repository contains:
 
-**Display settings:**
-```
-camera ortho
-cofr centerofview
-volume defaultvalues limitVoxelCount false voxelLimitForPlane 1000000000000000 voxelLimitForOpen 1000000000000000 saveSettings true
-```
-`camera ortho` sets the default camera mode to orthographic (which I prefer to perspective, and which allows for accurate scale bars). `cofr centerofview` sets the center of rotation midway between the two clip planes (`near` and `far`). The last line sets some defaults for displaying new volumes (this currently ony works in the daily build), setting the default step to 1 and switching off plane display of large volumes.
+- `chimerax_trimmings.txt`: startup commands, aliases, keybindings, and button-panel setup
+- `chimerax_trimmings.py`: companion ChimeraX Python commands for behaviors that are difficult or not possible to implement in ChimeraX command language.
 
+## Installation
 
-**Mouse mode settings**
-```
-mousemode right clip
-mousemode alt right contour
-mousemode alt left "translate selected models"
-mousemode shift left "rotate selected models"
-mousemode alt control left "pick blobs"
-```
-These make some alterations to the mouse modes:
+1. Make a local copy of `chimerax_startup.py` (somewhere permanent).
+2. Edit the first line of `chimerax_trimmings.txt` so the `runscript` path points to your local copy of `chimerax_trimmings.py`.
+3. In ChimeraX on macOS, open `UCSF ChimeraX -> Preferences... -> Startup` (I think under Favorites on Windows?)
+4. Paste the contents of your edited `chimerax-trimmings.txt` into the startup commands box.
+5. Restart ChimeraX.
 
-Right-click-drag: Moves front clip plane
+## Companion Script
 
-**Shift**-right-click-drag: Moves both clip planes
+The Python script registers:
 
-**Alt/option**-right-click-drag: Adjusts map threshold
+- `nextmodel`
+- `prevmodel`
+- `togglemaps`
+- `togglemodels`
 
-**Alt/option**-left-click-drag: Translates the _selected_ model(s) in x-y plane
+`togglemaps` and `togglemodels` toggle the currently displayed maps/models on/off. 
 
-**Shift+Alt/option**-left-click-drag: Rotates the _selected_ model(s)
+## Keybindings
 
-**Ctrl+Alt**-left-click: Picks & colors clicked blob (launches "Measure and Color Blobs" tool).
+- `F1`: Previous model
+- `F2`: Next model
+- `F3`: Center selection
+- `F4`: View all
+- `F5`: Toggle maps
+- `F6`: Toggle models
+- `F7`: Cycle lighting presets
 
-I would also suggest enabling "Mouse clipping enables _screen planes_" in the "clipping" section of preferences, rather than the default of altering _scene planes_, which in my experience can lead to unexpected results.
+## Button Panel
 
-One other note - certain Mac accessibility settings may interfere with trackpad behavior in ChimeraX, so if you are seeing something weird, check the accessibility settings (e.g. the "use trackpad gesture to zoom" setting can cause problems).
+The startup file creates a `Shortcuts` button panel with quick access to commonly used tools/commands.
 
+It currently includes buttons for:
 
-**Aliases**
-```
+- `Vol_Viewer`: open the Volume Viewer tool
+- `Model_Panel`: open the Model Panel
+- `Log`: open the Log viewer
+- `default_disp`: Set some nice defaults for model/map display
+- `map_sphere`: Zone maps to a 15 A sphere around the center of rotation
+- `map_unsphere`: Undo map zoning
+- `cofron`: Make sure the center of rotation is centered between the clip planes and show the center-of-rotation pivot marker
+- `cofroff`: Hide the center-of-rotation pivot marker while keeping the CoFR centered between the clip planes.
+- `cootmode`: Apply a Coot-style display preset for models/maps
+- `mark_cofr`: Place a marker at the current center of rotation
+- `togglemaps`: Hide shown maps, then restore the same set on the next use
+- `togglemodels`: Hide shown atomic models, then restore the same set on the next use
+- `reset_mouse_and_help`: Restore the default mouse bindings and open the mouse-mode help page
+- `previous_model`: Step to the previous model in the Model Panel
+- `next_model`: Step to the next model in the Model Panel
+
+## Alias Reference
+
+### `cofron`
+
+Centers the rotation point between the clip planes and shows the pivot marker.
+
+Usage: `cofron`
+
+```chimerax
 alias cofron cofr centerofview showpivot 7,0.25
+alias usage cofron synopsis "Centers the rotation point on the view and show the pivot"
+```
+
+### `cofroff`
+
+Recenters the rotation point between the clip planes and hides the pivot marker.
+
+Usage: `cofroff`
+
+```chimerax
 alias cofroff cofr centerofview showpivot false
+alias usage cofroff synopsis "Recenter the rotation point on the view and hide the pivot marker"
 ```
-`cofron` sets the center of rotation midway between the two clip planes, and adds a 3D marker for the center of rotation with orthogonal red, green and blue arrows (where R,G,B=X,Y,Z). `cofroff` does the same thing, but switches off the marker.  
 
-```
+### `symclip`
+
+Sets symmetric clip planes around the center of rotation.
+
+Usage: `symclip <half-distance>`
+
+```chimerax
 alias symclip cofr centerofview; clip near -$1 far $1 position cofr
+alias usage symclip synopsis "Set symmetric clip planes around the center of rotation" $1 "Half-width"
 ```
-`symclip` sets the near and far clip planes symmetrically with respect to the center of rotation. So `symclip 5` would set the near clip plane 5 Å from the CoFR, and the far clip plane 5Å in the other direction, giving a 10 Å slab.  
 
-```
-alias cootmode set bgColor black; surface cap false; surface style solid; lighting flat; graphics silhouettes false; style stick; ~rib; color ##num_residues gold; color byhet ; disp;  ~disp @H*; style ions ball; style solvent ball; size ballscale 0.2;  size stickradius 0.07; transparency 70; cofr centerofview; clip near -10 far 10 position cofr; color ~##num_residues cornflower blue
-alias cootmode_mesh surface cap false; surface style mesh; lighting flat; graphics silhouettes false; style stick; ~rib; color ##num_residues gold; color byhet ; disp;  ~disp @H*; style solvent ball; style ions ball; size ballscale 0.2;  size stickradius 0.07; cofr centerofview; clip near -10 far 10 position cofr; color ~##num_residues #3d60ffff; transparency 50
-```
-`cootmode` and `cootmode_mesh` give what I find to be pleasing and performant settings for inspecting atomic models in the context of density maps. By default, hydrogens are not displayed, as I find them distracting under most circumstances.  
+### `selmodel`
 
+Selects all atomic models.
+
+Usage: `selmodel`
+
+```chimerax
+alias selmodel sel ##num_residues
+alias usage selmodel synopsis "Select atomic models"
 ```
+
+### `selmap`
+
+Selects all non-atomic models such as maps.
+
+Usage: `selmap`
+
+```chimerax
+alias selmap sel ~##num_residues
+alias usage selmap synopsis "Select non-atomic models such as maps"
+```
+
+### `cootmode`
+
+Applies a dark-background Coot-style display preset for model building.
+
+Usage: `cootmode`
+
+```chimerax
+alias cootmode set bgColor black; surface cap false; surface style solid; nucleotides #* atoms; lighting flat; graphics silhouettes false; style stick; ~rib; color ##num_residues gold; color byhet ; disp;  ~disp @H*; style ions sphere; style solvent ball; size ballscale 0.2;  size stickradius 0.07; transparency 70; cofr centerofview; clip near -10 far 10 position cofr; color ~##num_residues cornflower blue
+alias usage cootmode synopsis "Apply the dark-background Coot-style display preset"
+```
+
+### `cootmode_white`
+
+Applies a white-background variant of `cootmode`.
+
+Usage: `cootmode_white`
+
+```chimerax
+alias cootmode_white set bgColor white; surface cap false; surface style solid; nucleotides #* atoms; lighting flat; graphics silhouettes false; style stick; ~rib; color ##num_residues orange; color byhet ; disp;  ~disp @H*; style ions sphere; style solvent ball; size ballscale 0.2;  size stickradius 0.07; transparency 85; cofr centerofview; clip near -10 far 10 position cofr; color ~##num_residues medium blue
+alias usage cootmode_white synopsis "Apply the white-background Coot-style display preset"
+```
+
+### `cootmode_mesh`
+
+Applies a mesh-map variant of `cootmode`.
+
+Usage: `cootmode_mesh`
+
+```chimerax
+alias cootmode_mesh surface cap false; surface style mesh; lighting flat; nucleotides #* atoms; graphics silhouettes false; style stick; ~rib; color ##num_residues gold; color byhet ; disp;  ~disp @H*; style solvent ball; style ions sphere; size ballscale 0.2;  size stickradius 0.07; cofr centerofview; clip near -10 far 10 position cofr; color ~##num_residues #3d60ffff; transparency 50
+alias usage cootmode_mesh synopsis "Apply the mesh Coot-style display preset"
+```
+
+### `ca_and_sidechains`
+
+Shows a CA trace for proteins or phosphate backbone trace for nucleic acids, plus protein sidechains and nucleic-acid bases.
+
+Usage: `ca_and_sidechains <model-spec>`
+
+```chimerax
 alias ca_and_sidechains ~rib $1; ~surf $1; ~disp $1; disp @CA&protein&$1; disp @P&nucleic&$1; style $1 stick; disp sidechain&$1; disp ~backbone&nucleic&$1; size stickradius 0.1; size pseudobondradius 0.1
+alias usage ca_and_sidechains synopsis "Show CA or phosphate trace plus sidechains or bases" $1 "model-spec"
+```
+
+### `ca_trace`
+
+Shows a CA trace for proteins and a phosphate trace for nucleic acids.
+
+Usage: `ca_trace <model-spec>`
+
+```chimerax
 alias ca_trace ~rib $1; ~surf $1; ~disp $1; disp @CA&protein&$1; disp @P&nucleic&$1; style $1 stick; size stickradius 0.1; size pseudobondradius 0.1
+alias usage ca_trace synopsis "Show a CA or phosphate trace" $1 "model-spec"
 ```
-`ca_and_sidechains` will display the selected model (executed as e.g. `ca_and_sidechains #1`) as a C-alpha (or phosphate for nucleic acids) backbone with attached sidechains/bases. `ca_trace` will do the same, just without the sidechains/bases.  
 
-```
+### `map_sphere_15`
+
+Zones maps to a 15 A sphere around the center of rotation.
+
+Usage: `map_sphere_15`
+
+```chimerax
 alias map_sphere_15 volume unzone ~##num_residues; sel; close #10000; marker #10000 position cofr; sel ~sel; volume zone ~##num_residues nearAtoms sel minimalBounds true range 15; close #10000
-alias map_unsphere volume unzone ~##num_residues
+alias usage map_sphere_15 synopsis "Zone maps to a 15 A sphere around the center of rotation"
 ```
-`map_sphere_15` will limit display of all maps to a spherical 15Å zone around the center of rotation.  
 
-```
-alias default_mol_display ~disp target a; rib; rainbow chain palette RdYlBu-5; lighting soft
-```
-A nice default display setting for proteins.  
+### `cubic_map`
 
-```
-alias hidemaps surface unzone ~##num_residues; sel; close #10000; marker #10000 position cofr; sel ~sel; surface zone ~##num_residues nearAtoms sel distance 0; close #10000
-alias showmaps surface unzone ~##num_residues
-```
-`hidemaps` and `showmaps` allow quick toggling of the display of the current maps, in order to view or interact with the atomic model underneath. Most useful bound to buttons (see below)  
+Creates a spherical mask map on a cubic grid.
 
-```
-alias caps_off surface cap false
-alias caps_on surface cap true
-```
-I like having aliases to quickly switch surface caps on and off, as displaying caps can be useful for figures, but dramatically slows down rotation/translation of large maps (especially with `full` lighting).  
+Usage: `cubic_map <sphere-radius>`
 
-```
-alias selbetween ks ri
-```
-Selects all residues (inclusive) between the selected residues. Temporary I think (until this is officially added as a selection mode in ChimeraX).  
-
-```
-alias helix setattr $1 res is_helix true
-alias strand setattr $1 res is_strand true
-alias coil setattr $1 res is_strand false; setattr $1 res is_helix false
-```
-Aliases for changing secondary structure assignment by selection. For example, `helix sel` will set the selected residues as helical, even if they were automatically assigned as strand or coil. Use with caution, and always check _why_ the automated assignment is failing.  
-
-```
-alias rock_movie cofr showpivot false; movie record; rock y 30; wait 136; movie encode ~/Desktop/rock_movie.mp4; stop
-```
-Makes a simple rocking movie, which can be seamlessly looped, e.g. for use in a presentation to show map/model fit. Hides center of rotation indicator if shown.
-
-```
-alias open_vseries "open browse vseries true"
-```
-Creates a volume series using files selected from the file browser GUI.
-
-```
+```chimerax
 alias cubic_map shape sphere radius $1 modelid #10000; volume onesmask #10000 spacing 1 border -0.5
+alias usage cubic_map synopsis "Create a spherical mask map on a cubic grid" $1 "sphere radius"
 ```
-Creates a cubic map with a sphere of density, two times the entered value in both voxels and Å. So `cubic_map 128` will create a new map with 256px sides and 1Å spacing. Useful to create a new map to use for resampling another map.
 
-```
-alias local_fitmap ~sel; close #10000-10001; marker #10000 position cofr; sel #10000; volume zone $2 nearAtoms sel range $3 newMap true modelid 10001 minimalbounds true; fitmap $1 inmap #10001 eachmodel true; close #10001; close sel; show $2
-```
-Fits model(s) or map(s) to a spherical zone of a single target map. The zone is defined by a radius in Å with respect to the center of rotation. Usage `local_fitmap #models_to_fit #target_map radius`.
+### `map_unsphere`
 
-```
-alias centersel cofr sel; clip near 10 position cofr; clip far -10 position cofr; cofr centerOfView showpivot true; view sel
-```
-Centers the selection in the view, and moves the center of rotation to the center of the selection.
+Removes zoning from all maps.
 
+Usage: `map_unsphere`
+
+```chimerax
+alias map_unsphere volume unzone ~##num_residues
+alias usage map_unsphere synopsis "Remove map zoning from all maps"
 ```
+
+### `fit_by_chain`
+
+Splits a model by chain, fits each chain independently into a map, then recombines the result.
+
+Usage: `fit_by_chain <model-spec> <map-spec>`
+
+```chimerax
 alias fit_by_chain split $1; fitmap $1.* inmap $2 eachmodel true; combine $1.* close true
+alias usage fit_by_chain synopsis "Split a model by chain, fit each chain into a map, and recombine" $1 "model-spec" $2 "map-spec"
 ```
-Fits the model (with modelID $1) into map with mapID $2 by rigid body fitting each chain.
 
+### `default_mol_display`
+
+Restores a default ribbon/cartoon molecular display with chain rainbow coloring.
+
+Usage: `default_mol_display`
+
+```chimerax
+alias default_mol_display ~disp; rib; rainbow chain palette RdYlBu-5; lighting soft
+alias usage default_mol_display synopsis "Restore the default cartoon molecular display"
 ```
+
+### `local_fitmap`
+
+Fits a model or map into a local zone cut from a target map around the center of rotation.
+
+Usage: `local_fitmap <model-or-map> <target-map> <zone-radius>`
+
+```chimerax
+alias local_fitmap ~sel; close #10000-10001; marker #10000 position cofr; sel #10000; volume zone $2 nearAtoms sel range $3 newMap true modelid 10001 minimalbounds true; fitmap $1 inmap #10001 eachmodel true; close #10001; close sel; show $2
+alias usage local_fitmap synopsis "Fit a model or map into a local zone around the center of rotation" $1 "model or map to fit" $2 "target map" $3 "zone radius"
+```
+
+### `caps_off`
+
+Turns clipped surface caps off.
+
+Usage: `caps_off`
+
+```chimerax
+alias caps_off surface cap false
+alias usage caps_off synopsis "Turn clipped surface caps off"
+```
+
+### `caps_on`
+
+Turns clipped surface caps on.
+
+Usage: `caps_on`
+
+```chimerax
+alias caps_on surface cap true
+alias usage caps_on synopsis "Turn clipped surface caps on"
+```
+
+### `open_vseries`
+
+Opens a file browser with volume-series mode enabled.
+
+Usage: `open_vseries`
+
+```chimerax
+alias open_vseries "open browse vseries true"
+alias usage open_vseries synopsis "Open a file browser with volume series enabled"
+```
+
+### `selbetween`
+
+Selects residues between the current selection endpoints.
+
+Usage: `selbetween`
+
+```chimerax
+alias selbetween ks ri
+alias usage selbetween synopsis "Select residues between the current selection endpoints"
+```
+
+### `helix`
+
+Marks selected residues as helix.
+
+Usage: `helix <residue-spec>`
+
+```chimerax
+alias helix setattr $1 res is_helix true
+alias usage helix synopsis "Mark residues as helix" $1 "residue-spec"
+```
+
+### `strand`
+
+Marks selected residues as strand.
+
+Usage: `strand <residue-spec>`
+
+```chimerax
+alias strand setattr $1 res is_strand true
+alias usage strand synopsis "Mark residues as strand" $1 "residue-spec"
+```
+
+### `coil`
+
+Clears helix and strand assignment for selected residues.
+
+Usage: `coil <residue-spec>`
+
+```chimerax
+alias coil setattr $1 res is_strand false; setattr $1 res is_helix false
+alias usage coil synopsis "Clear helix and strand assignment for residues" $1 "residue-spec"
+```
+
+### `rock_movie`
+
+Records a rocking movie to `~/Desktop/rock_movie.mp4`.
+
+Usage: `rock_movie`
+
+```chimerax
+alias rock_movie cofr showpivot false; movie record; rock y 50; wait 600; movie encode ~/Desktop/rock_movie.mp4; stop
+alias usage rock_movie synopsis "Record a rocking movie and save it to the default Desktop file"
+```
+
+### `centersel`
+
+Centers on the current selection and applies local clipping around it.
+
+Usage: `centersel`
+
+```chimerax
+alias centersel cofr sel; clip near 10 position cofr; clip far -10 position cofr; cofr centerOfView showpivot true; view sel
+alias usage centersel synopsis "Center the view on the selection and apply local clipping"
+```
+
+### `volume_project`
+
+Displays a map as a projected image volume.
+
+Usage: `volume_project <map-spec>`
+
+```chimerax
 alias volume_project set bgColor black; volume $1 step 1 sd_level 0,0 sd_level 50,1 color white color white style image projection_mode auto maximum_intensity_projection true bt_correction true linear_interpolation true; lighting depth_cue false
-```
-Displays the map with `#map_id` as a projection, rather than surface. Can be useful for membrane proteins in micelles.
-
-**Shortcut buttons**
-```
-buttonpanel Shortcuts rows 3 columns 5
-buttonpanel Shortcuts add Vol_Viewer command "tool show 'Volume Viewer'"
-buttonpanel Shortcuts add Model_Panel command "tool show Models"
-buttonpanel Shortcuts add Log command "tool show Log"
-buttonpanel Shortcuts add default_disp command "default_mol_display"
-buttonpanel Shortcuts add map_sphere command "map_sphere_15"
-buttonpanel Shortcuts add map_unsphere command "map_unsphere"
-buttonpanel Shortcuts add cofron command "cofron"
-buttonpanel Shortcuts add cofroff command "cofroff"
-buttonpanel Shortcuts add cootmode command "cootmode"
-buttonpanel Shortcuts add mark_cofr command "marker #20000 position cofr radius 1"
-buttonpanel Shortcuts add hidemaps command "hidemaps"
-buttonpanel Shortcuts add showmaps command "showmaps"
-buttonpanel Shortcuts add reset_mouse_and_help command "mousemode alt right contour ; mousemode right clip ; mousemode alt left 'translate selected models' ; mousemode shift left 'rotate selected models' ; mousemode alt control left 'pick blobs'; help https://github.com/olibclarke/chimerax-trimmings/blob/main/default_mousemodes.md"
+alias usage volume_project synopsis "Display a map as a maximum-intensity projection" $1 "map-spec"
 ```
 
-The first line will create a 3x5 panel of buttons that may be docked to a position of your choosing (I prefer the upper right - remember to right-click and check "Save tool position" & "Dockable tool" to make this persist), with useful shortcuts. Most are documented above; the only one that isn't is `mark cofr`, which places a marker at the center of rotation (useful for measurements of map features).
+### `split_diff_map`
 
-There are two additional buttons that I use **which will only work when sequential model display controls are activated in the model panel, and when an additional startup script is provided**:
+Replaces a map with a scaled positive/negative mesh difference map.
 
-```
-buttonpanel Shortcuts add previous_model command "prevmodel"
-buttonpanel Shortcuts add next_model command "nextmodel"
-```
-**Startup script:**
+Usage: `split_diff_map <input-map> <output-model-id>`
 
-```python
-def next_model(session):
-    from chimerax.model_panel.tool import model_panel
-    mp = model_panel(session, "Model Panel")
-    mp._next_model()
-
-def previous_model(session):
-    from chimerax.model_panel.tool import model_panel
-    mp = model_panel(session, "Model Panel")
-    mp._previous_model()
-def register_command(logger):
-    from chimerax.core.commands import register, CmdDesc
-    register('nextmodel', CmdDesc(synopsis="show next model"), next_model, logger=logger)
-    register('prevmodel', CmdDesc(synopsis="show previous model"), previous_model, logger=logger)
-
-register_command(session.logger)
+```chimerax
+alias split_diff_map volume scale $1 rms 1 modelId $2; close $1; volume $2 capFaces false meshLighting false squareMesh false level -3 color #da1200000000 level 3 color #0000bda00000; lighting depthCue true; volume $2 style mesh
+alias usage split_diff_map synopsis "Replace a map with a scaled positive and negative mesh difference map" $1 "input map" $2 "output model-id"
 ```
 
-The above text needs to be placed in a `.py` file, and sourced at startup, by adding a line with the location of the script to the startup section of the preferences, e.g.:
+### `local_diff_map`
 
-```
-runscript "/home/chimera_startup/chimerax_startup.py"
-```
+Builds a local difference map from two maps around a model.
 
-These nextmodel/prevmodel buttons will allow for quick switching between models, without needing to activate the model panel.
+Usage: `local_diff_map <model-spec> <first-map> <second-map>`
 
-**Function Key Bindings**
+Depends on: `split_diff_map`
 
-In ChimeraX, commands can be bound to function keys (F1-F12). I like to bind F1 & F2 to next/previous model, F3 to centersel, and F4 to view all, as so (just add to the startup section of preferences):
-
-```
-fun F1 prevmodel
-fun F2 nextmodel
-fun F3 centersel
-fun F4 view all
+```chimerax
+alias local_diff_map view name tmp; close #1001,1002,1003,1004,1005; fitmap $1 inMap $2; vol zone $2 near $1 range 5 newMap true modelId 1000 minimalBounds true; fitmap $1 inMap $3; vol zone $3 near $1 range 5 newMap true modelId 1001 minimalBounds true; volume scale #1000 sd 0.1 modelId 1002; volume scale #1001 sd 0.1 modelId 1003; fitmap #1003 inMap #1002; volume resample #1003 onGrid #1002 modelId 1004; volume subtract #1002 #1004 modelId 1005 minRms true; volume #1005 step 1; split_diff_map #1005 #1006; close #1000,1001,1002,1003,1004,1005; view tmp
+alias usage local_diff_map synopsis "Build a local difference map between two fitted maps around a model" $1 "model-spec" $2 "first map" $3 "second map"
 ```
 
+## Notes
 
+- The Python file is meant to be sourced inside ChimeraX with `runscript`; it is not a standalone Python program.
+- `nextmodel` and `prevmodel` use the Model Panel tool and therefore depend on ChimeraX's current Model Panel implementation.
+- If you move the repository, update the `runscript` path in the first line of your Startup preferences panel.
+
+## Example 
 I prefer to operate ChimeraX with all panels undocked by default (except for this button panel!), as I find this is the best way to make use of screen real estate on a laptop (which is how I mostly work). So I have a button panel that allows me to quickly access the volume viewer, model panel and log, as well as other shortcuts that I find useful to have on hand. Here is what this looks like in practice:
 
 <img width="1624" alt="image" src="https://github.com/olibclarke/chimeras-trimmings/assets/19766818/7f8f578a-48a3-4474-9526-72da8e7a4472">
