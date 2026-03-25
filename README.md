@@ -61,6 +61,8 @@ It currently includes buttons for:
 
 ## Alias Reference
 
+_**Note: for all of these aliases, on the Chimerax command line you can type "help `cofron`" or "usage `cofron`" for example to get a short description of usage of the indicated alias in the Log**_
+
 ### `cofron`
 
 Centers the rotation point between the clip planes and shows the pivot marker.
