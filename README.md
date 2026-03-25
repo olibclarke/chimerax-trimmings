@@ -36,6 +36,7 @@ The Python script registers:
 - `F5`: Toggle maps
 - `F6`: Toggle models
 - `F7`: Cycle lighting presets
+- `F8`: Cycle model display options
 
 ## Button Panel
 
