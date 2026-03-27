@@ -210,6 +210,7 @@ def map_salami(
     model=None,
     zone=2.0,
     map=None,
+    patches=None,
     segment_size=40,
     image_height=2000,
     output_dir=os.path.expanduser("~/Desktop"),
@@ -225,6 +226,9 @@ def map_salami(
         Surface-zoning distance in Angstroms. Default 2.0.
     map : Volume
         Map whose displayed surface/mesh will be zoned around each residue window.
+    patches : int, optional
+        If given, pass `maxComponents` to `surface zone` to limit the number
+        of disconnected density patches kept.
     segment_size : int, optional
         Target number of residues per segment before extending to avoid breaking a
         secondary-structure element, with tiny terminal leftovers merged into
@@ -253,6 +257,8 @@ def map_salami(
         raise UserError("segment_size must be at least 1.")
     if zone <= 0:
         raise UserError("zone must be greater than 0.")
+    if patches is not None and patches < 1:
+        raise UserError("patches must be at least 1.")
     if image_height is not None and image_height < 1:
         raise UserError("image_height must be at least 1.")
     if structure is None:
@@ -270,6 +276,21 @@ def map_salami(
     display_state = _display_state(session)
     atom_display_state = _atom_display_state(structure)
     metadata_rows = []
+    metadata_fieldnames = [
+        "image_file",
+        "chain_id",
+        "start_residue",
+        "end_residue",
+        "residue_count",
+        "zone_offset_a",
+        "surface_levels",
+        "image_levels",
+        "image_pixel_size_a",
+        "panel_width_a",
+        "panel_height_a",
+    ]
+    if patches is not None:
+        metadata_fieldnames.append("patches")
     panel_index = 1
     saved_view = NamedView(session.main_view, session.main_view.center_of_rotation, session.models.list())
     starting_scene_name = "map_salami_scene_start"
@@ -294,7 +315,10 @@ def map_salami(
                         "The supplied map has no displayed surfaces to zone. Please show it as a surface or mesh first."
                     )
 
-                run(session, f"surface zone {map_model.atomspec} near {residue_spec} distance {zone}")
+                zone_cmd = f"surface zone {map_model.atomspec} near {residue_spec} distance {zone}"
+                if patches is not None:
+                    zone_cmd += f" maxComponents {int(patches)}"
+                run(session, zone_cmd)
 
                 for model in session.models.list():
                     if tuple(model.id) not in (tuple(structure.id), tuple(map_model.id)):
@@ -360,23 +384,24 @@ def map_salami(
 
                     start_residue = window_residues[0]
                     end_residue = window_residues[-1]
-                    metadata_rows.append(
-                        {
-                            "image_file": os.path.basename(image_path),
-                            "chain_id": chain.chain_id,
-                            "start_residue": _residue_id_text(start_residue),
-                            "end_residue": _residue_id_text(end_residue),
-                            "residue_count": len(window_residues),
-                            "zone_offset_a": _format_sigfigs(zone),
-                            "surface_levels": ";".join(str(surface.level) for surface in map_model.surfaces),
-                            "image_levels": ";".join(
-                                f"{level}:{brightness}" for level, brightness in map_model.image_levels
-                            ),
-                            "image_pixel_size_a": _format_sigfigs(image_pixel_size_a),
-                            "panel_width_a": _format_sigfigs(width_a),
-                            "panel_height_a": _format_sigfigs(height_a),
-                        }
-                    )
+                    row = {
+                        "image_file": os.path.basename(image_path),
+                        "chain_id": chain.chain_id,
+                        "start_residue": _residue_id_text(start_residue),
+                        "end_residue": _residue_id_text(end_residue),
+                        "residue_count": len(window_residues),
+                        "zone_offset_a": _format_sigfigs(zone),
+                        "surface_levels": ";".join(str(surface.level) for surface in map_model.surfaces),
+                        "image_levels": ";".join(
+                            f"{level}:{brightness}" for level, brightness in map_model.image_levels
+                        ),
+                        "image_pixel_size_a": _format_sigfigs(image_pixel_size_a),
+                        "panel_width_a": _format_sigfigs(width_a),
+                        "panel_height_a": _format_sigfigs(height_a),
+                    }
+                    if patches is not None:
+                        row["patches"] = int(patches)
+                    metadata_rows.append(row)
                 finally:
                     structure.scene_position = original_structure_position
                     map_model.scene_position = original_map_position
@@ -389,7 +414,7 @@ def map_salami(
 
         csv_path = os.path.join(output_dir, "map_salami_metadata.csv")
         with open(csv_path, "w", newline="", encoding="utf-8") as handle:
-            writer = csv.DictWriter(handle, fieldnames=list(metadata_rows[0].keys()))
+            writer = csv.DictWriter(handle, fieldnames=metadata_fieldnames)
             writer.writeheader()
             writer.writerows(metadata_rows)
 
@@ -415,6 +440,7 @@ def register_command(logger):
             ("model", AtomicStructureArg),
             ("map", MapArg),
             ("zone", FloatArg),
+            ("patches", IntArg),
             ("segment_size", IntArg),
             ("image_height", IntArg),
             ("output_dir", SaveFolderNameArg),
