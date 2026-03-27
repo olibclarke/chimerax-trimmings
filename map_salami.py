@@ -1,4 +1,3 @@
-
 import csv
 import os
 from uuid import uuid4
@@ -98,6 +97,25 @@ def _window_ranges(residues, window_size):
             windows[-2] = (prev_start, last_end)
             windows.pop()
     return windows
+
+
+def _selected_residue_blocks(residues, selected_residue_keys=None):
+    if selected_residue_keys is None:
+        return [residues] if len(residues) > 0 else []
+
+    from chimerax.atomic import Residues
+
+    blocks = []
+    block = []
+    for residue in residues:
+        if _residue_key(residue) in selected_residue_keys:
+            block.append(residue)
+        elif block:
+            blocks.append(Residues(block))
+            block = []
+    if block:
+        blocks.append(Residues(block))
+    return blocks
 
 
 def _principal_axis_transform(coords):
@@ -253,7 +271,7 @@ def map_salami(
         If given, pass `maxComponents` to `surface zone` to limit the number
         of disconnected density patches kept.
     movie : bool, optional
-        If true, also render a 4k movie that transitions through the starting
+        If true, also render a movie that transitions through the starting
         scene and all generated panel scenes, rocking each panel scene around
         the y axis.
     movie_resolution : {"4k", "1080p"}, optional
@@ -280,6 +298,7 @@ def map_salami(
 
     structure = model
     map_model = map
+    output_dir = os.path.expanduser(output_dir)
     panel_pad = 0.01
     start_window_width, start_window_height = session.main_view.window_size
     start_aspect = start_window_width / max(start_window_height, 1)
@@ -340,120 +359,120 @@ def map_salami(
 
     try:
         for chain in structure.chains:
-            residues = _polymer_residues_for_chain(chain)
-            if selected_residue_keys is not None:
-                residues = Residues([r for r in residues if _residue_key(r) in selected_residue_keys])
-            if len(residues) == 0:
+            chain_residues = _polymer_residues_for_chain(chain)
+            residue_blocks = _selected_residue_blocks(chain_residues, selected_residue_keys)
+            if len(residue_blocks) == 0:
                 continue
 
-            for start_index, end_index in _window_ranges(residues, segment_size):
-                window_residues = residues[start_index : end_index + 1]
-                residue_spec = concise_residue_spec(session, window_residues)
-                panel_atoms = window_residues.atoms
-                if len(panel_atoms) == 0:
-                    continue
+            for residues in residue_blocks:
+                for start_index, end_index in _window_ranges(residues, segment_size):
+                    window_residues = residues[start_index : end_index + 1]
+                    residue_spec = concise_residue_spec(session, window_residues)
+                    panel_atoms = window_residues.atoms
+                    if len(panel_atoms) == 0:
+                        continue
 
-                if len(map_model.surfaces) == 0:
-                    raise UserError(
-                        "The supplied map has no displayed surfaces to zone. Please show it as a surface or mesh first."
-                    )
+                    if len(map_model.surfaces) == 0:
+                        raise UserError(
+                            "The supplied map has no displayed surfaces to zone. Please show it as a surface or mesh first."
+                        )
 
-                zone_cmd = f"surface zone {map_model.atomspec} near {residue_spec} distance {zone}"
-                if patches is not None:
-                    zone_cmd += f" maxComponents {int(patches)}"
-                run(session, zone_cmd)
+                    zone_cmd = f"surface zone {map_model.atomspec} near {residue_spec} distance {zone}"
+                    if patches is not None:
+                        zone_cmd += f" maxComponents {int(patches)}"
+                    run(session, zone_cmd)
 
-                for model in session.models.list():
-                    if tuple(model.id) not in (tuple(structure.id), tuple(map_model.id)):
-                        model.display = False
-                structure.display = True
-                map_model.display = True
-                structure.atoms.displays = False
-                panel_atoms.displays = True
-                run(session, f"~rib {structure.atomspec}; ~surf {structure.atomspec}; show {residue_spec} atoms")
-                for surface in map_model.surfaces:
-                    surface.display = True
-                session.update_loop.update_graphics_now()
-
-                coords = panel_atoms.scene_coords
-                if len(coords) == 0:
-                    raise UserError(f"Residue window for panel {panel_index} has no displayed atoms.")
-
-                transform = _principal_axis_transform(coords)
-                original_structure_position = structure.scene_position
-                structure.scene_position = transform * structure.scene_position
-                original_map_position = map_model.scene_position
-                map_model.scene_position = transform * map_model.scene_position
-
-                try:
-                    view_command(
-                        session,
-                        Objects(atoms=panel_atoms, models=[map_model]),
-                        clip=True,
-                        cofr=True,
-                        orient=True,
-                        pad=panel_pad,
-                        need_undo=False,
-                    )
+                    for model in session.models.list():
+                        if tuple(model.id) not in (tuple(structure.id), tuple(map_model.id)):
+                            model.display = False
+                    structure.display = True
+                    map_model.display = True
+                    structure.atoms.displays = False
+                    panel_atoms.displays = True
+                    run(session, f"~rib {structure.atomspec}; ~surf {structure.atomspec}; show {residue_spec} atoms")
+                    for surface in map_model.surfaces:
+                        surface.display = True
                     session.update_loop.update_graphics_now()
 
-                    atom_bounds = panel_atoms.scene_bounds
-                    if atom_bounds is not None:
-                        session.main_view.camera.view_all(
-                            atom_bounds, window_size=(int(image_width), int(image_height)), pad=panel_pad
+                    coords = panel_atoms.scene_coords
+                    if len(coords) == 0:
+                        raise UserError(f"Residue window for panel {panel_index} has no displayed atoms.")
+
+                    transform = _principal_axis_transform(coords)
+                    original_structure_position = structure.scene_position
+                    structure.scene_position = transform * structure.scene_position
+                    original_map_position = map_model.scene_position
+                    map_model.scene_position = transform * map_model.scene_position
+
+                    try:
+                        view_command(
+                            session,
+                            Objects(atoms=panel_atoms, models=[map_model]),
+                            clip=True,
+                            cofr=True,
+                            orient=True,
+                            pad=panel_pad,
+                            need_undo=False,
                         )
-                        session.main_view.center_of_rotation = atom_bounds.center()
                         session.update_loop.update_graphics_now()
 
-                    panel_center = panel_atoms.scene_coords.mean(axis=0)
-                    image_pixel_size_a = float(session.main_view.pixel_size(panel_center))
+                        atom_bounds = panel_atoms.scene_bounds
+                        if atom_bounds is not None:
+                            session.main_view.camera.view_all(
+                                atom_bounds, window_size=(int(image_width), int(image_height)), pad=panel_pad
+                            )
+                            session.main_view.center_of_rotation = atom_bounds.center()
+                            session.update_loop.update_graphics_now()
 
-                    atom_xyz_min = panel_atoms.scene_coords.min(axis=0)
-                    atom_xyz_max = panel_atoms.scene_coords.max(axis=0)
-                    size = atom_xyz_max - atom_xyz_min
-                    if len(size) == 3:
-                        width_a, height_a, depth_a = [float(v) for v in size]
-                    else:
-                        width_a = height_a = depth_a = 0.0
+                        panel_center = panel_atoms.scene_coords.mean(axis=0)
+                        image_pixel_size_a = float(session.main_view.pixel_size(panel_center))
 
-                    scene_name = f"map_salami_scene_{panel_index}"
-                    run(session, f"scenes save {_quote_string(scene_name)}")
+                        atom_xyz_min = panel_atoms.scene_coords.min(axis=0)
+                        atom_xyz_max = panel_atoms.scene_coords.max(axis=0)
+                        size = atom_xyz_max - atom_xyz_min
+                        if len(size) == 3:
+                            width_a, height_a, _depth_a = [float(v) for v in size]
+                        else:
+                            width_a = height_a = 0.0
 
-                    image_path = os.path.join(output_dir, f"{panel_index}.png")
-                    run(
-                        session,
-                        f"save {_quote_path(image_path)} width {int(image_width)} height {int(image_height)}",
-                    )
+                        scene_name = f"map_salami_scene_{panel_index}"
+                        run(session, f"scenes save {_quote_string(scene_name)}")
 
-                    start_residue = window_residues[0]
-                    end_residue = window_residues[-1]
-                    row = {
-                        "image_file": os.path.basename(image_path),
-                        "chain_id": chain.chain_id,
-                        "start_residue": _residue_id_text(start_residue),
-                        "end_residue": _residue_id_text(end_residue),
-                        "residue_count": len(window_residues),
-                        "zone_offset_a": _format_sigfigs(zone),
-                        "surface_levels": ";".join(str(surface.level) for surface in map_model.surfaces),
-                        "image_levels": ";".join(
-                            f"{level}:{brightness}" for level, brightness in map_model.image_levels
-                        ),
-                        "image_pixel_size_a": _format_sigfigs(image_pixel_size_a),
-                        "panel_width_a": _format_sigfigs(width_a),
-                        "panel_height_a": _format_sigfigs(height_a),
-                    }
-                    if patches is not None:
-                        row["patches"] = int(patches)
-                    metadata_rows.append(row)
-                    movie_scenes.append(
-                        (scene_name, f"{chain.chain_id}:{_residue_id_text(start_residue)}-{_residue_id_text(end_residue)}")
-                    )
-                finally:
-                    structure.scene_position = original_structure_position
-                    map_model.scene_position = original_map_position
-                    run(session, f"surface unzone {map_model.atomspec}")
-                    _restore_atom_display_state(structure, atom_display_state)
-                panel_index += 1
+                        image_path = os.path.join(output_dir, f"{panel_index}.png")
+                        run(
+                            session,
+                            f"save {_quote_path(image_path)} width {int(image_width)} height {int(image_height)}",
+                        )
+
+                        start_residue = window_residues[0]
+                        end_residue = window_residues[-1]
+                        row = {
+                            "image_file": os.path.basename(image_path),
+                            "chain_id": chain.chain_id,
+                            "start_residue": _residue_id_text(start_residue),
+                            "end_residue": _residue_id_text(end_residue),
+                            "residue_count": len(window_residues),
+                            "zone_offset_a": _format_sigfigs(zone),
+                            "surface_levels": ";".join(str(surface.level) for surface in map_model.surfaces),
+                            "image_levels": ";".join(
+                                f"{level}:{brightness}" for level, brightness in map_model.image_levels
+                            ),
+                            "image_pixel_size_a": _format_sigfigs(image_pixel_size_a),
+                            "panel_width_a": _format_sigfigs(width_a),
+                            "panel_height_a": _format_sigfigs(height_a),
+                        }
+                        if patches is not None:
+                            row["patches"] = int(patches)
+                        metadata_rows.append(row)
+                        movie_scenes.append(
+                            (scene_name, f"{chain.chain_id}:{_residue_id_text(start_residue)}-{_residue_id_text(end_residue)}")
+                        )
+                    finally:
+                        structure.scene_position = original_structure_position
+                        map_model.scene_position = original_map_position
+                        run(session, f"surface unzone {map_model.atomspec}")
+                        _restore_atom_display_state(structure, atom_display_state)
+                    panel_index += 1
 
         if not metadata_rows:
             raise UserError("No polymer residue windows were found in the supplied structure.")
