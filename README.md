@@ -7,6 +7,7 @@ This repository contains:
 
 - `chimerax_trimmings.txt`: Startup commands, aliases, keybindings, and Shortcut buttonpanel setup.
 - `chimerax_trimmings.py`: Companion ChimeraX Python script for a couple of things that are difficult or not possible to implement in ChimeraX command language.
+- `map_salami.py`: Experimental script that , if invoked via runscript, adds a command `map_salami`, which automates the generation of section-by-section map/model density fit figures (can run as `map_salami model #1 map #2 zone 2 segment_size 40 image_height 2000 output_dir ~/Desktop`, everything after map & model is optional)
 
 ## Installation
 
