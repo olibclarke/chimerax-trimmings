@@ -207,13 +207,11 @@ def _format_sigfigs(value, sigfigs=3):
 
 def map_salami(
     session,
-    structure,
-    zone_offset=2.0,
+    model=None,
+    zone=2.0,
     map=None,
-    window_size=40,
-    panel_pad=0.01,
-    image_width=1200,
-    image_height=1200,
+    segment_size=40,
+    image_height=2000,
     output_dir=os.path.expanduser("~/Desktop"),
 ):
     '''
@@ -221,23 +219,20 @@ def map_salami(
 
     Parameters
     ----------
-    structure : AtomicStructure
+    model : AtomicStructure
         Atomic model to segment into residue windows.
-    zone_offset : float, optional
+    zone : float, optional
         Surface-zoning distance in Angstroms. Default 2.0.
     map : Volume
         Map whose displayed surface/mesh will be zoned around each residue window.
-    window_size : int, optional
-        Target residues per segment before extending to avoid breaking a
+    segment_size : int, optional
+        Target number of residues per segment before extending to avoid breaking a
         secondary-structure element, with tiny terminal leftovers merged into
         the neighboring segment. Default 40.
-    panel_pad : float, optional
-        Fractional padding around the region of interest in the saved image.
-        Smaller values give a tighter crop with less whitespace. Default 0.01.
-    image_width : int, optional
-        Width of each saved PNG in pixels. Default 1200.
     image_height : int, optional
-        Height of each saved PNG in pixels. Default 1200.
+        Height of each saved PNG in pixels. Width is computed automatically to
+        preserve the starting scene aspect ratio. If omitted, the starting
+        scene aspect ratio is preserved and the default height is 2000 pixels.
     output_dir : str, optional
         Folder for output PNGs and map_salami_metadata.csv. Default ~/Desktop.
     '''
@@ -248,24 +243,29 @@ def map_salami(
     from chimerax.map import Volume
     from chimerax.std_commands.view import NamedView, view as view_command
 
+    structure = model
     map_model = map
+    panel_pad = 0.01
+    start_window_width, start_window_height = session.main_view.window_size
+    start_aspect = start_window_width / max(start_window_height, 1)
 
-    if window_size < 1:
-        raise UserError("window_size must be at least 1.")
-    if zone_offset <= 0:
-        raise UserError("zone_offset must be greater than 0.")
-    if panel_pad < 0:
-        raise UserError("panel_pad must be greater than or equal to 0.")
-    if image_width < 1:
-        raise UserError("image_width must be at least 1.")
-    if image_height < 1:
+    if segment_size < 1:
+        raise UserError("segment_size must be at least 1.")
+    if zone <= 0:
+        raise UserError("zone must be greater than 0.")
+    if image_height is not None and image_height < 1:
         raise UserError("image_height must be at least 1.")
+    if structure is None:
+        raise UserError("A model must be supplied with the model keyword.")
     if map_model is None:
-        raise UserError("A map model must be supplied with the map_model keyword.")
+        raise UserError("A map model must be supplied with the map keyword.")
     if not os.path.isdir(output_dir):
         raise UserError(f'Output directory does not exist: "{output_dir}"')
     if not isinstance(map_model, Volume):
         raise UserError("The map argument must be a volume model.")
+
+    image_height = int(image_height)
+    image_width = max(1, int(round(image_height * start_aspect)))
 
     display_state = _display_state(session)
     atom_display_state = _atom_display_state(structure)
@@ -282,7 +282,7 @@ def map_salami(
             if len(residues) == 0:
                 continue
 
-            for start_index, end_index in _window_ranges(residues, window_size):
+            for start_index, end_index in _window_ranges(residues, segment_size):
                 window_residues = residues[start_index : end_index + 1]
                 residue_spec = concise_residue_spec(session, window_residues)
                 panel_atoms = window_residues.atoms
@@ -294,7 +294,7 @@ def map_salami(
                         "The supplied map has no displayed surfaces to zone. Please show it as a surface or mesh first."
                     )
 
-                run(session, f"surface zone {map_model.atomspec} near {residue_spec} distance {zone_offset}")
+                run(session, f"surface zone {map_model.atomspec} near {residue_spec} distance {zone}")
 
                 for model in session.models.list():
                     if tuple(model.id) not in (tuple(structure.id), tuple(map_model.id)):
@@ -367,7 +367,7 @@ def map_salami(
                             "start_residue": _residue_id_text(start_residue),
                             "end_residue": _residue_id_text(end_residue),
                             "residue_count": len(window_residues),
-                            "zone_offset_a": _format_sigfigs(zone_offset),
+                            "zone_offset_a": _format_sigfigs(zone),
                             "surface_levels": ";".join(str(surface.level) for surface in map_model.surfaces),
                             "image_levels": ";".join(
                                 f"{level}:{brightness}" for level, brightness in map_model.image_levels
@@ -411,17 +411,15 @@ def register_command(logger):
     from chimerax.map import MapArg
 
     desc = CmdDesc(
-        required=[("structure", AtomicStructureArg)],
-        optional=[("zone_offset", FloatArg)],
         keyword=[
+            ("model", AtomicStructureArg),
             ("map", MapArg),
-            ("window_size", IntArg),
-            ("panel_pad", FloatArg),
-            ("image_width", IntArg),
+            ("zone", FloatArg),
+            ("segment_size", IntArg),
             ("image_height", IntArg),
             ("output_dir", SaveFolderNameArg),
         ],
-        hidden=["map_model"],
+        required_arguments=("model", "map"),
         synopsis="Export segment-wise map-fit panels for one structure and one map",
     )
     register("map_salami", desc, map_salami, logger=logger)
