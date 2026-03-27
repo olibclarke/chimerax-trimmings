@@ -8,6 +8,7 @@ This repository contains:
 - `chimerax_trimmings.txt`: Startup commands, aliases, keybindings, and Shortcut buttonpanel setup.
 - `chimerax_trimmings.py`: Companion ChimeraX Python script for a couple of things that are difficult or not possible to implement in ChimeraX command language.
 - `map_salami.py`: Experimental script that , if invoked via runscript, adds a command `map_salami`, which automates the generation of section-by-section map/model density fit figures (can run as `map_salami model #1 selection /A:100-220 map #2 zone 2 patches 3 movie true movie_resolution 1080p segment_size 40 image_height 2000 output_dir ~/Desktop/map_salami_panels`, everything except for map & model is optional; patches controls `MaxComponents` of surface, defaults to `None`; `movie_resolution` can be either 4k or 1080p, defaults to 1080p; `zone` is the surface zone clipping offset, defaults to 2 Å; `segment_size` is the residue range chunk to use, defaults to 40 but will expand to include entire helix/strand or short terminal segments if needed.)
+- Caveat - I have re-organized, updated, and translated from the original `chimera-trimmings` with the help of an LLM (Codex). I have tried to carefully check for errors and unexpected behaviors, and inspect each ChimeraX command invoked, but if you notice anything broken or unexpected, please let me know and I will do my best to fix it.
 
 ## Installation
 
