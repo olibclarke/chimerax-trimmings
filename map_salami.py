@@ -1,38 +1,21 @@
 import csv
 import os
-from uuid import uuid4
 
 import numpy as np
+
+DEFAULT_OUTPUT_DIR = os.path.expanduser("~/Desktop")
+DEFAULT_SEGMENT_SIZE = 40
+DEFAULT_IMAGE_HEIGHT = 2000
+DEFAULT_ZONE = 2.0
+DEFAULT_PANEL_PAD = 0.01
+MOVIE_RESOLUTIONS = ("4k", "1080p")
+MOVIE_HOLD_FRAMES = 20
+MOVIE_ROCK_FRAMES = 90
+MOVIE_ROCK_ANGLE = 30
 
 
 def _model_id_key(model):
     return tuple(model.id)
-
-
-def _model_id_spec(model_id):
-    if isinstance(model_id, int):
-        model_id = (model_id,)
-    return "#" + ".".join(str(part) for part in model_id)
-
-
-def _model_ids_spec(model_ids):
-    parts = []
-    for model_id in model_ids:
-        if isinstance(model_id, int):
-            model_id = (model_id,)
-        parts.append(".".join(str(part) for part in model_id))
-    return "#" + ",".join(parts)
-
-
-def _find_model_by_id(session, model_id):
-    if isinstance(model_id, int):
-        wanted = (model_id,)
-    else:
-        wanted = tuple(model_id)
-    for model in session.models.list():
-        if tuple(model.id) == wanted:
-            return model
-    return None
 
 
 def _quote_path(path):
@@ -41,16 +24,6 @@ def _quote_path(path):
 
 def _quote_string(value):
     return '"' + str(value).replace('"', '\\"') + '"'
-
-
-def _next_unused_model_id(session, reserved_ids, start=9200):
-    used = {model.id[0] for model in session.models.list()}
-    used.update(reserved_ids)
-    model_id = start
-    while model_id in used:
-        model_id += 1
-    reserved_ids.add(model_id)
-    return model_id
 
 
 def _polymer_residues_for_chain(chain):
@@ -177,12 +150,6 @@ def _principal_axis_transform(coords):
     return translation(center) * rotation_place * translation(-center)
 
 
-def _bounds_size(bounds):
-    xyz_min = np.array(bounds.xyz_min)
-    xyz_max = np.array(bounds.xyz_max)
-    return xyz_max - xyz_min
-
-
 def _residue_id_text(residue):
     insertion = residue.insertion_code if residue.insertion_code else ""
     return f"{residue.number}{insertion}"
@@ -202,10 +169,6 @@ def _restore_display_state(session, states):
         key = _model_id_key(model)
         if key in states:
             model.display = states[key]
-
-
-def _view_name():
-    return f"map_salami_{uuid4().hex}"
 
 
 def _atom_display_state(structure):
@@ -239,18 +202,29 @@ def _overlay_color_name(session):
     return "black" if luminance >= 0.5 else "white"
 
 
+def _movie_size(start_aspect, movie_resolution):
+    max_movie_dim = 3840 if movie_resolution == "4k" else 1080
+    if start_aspect >= 1:
+        movie_width = max_movie_dim
+        movie_height = _even_int(movie_width / start_aspect)
+    else:
+        movie_height = max_movie_dim
+        movie_width = _even_int(movie_height * start_aspect)
+    return _even_int(movie_width), _even_int(movie_height)
+
+
 def map_salami(
     session,
     model=None,
     selection=None,
-    zone=2.0,
+    zone=DEFAULT_ZONE,
     map=None,
     patches=None,
     movie=False,
     movie_resolution="1080p",
-    segment_size=40,
-    image_height=2000,
-    output_dir=os.path.expanduser("~/Desktop"),
+    segment_size=DEFAULT_SEGMENT_SIZE,
+    image_height=DEFAULT_IMAGE_HEIGHT,
+    output_dir=DEFAULT_OUTPUT_DIR,
 ):
     '''
     Export one PNG per local model-map fit segment and a matching CSV metadata file.
@@ -289,7 +263,7 @@ def map_salami(
     output_dir : str, optional
         Folder for output PNGs and map_salami_metadata.csv. Default ~/Desktop.
     '''
-    from chimerax.atomic import Residues, concise_residue_spec
+    from chimerax.atomic import concise_residue_spec
     from chimerax.core.commands import run
     from chimerax.core.errors import UserError
     from chimerax.core.objects import Objects
@@ -299,7 +273,7 @@ def map_salami(
     structure = model
     map_model = map
     output_dir = os.path.expanduser(output_dir)
-    panel_pad = 0.01
+    panel_pad = DEFAULT_PANEL_PAD
     start_window_width, start_window_height = session.main_view.window_size
     start_aspect = start_window_width / max(start_window_height, 1)
 
@@ -309,7 +283,7 @@ def map_salami(
         raise UserError("zone must be greater than 0.")
     if patches is not None and patches < 1:
         raise UserError("patches must be at least 1.")
-    if movie_resolution not in ("4k", "1080p"):
+    if movie_resolution not in MOVIE_RESOLUTIONS:
         raise UserError('movie_resolution must be "4k" or "1080p".')
     if image_height is not None and image_height < 1:
         raise UserError("image_height must be at least 1.")
@@ -358,6 +332,9 @@ def map_salami(
     run(session, f"scenes save {_quote_string(starting_scene_name)}")
 
     try:
+        # Build one panel at a time by shrinking display down to the current
+        # residue window, orienting that window, then restoring the global
+        # session state before moving on.
         for chain in structure.chains:
             chain_residues = _polymer_residues_for_chain(chain)
             residue_blocks = _selected_residue_blocks(chain_residues, selected_residue_keys)
@@ -382,6 +359,9 @@ def map_salami(
                         zone_cmd += f" maxComponents {int(patches)}"
                     run(session, zone_cmd)
 
+                    # Limit the live session display to just the current model
+                    # segment and map so the saved image is generated directly
+                    # from the real scene, not from temporary model copies.
                     for model in session.models.list():
                         if tuple(model.id) not in (tuple(structure.id), tuple(map_model.id)):
                             model.display = False
@@ -405,6 +385,9 @@ def map_salami(
                     map_model.scene_position = transform * map_model.scene_position
 
                     try:
+                        # First fit the window and its zoned map, then tighten
+                        # the final saved frame using the atom bounds so panel
+                        # width tracks the actual segment shape.
                         view_command(
                             session,
                             Objects(atoms=panel_atoms, models=[map_model]),
@@ -431,7 +414,7 @@ def map_salami(
                         atom_xyz_max = panel_atoms.scene_coords.max(axis=0)
                         size = atom_xyz_max - atom_xyz_min
                         if len(size) == 3:
-                            width_a, height_a, _depth_a = [float(v) for v in size]
+                            width_a, height_a = float(size[0]), float(size[1])
                         else:
                             width_a = height_a = 0.0
 
@@ -468,6 +451,8 @@ def map_salami(
                             (scene_name, f"{chain.chain_id}:{_residue_id_text(start_residue)}-{_residue_id_text(end_residue)}")
                         )
                     finally:
+                        # Restore scene transforms and display masks so each
+                        # panel starts from the same clean global state.
                         structure.scene_position = original_structure_position
                         map_model.scene_position = original_map_position
                         run(session, f"surface unzone {map_model.atomspec}")
@@ -488,19 +473,8 @@ def map_salami(
             movie_path = os.path.join(output_dir, "map_salami_movie.mp4")
             movie_label_name = "map_salami_movie_label"
             movie_scalebar_label_name = "map_salami_movie_scalebar_text"
-            hold_frames = 20
-            rock_frames = 90
-            rock_angle = 30
-            max_movie_dim = 3840 if movie_resolution == "4k" else 1080
             overlay_color = _overlay_color_name(session)
-            if start_aspect >= 1:
-                movie_width = max_movie_dim
-                movie_height = _even_int(movie_width / start_aspect)
-            else:
-                movie_height = max_movie_dim
-                movie_width = _even_int(movie_height * start_aspect)
-            movie_width = _even_int(movie_width)
-            movie_height = _even_int(movie_height)
+            movie_width, movie_height = _movie_size(start_aspect, movie_resolution)
 
             def _delete_movie_overlays():
                 try:
@@ -544,9 +518,9 @@ def map_salami(
                 run(session, "wait 1")
                 _set_movie_scalebar()
                 run(session, "wait 1")
-                run(session, f"movie duplicate {hold_frames}")
-                run(session, f"rock y {rock_angle} {rock_frames} cycle {rock_frames}")
-                run(session, f"wait {rock_frames}")
+                run(session, f"movie duplicate {MOVIE_HOLD_FRAMES}")
+                run(session, f"rock y {MOVIE_ROCK_ANGLE} {MOVIE_ROCK_FRAMES} cycle {MOVIE_ROCK_FRAMES}")
+                run(session, f"wait {MOVIE_ROCK_FRAMES}")
 
                 for index, (scene_name, label_text) in enumerate(movie_scenes, start=1):
                     _delete_movie_overlays()
@@ -555,9 +529,9 @@ def map_salami(
                     _set_movie_label(f"{movie_label_name}_{index}", label_text)
                     _set_movie_scalebar()
                     run(session, "wait 2")
-                    run(session, f"movie duplicate {hold_frames}")
-                    run(session, f"rock y {rock_angle} {rock_frames} cycle {rock_frames}")
-                    run(session, f"wait {rock_frames}")
+                    run(session, f"movie duplicate {MOVIE_HOLD_FRAMES}")
+                    run(session, f"rock y {MOVIE_ROCK_ANGLE} {MOVIE_ROCK_FRAMES} cycle {MOVIE_ROCK_FRAMES}")
+                    run(session, f"wait {MOVIE_ROCK_FRAMES}")
 
                 _delete_movie_overlays()
                 run(
