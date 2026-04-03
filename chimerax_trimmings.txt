@@ -1,4 +1,5 @@
-runscript "~/chimerax_trimmings.py"
+runscript "/Users/oc2188/Documents/Codex_coding/chimerax-trimmings/chimerax_trimmings.py"
+runscript "/Users/oc2188/Documents/Codex_coding/chimerax-trimmings/map_salami.py"
 camera ortho
 cofr centerofview
 mousemode alt right contour
@@ -12,14 +13,14 @@ alias cofroff cofr centerofview showpivot false
 alias usage cofroff synopsis "Recenter the rotation point on the view and hide the pivot marker"
 alias symclip cofr centerofview; clip near -$1 far $1 position cofr
 alias usage symclip synopsis "Set symmetric clip planes around the center of rotation" $1 "half-distance"
-alias selmodel sel ##num_residues
-alias usage selmodel synopsis "Select atomic models"
-alias selmap sel ~##num_residues
-alias usage selmap synopsis "Select non-atomic models such as maps"
-alias selside sel sidechain & $1 | ~backbone & nucleic & $1
-alias usage selside synopsis "Select protein sidechains and nucleic-acid bases" $1 "atom-spec"
-alias dispside sel sidechain & $1 | ~backbone & nucleic & $1; disp sel
-alias usage dispside synopsis "Display protein sidechains and nucleic-acid bases" $1 "atom-spec"
+alias modelsel select ##num_residues
+alias usage modelsel synopsis "Select atomic models"
+alias mapsel select ~##num_residues
+alias usage mapsel synopsis "Select non-atomic models such as maps"
+alias sidesel select sidechain & $1 | ~backbone & nucleic & $1
+alias usage sidesel synopsis "Select protein sidechains and nucleic-acid bases" $1 "atom-spec"
+alias sidedisp select sidechain & $1 | ~backbone & nucleic & $1; display sel
+alias usage sidedisp synopsis "Display protein sidechains and nucleic-acid bases" $1 "atom-spec"
 alias cootmode_white set bgColor white; surface cap false; surface style solid; nucleotides #* atoms; lighting flat; graphics silhouettes false; style stick; ~rib; color ##num_residues orange; color byhet ; disp ##num_residues & ##display;  ~disp @H*; style ions sphere; style solvent ball; size ballscale 0.2;  size stickradius 0.07; transparency 85; cofr centerofview; clip near -10 far 10 position cofr; color ~##num_residues medium blue
 alias usage cootmode_white synopsis "Apply the white-background Coot-style display preset"
 alias cootmode set bgColor black; surface cap false; surface style solid; nucleotides #* atoms; lighting flat; graphics silhouettes false; style stick; ~rib; color ##num_residues gold; color byhet ; disp ##num_residues & ##display;  ~disp @H*; style ions sphere; style solvent ball; size ballscale 0.2;  size stickradius 0.07; transparency 70; cofr centerofview; clip near -10 far 10 position cofr; color ~##num_residues cornflower blue
