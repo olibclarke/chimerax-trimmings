@@ -23,10 +23,15 @@ _**Function keys:**_
 **F4** - view all
 
 **F5** - Toggle maps
+
 **F6** - Toggle models
+
 **F7** - Cycle lighting presets
+
 **F8** - Cycle model display options
+
 **F9** - Previous map (Ignores models)
+
 **F10** - Next map (Ignores models)
 
 **For a description of chimerax-trimmings as a whole, see here:** [Readme](README.md)
