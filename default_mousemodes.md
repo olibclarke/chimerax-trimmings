@@ -1,3 +1,5 @@
+_**Mouse modes:**_
+
 **Right-click-drag**: Moves front clip plane
 
 **Shift**-right-click-drag: Moves both clip planes
