@@ -1,15 +1,9 @@
 def next_model(session):
-    from chimerax.model_panel.tool import model_panel
-
-    mp = model_panel(session, "Model Panel")
-    mp._next_model()
+    _step_atomic_model_visibility(session, 1)
 
 
 def previous_model(session):
-    from chimerax.model_panel.tool import model_panel
-
-    mp = model_panel(session, "Model Panel")
-    mp._previous_model()
+    _step_atomic_model_visibility(session, -1)
 
 
 def _model_id_key(model):
@@ -110,6 +104,37 @@ def _visible_atomic_models(session):
     from chimerax.atomic import AtomicStructure
 
     return [m for m in session.models.list(type=AtomicStructure) if m.display]
+
+
+def _atomic_models_in_id_order(session):
+    from chimerax.atomic import AtomicStructure
+
+    models = list(session.models.list(type=AtomicStructure))
+    models.sort(key=lambda model: tuple(model.id))
+    return models
+
+
+def _step_atomic_model_visibility(session, direction):
+    models = _atomic_models_in_id_order(session)
+    if not models:
+        session.logger.info("No atomic models are open.")
+        return
+
+    visible_models = [model for model in models if model.display]
+    if not visible_models:
+        target = models[0 if direction > 0 else -1]
+        target.display = True
+        return
+
+    current = visible_models[-1] if direction > 0 else visible_models[0]
+    current_index = models.index(current)
+    next_index = (current_index + direction) % len(models)
+
+    # Match the old one-at-a-time stepping behavior without relying on
+    # ChimeraX's private Model Panel implementation.
+    for model in visible_models:
+        model.display = False
+    models[next_index].display = True
 
 
 def _next_unused_model_id(session, reserved_ids):
@@ -246,13 +271,13 @@ def register_command(logger):
 
     register(
         "nextmodel",
-        CmdDesc(synopsis="Show the next model in the Model Panel"),
+        CmdDesc(synopsis="Show the next atomic model"),
         next_model,
         logger=logger,
     )
     register(
         "prevmodel",
-        CmdDesc(synopsis="Show the previous model in the Model Panel"),
+        CmdDesc(synopsis="Show the previous atomic model"),
         previous_model,
         logger=logger,
     )
