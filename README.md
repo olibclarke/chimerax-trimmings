@@ -26,8 +26,9 @@ The Python script registers:
 - `prevmodel`
 - `togglemaps`
 - `togglemodels`
+- `reorient`
 
-`togglemaps` and `togglemodels` toggle the currently displayed maps/models on/off. 
+`togglemaps` and `togglemodels` toggle the currently displayed maps/models on/off. `reorient` attempts to orient the view in a sensible direction - aligning the view to the shortest axis of an ellipsoid defined by the visible components - and repeated invocations of the command cycle through alignment to other axes of the ellipsoid.
 
 ## Keybindings
 
