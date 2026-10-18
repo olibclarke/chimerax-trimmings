@@ -1,6 +1,297 @@
 _REORIENT_STATE_VERSION = 2
 
 
+def _motion_units(session):
+    from chimerax.atomic import Structure
+    from chimerax.core.models import Surface
+    from chimerax.map import Volume
+
+    candidates = {
+        model for model in session.models.list()
+        if isinstance(model, (Structure, Surface, Volume))
+        and getattr(model, "has_scene_bounds", True)
+    }
+    # A structure/map owns its surfaces. Move the owner once, never both.
+    units = set()
+    for model in candidates:
+        parent = model.parent
+        while parent is not None and parent not in candidates:
+            parent = parent.parent
+        if parent is None:
+            units.add(model)
+    return units
+
+
+def _requested_motion_units(session, models):
+    from chimerax.core.errors import UserError
+
+    requested = set(models)
+    units = set()
+    for model in _motion_units(session):
+        ancestor = model
+        while ancestor is not None:
+            if ancestor in requested:
+                units.add(model)
+                break
+            ancestor = ancestor.parent
+    if not units:
+        raise UserError("Specify structures, maps, independent surfaces, or their groups.")
+    return units
+
+
+def _active_motion_modes(session, controller):
+    from chimerax.mouse_modes.std_modes import RotateMouseMode, TranslateMouseMode
+
+    class ActiveModelsMixin:
+        icon_file = None
+
+        def models(self):
+            return controller.targets() if controller.enabled else []
+
+        def mouse_down(self, event):
+            controller.finish_gesture()
+            super().mouse_down(event)
+
+        def _rotate(self, axis, angle):
+            if self.models():
+                super()._rotate(axis, angle)
+
+        def _translate(self, shift):
+            if self.models():
+                super()._translate(shift)
+
+        def touchpad_two_finger_trans(self, event):
+            if controller.begin_gesture():
+                super().touchpad_two_finger_trans(event)
+
+        def touchpad_two_finger_twist(self, event):
+            if controller.begin_gesture():
+                super().touchpad_two_finger_twist(event)
+
+        def touchpad_three_finger_trans(self, event):
+            if not controller.begin_gesture():
+                return
+            if "control" in event.modifiers:
+                _dx, dy = event.three_finger_trans
+                trackpad = session.ui.mouse_modes.trackpad
+                scale = trackpad.trackpad_speed * session.main_view.window_size[0]
+                # _translate expects camera-space pixels and converts to scene units.
+                self._translate((0, 0, scale * dy))
+            else:
+                super().touchpad_three_finger_trans(event)
+
+    class ActiveRotate(ActiveModelsMixin, RotateMouseMode):
+        name = "rotate active models"
+
+    class ActiveRotateAndSelect(ActiveRotate):
+        name = "rotate active models and select"
+        click_to_select = True
+
+    class ActiveTranslate(ActiveModelsMixin, TranslateMouseMode):
+        name = "translate active models"
+
+    return ActiveRotate(session), ActiveRotateAndSelect(session), ActiveTranslate(session)
+
+
+class _ModelMotion:
+    def __init__(self, session):
+        from Qt.QtCore import QTimer
+
+        self.session = session
+        self.enabled = False
+        self.active = set()
+        self.saved_bindings = {}
+        self.rotate, self.rotate_select, self.translate = _active_motion_modes(session, self)
+        for mode in (self.rotate, self.rotate_select, self.translate):
+            session.ui.mouse_modes.add_mode(mode)
+        self.gesture_positions = {}
+        # Native touch events have no mouse-up callback. Group a continuous
+        # gesture into one undo action after 300 ms without movement updates.
+        self.gesture_timer = QTimer()
+        self.gesture_timer.setSingleShot(True)
+        self.gesture_timer.setInterval(300)
+        self.gesture_timer.timeout.connect(self.finish_gesture)
+
+    def targets(self):
+        self.active = {model for model in self.active if not model.deleted and model.id is not None}
+        return sorted(self.active, key=lambda model: model.id)
+
+    def begin_gesture(self):
+        models = self.targets() if self.enabled else []
+        if not models:
+            return False
+        if not self.gesture_positions:
+            self.gesture_positions = {model: model.position for model in models}
+        self.gesture_timer.start()
+        return True
+
+    def finish_gesture(self):
+        self.gesture_timer.stop()
+        positions, self.gesture_positions = self.gesture_positions, {}
+        changed = [
+            model for model, position in positions.items()
+            if not model.deleted and model.position != position
+        ]
+        if changed:
+            from chimerax.core.undo import UndoState
+
+            undo = UndoState("move active models")
+            for model in changed:
+                undo.add(model, "position", positions[model], model.position)
+            self.session.undo.register(undo)
+
+    def _bind(self, kind, key, modifiers, mode):
+        manager = self.session.ui.mouse_modes
+        binding = (kind, key, tuple(sorted(modifiers)))
+        if binding not in self.saved_bindings:
+            lookup = manager.mode if kind == "mouse" else manager.trackpad_mode
+            self.saved_bindings[binding] = lookup(key, modifiers, exact=True)
+        if kind == "mouse":
+            manager.bind_mouse_mode(mouse_button=key, mouse_modifiers=modifiers, mode=mode)
+        else:
+            manager.bind_mouse_mode(trackpad_action=key, trackpad_modifiers=modifiers, mode=mode)
+
+    def enable(self):
+        if self.enabled:
+            return
+        from itertools import combinations
+
+        manager = self.session.ui.mouse_modes
+        replacements = {
+            "rotate": self.rotate,
+            "rotate and select": self.rotate_select,
+            "rotate selected models": self.rotate,
+            "translate": self.translate,
+            "translate selected models": self.translate,
+        }
+        for binding in list(manager.bindings):
+            replacement = replacements.get(binding.mode.name)
+            if replacement is not None:
+                replacement.speed = binding.mode.speed
+                self._bind("mouse", binding.button, binding.modifiers, replacement)
+
+        # Trackpad bindings are independent of mouse-button bindings, including
+        # modifier-specific overrides that could otherwise move frozen models.
+        for count in range(5):
+            for modifiers in combinations(("alt", "command", "control", "shift"), count):
+                for action in ("two finger swipe", "twist", "three finger swipe"):
+                    previous = manager.trackpad_mode(action, list(modifiers), exact=True)
+                    replacement = replacements.get(getattr(previous, "name", None))
+                    if replacement is not None:
+                        self._bind("trackpad", action, list(modifiers), replacement)
+        for action, modifiers, mode in (
+            ("two finger swipe", [], self.rotate),
+            ("twist", [], self.rotate),
+            ("three finger swipe", [], self.translate),
+            ("three finger swipe", ["control"], self.translate),
+        ):
+            self._bind("trackpad", action, modifiers, mode)
+        self.enabled = True
+
+    def disable(self):
+        self.finish_gesture()
+        for (kind, key, modifiers), previous in self.saved_bindings.items():
+            manager = self.session.ui.mouse_modes
+            if kind == "mouse":
+                manager.bind_mouse_mode(mouse_button=key, mouse_modifiers=list(modifiers), mode=previous)
+            else:
+                manager.bind_mouse_mode(trackpad_action=key, trackpad_modifiers=list(modifiers), mode=previous)
+        self.saved_bindings.clear()
+        self.enabled = False
+
+
+def _model_motion_controller(session):
+    from chimerax.core.errors import UserError
+
+    if not session.ui.is_gui:
+        raise UserError("Model movement controls require the ChimeraX GUI.")
+    controller = getattr(session, "_trimmings_model_motion", None)
+    if controller is None:
+        controller = _ModelMotion(session)
+        session._trimmings_model_motion = controller
+    return controller
+
+
+def _watch_new_motion_models(session):
+    from chimerax.core.models import ADD_MODELS
+
+    if getattr(session, "_trimmings_motion_added_handler", None) is not None:
+        return
+
+    def activate_new_models(_trigger_name, added_models):
+        controller = getattr(session, "_trimmings_model_motion", None)
+        if controller is None or not controller.enabled:
+            return
+        units = _motion_units(session)
+        new_units = units.intersection(added_models)
+        if new_units:
+            # Finish the old movement before changing its targets. Owned map/
+            # structure surfaces are excluded, so frozen owners stay frozen.
+            controller.finish_gesture()
+            controller.active.intersection_update(units)
+            controller.active.update(new_units)
+
+    session._trimmings_motion_added_handler = session.triggers.add_handler(
+        ADD_MODELS, activate_new_models
+    )
+
+
+def _change_model_motion(session, models, operation):
+    units = _motion_units(session) if models is None else _requested_motion_units(session, models)
+    controller = _model_motion_controller(session)
+    controller.finish_gesture()
+    if not controller.enabled:
+        controller.active = _motion_units(session)
+    if operation == "replace":
+        controller.active = units
+    elif operation == "freeze":
+        controller.active.difference_update(units)
+    else:
+        controller.active.update(units)
+    controller.enable()
+    _watch_new_motion_models(session)
+    model_motion_status(session)
+
+
+def model_motion_active(session, models):
+    """Enable movement for only the specified models, independently of selection."""
+    _change_model_motion(session, models, "replace")
+
+
+def model_motion_freeze(session, models):
+    _change_model_motion(session, models, "freeze")
+
+
+def model_motion_unfreeze(session, models):
+    _change_model_motion(session, models, "unfreeze")
+
+
+def model_motion_all(session):
+    _change_model_motion(session, None, "replace")
+
+
+def model_motion_off(session):
+    controller = getattr(session, "_trimmings_model_motion", None)
+    if controller is not None and controller.enabled:
+        controller.disable()
+    handler = getattr(session, "_trimmings_motion_added_handler", None)
+    if handler is not None:
+        handler.remove()
+        session._trimmings_motion_added_handler = None
+    session.logger.status("Model movement controls off; previous input bindings restored.")
+
+
+def model_motion_status(session):
+    controller = getattr(session, "_trimmings_model_motion", None)
+    if controller is None or not controller.enabled:
+        session.logger.info("Model movement controls are off.")
+        return
+    targets = controller.targets()
+    label = ", ".join(_model_status_label(model) for model in targets) or "none (all frozen)"
+    session.logger.info(f"Active for movement: {label}")
+    session.logger.status(f"Active for movement: {label}")
+
+
 def next_model(session):
     _step_atomic_model_visibility(session, 1)
 
@@ -568,7 +859,25 @@ def previous_map(session):
 
 
 def register_command(logger):
-    from chimerax.core.commands import CmdDesc, register
+    from chimerax.core.commands import CmdDesc, ModelsArg, register
+
+    for name, function, synopsis in (
+        ("active", model_motion_active, "Move only the specified models with mouse and trackpad"),
+        ("freeze", model_motion_freeze, "Freeze the specified models during interactive movement"),
+        ("unfreeze", model_motion_unfreeze, "Add the specified models to the active movement set"),
+    ):
+        register(
+            f"modelmotion {name}",
+            CmdDesc(required=[("models", ModelsArg)], synopsis=synopsis),
+            function,
+            logger=logger,
+        )
+    for name, function, synopsis in (
+        ("all", model_motion_all, "Enable interactive movement for all current models"),
+        ("off", model_motion_off, "Restore the mouse and trackpad bindings from before modelmotion"),
+        ("status", model_motion_status, "List the models currently active for movement"),
+    ):
+        register(f"modelmotion {name}", CmdDesc(synopsis=synopsis), function, logger=logger)
 
     register(
         "nextmodel",
@@ -655,3 +964,7 @@ def register_command(logger):
 
 
 register_command(session.logger)
+
+# Reloading the script also upgrades an already-enabled controller in the session.
+if getattr(getattr(session, "_trimmings_model_motion", None), "enabled", False):
+    _watch_new_motion_models(session)
