@@ -1,5 +1,5 @@
-runscript "/Users/oc2188/Documents/Codex_coding/chimerax-trimmings/chimerax_trimmings.py"
-runscript "/Users/oc2188/Documents/Codex_coding/chimerax-trimmings/map_salami.py"
+runscript "/your/path/here/chimerax_trimmings.py"
+runscript "/your/path/here/map_salami.py"
 camera ortho
 cofr centerofview
 mousemode alt right contour
@@ -99,6 +99,8 @@ fun F7 cyclelighting
 fun F8 cyclemodeldisplay
 fun F9 prevmap
 fun F10 nextmap
+fun F11 lowermapthreshold
+fun F12 raisemapthreshold
 buttonpanel Shortcuts rows 3 columns 5
 buttonpanel Shortcuts add Vol_Viewer command "tool show 'Volume Viewer'"
 buttonpanel Shortcuts add Model_Panel command "tool show Models"
@@ -113,6 +115,6 @@ buttonpanel Shortcuts add mark_cofr command "marker #20000 position cofr radius 
 buttonpanel Shortcuts add togglemaps command "togglemaps"
 buttonpanel Shortcuts add togglemodels command "togglemodels"
 buttonpanel Shortcuts add reset_mouse_and_help command "mousemode alt right contour ; mousemode right clip ; mousemode alt left 'translate selected models' ; mousemode shift left 'rotate selected models' ; mousemode alt control left 'pick blobs'; help https://github.com/olibclarke/chimerax-trimmings/blob/main/default_mousemodes.md"
-buttonpanel Shortcuts add previous_model command "prevmodel"
-buttonpanel Shortcuts add next_model command "nextmodel"
+buttonpanel Shortcuts add previous_model_map command "previtem"
+buttonpanel Shortcuts add next_model_map command "nextitem"
 volume defaultvalues limitVoxelCount false voxelLimitForPlane 1000000000000000 voxelLimitForOpen 1000000000000000 saveSettings true
