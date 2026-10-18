@@ -13,7 +13,7 @@ This repository contains:
 ## Installation
 
 1. Make a local copy of `chimerax_startup.py` (somewhere permanent).
-2. Edit the first line of `chimerax_trimmings.txt` so the `runscript` path points to your local copy of `chimerax_trimmings.py`.
+2. Edit the first two lines of `chimerax_trimmings.txt` so the `runscript` paths point to your local copies of `chimerax_trimmings.py` and `map_salami.py`.
 3. In ChimeraX on macOS, open `UCSF ChimeraX -> Preferences... -> Startup` (I think under Favorites on Windows?)
 4. Paste the contents of your edited `chimerax-trimmings.txt` into the startup commands box.
 5. Restart ChimeraX.
@@ -27,8 +27,65 @@ The Python script registers:
 - `togglemaps`
 - `togglemodels`
 - `reorient`
+- `modelmotion`
 
-`togglemaps` and `togglemodels` toggle the currently displayed maps/models on/off. `reorient` attempts to orient the view in a sensible direction - aligning the view to the shortest axis of an ellipsoid defined by the visible components - and repeated invocations of the command cycle through alignment to other axes of the ellipsoid.
+`togglemaps` and `togglemodels` toggle the currently displayed maps/models on/off. `reorient` attempts to orient the view in a sensible direction - aligning the view to the shortest axis of an ellipsoid defined by the visible components - and repeated invocations of the command cycle through alignment to other axes of the ellipsoid. `modelmotion` activates & freezes selected models for motion, in order to mimick the behavior of legacy Chimera, described in more detail below.
+
+## Modelmotion
+
+The `modelmotion` commands provide legacy Chimera-style activation independently
+of atom/model selection. Structures, maps, and independent surfaces are supported.
+Groups expand to their movable members; surfaces owned by a structure or map move
+with that owner. Specify the owner rather than its surface submodel.
+
+E.g.
+```python
+modelmotion active #1
+modelmotion unfreeze #3
+modelmotion freeze #1
+modelmotion status
+modelmotion all
+modelmotion off
+```
+
+`active` replaces the movement set, `unfreeze` adds models, and `freeze` removes
+models. If `freeze` is the first command, all other current models remain active.
+Newly opened models are active by default; existing frozen models stay frozen.
+An empty active set prevents rotation/translation; clearing selection has no effect.
+
+Mouse and trackpad input work simultaneously and use the same active/frozen model
+set. With the Trimmings startup bindings and ChimeraX's standard middle-button and
+wheel bindings, mouse controls are:
+
+| Mouse input | Behavior |
+| --- | --- |
+| Left drag | Rotate active models together |
+| Middle-button drag | Translate active models in the screen plane |
+| Control + middle-button drag | Translate active models along screen Z |
+| Scroll wheel | Keep the existing whole-view zoom binding |
+| Right drag | Keep the Trimmings clipping control |
+| Alt + right drag | Keep the Trimmings contour control |
+
+Custom mouse bindings are respected: existing model rotation/translation bindings
+are redirected to the active set when `modelmotion` is enabled. Selected-model
+movement bindings then use the active set independently of selection.
+
+| Trackpad gesture | Movement |
+| --- | --- |
+| Two-finger swipe | Rotate the active models together |
+| Two-finger twist | Rotate active models around the screen-normal axis |
+| Three-finger swipe | Translate active models in the screen plane |
+| Control + three-finger swipe | Translate active models along screen Z |
+| Pinch | Keep the existing zoom binding |
+
+Trackpad gestures must be enabled in ChimeraX and available to it from macOS.
+Rotation uses the native active-model bounds center. Mouse bindings that currently
+rotate/translate models are redirected to the same active set; selection, clipping,
+and contour bindings retain their existing behavior. Trackpad movement is undoable
+after a short pause. `modelmotion off` restores the previous mouse and trackpad
+bindings changed on activation.
+Freezing applies to these movement modes; commands such as `fitmap` can still move
+models. Activation is temporary session state and is not saved in session files.
 
 ## Keybindings
 
