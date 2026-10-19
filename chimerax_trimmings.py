@@ -39,11 +39,27 @@ def _requested_motion_units(session, models):
     return units
 
 
+def _rotate_motion_models(mode, axis, angle):
+    from chimerax.geometry import rotation
+
+    models = mode.models()
+    if not models:
+        return
+    scene_axis = mode.camera_position.transform_vector(axis)
+    # View.rotate(..., models) substitutes the models' bounds center. Apply
+    # the transform directly so cofr/cofron's actual pivot is respected.
+    transform = rotation(
+        scene_axis, angle * mode.speed, center=mode.view.center_of_rotation
+    )
+    mode.view.move(transform, models)
+
+
 def _active_motion_modes(session, controller):
     from chimerax.mouse_modes.std_modes import RotateMouseMode, TranslateMouseMode
 
     class ActiveModelsMixin:
         icon_file = None
+        _uses_view_pivot = True
 
         def models(self):
             return controller.targets() if controller.enabled else []
@@ -53,8 +69,7 @@ def _active_motion_modes(session, controller):
             super().mouse_down(event)
 
         def _rotate(self, axis, angle):
-            if self.models():
-                super()._rotate(axis, angle)
+            _rotate_motion_models(self, axis, angle)
 
         def _translate(self, shift):
             if self.models():
@@ -209,6 +224,15 @@ def _model_motion_controller(session):
     if controller is None:
         controller = _ModelMotion(session)
         session._trimmings_model_motion = controller
+    elif not getattr(controller.rotate, "_uses_view_pivot", False):
+        from types import MethodType
+
+        # Update our existing mode instances on reload without losing active
+        # models or the original bindings needed by modelmotion off.
+        controller.finish_gesture()
+        for mode in (controller.rotate, controller.rotate_select, controller.translate):
+            mode._rotate = MethodType(_rotate_motion_models, mode)
+            mode._uses_view_pivot = True
     return controller
 
 
@@ -967,4 +991,5 @@ register_command(session.logger)
 
 # Reloading the script also upgrades an already-enabled controller in the session.
 if getattr(getattr(session, "_trimmings_model_motion", None), "enabled", False):
+    _model_motion_controller(session)
     _watch_new_motion_models(session)
