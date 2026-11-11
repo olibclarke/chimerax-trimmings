@@ -28,8 +28,163 @@ The Python script registers:
 - `togglemodels`
 - `reorient`
 - `modelmotion`
+- `exposedhydrophobics`
+- `hydrophobicpatches`
+- `patchbrowser`
 
 `togglemaps` and `togglemodels` toggle the currently displayed maps/models on/off. `reorient` attempts to orient the view in a sensible direction - aligning the view to the shortest axis of an ellipsoid defined by the visible components - and repeated invocations of the command cycle through alignment to other axes of the ellipsoid. `modelmotion` activates & freezes selected models for motion, in order to mimick the behavior of legacy Chimera, described in more detail below.
+
+## Exposed Hydrophobic Residues
+
+`exposedhydrophobics` replaces the selection with whole protein residues whose
+relative sidechain solvent accessibility exceeds a fractional cutoff.
+
+```chimerax
+exposedhydrophobics #1
+exposedhydrophobics #1/A minimum_exposure 0.4
+exposedhydrophobics #1 residue_names LEU,ILE,VAL,PHE probe_radius 1.4
+exposedhydrophobics #1 minimum_exposure 0.25 minimum_area 10
+```
+
+| Argument | Meaning | Default |
+| --- | --- | --- |
+| Atom specification | Candidate residues, e.g. `#1`, `#1/A`, or `sel` | Required |
+| `minimum_exposure` | Relative sidechain exposure must exceed this fraction, from 0 to 1 | `0.25` (25%) |
+| `minimum_area` | Optional additional sidechain SASA cutoff, in square Angstroms | `0` |
+| `residue_names` | Comma-separated residue names to consider | `ALA,VAL,ILE,LEU,MET,PHE,TRP,PRO` |
+| `probe_radius` | Solvent probe radius in Angstroms | `1.4` |
+
+The calculation uses all non-water atoms in each candidate's model, including
+hidden chains, nucleic acids, ligands, and ions. Restricting candidates to one
+chain does not remove burial by other chains in that model. Separate models are
+calculated independently, so overlapping alternative structures do not bury each
+other. Existing atom radii and any hydrogens present are used. Sidechain area is
+summed using ChimeraX's `sideonly` definition, excluding backbone atoms and CA.
+Glycine therefore has zero sidechain area.
+
+Relative exposure is the sidechain SASA in the full model divided by its sidechain
+SASA with only that residue present. The reference retains the residue's own
+backbone and conformation and uses the same atom radii, hydrogens, and probe radius
+as the full-model calculation. This compares exposed fractions rather than imposing
+the same absolute area on large and small sidechains. It is an isolated-residue
+reference, not a published maximum-accessibility table or tripeptide reference.
+Residues with zero reference area have zero relative exposure. Incomplete
+sidechains are normalized using only the atoms present, so a highly exposed
+fragment does not imply that the missing sidechain would also be exposed.
+
+The command assigns three attributes to every protein residue in the models it
+calculates: `sidechain_sasa` (square Angstroms), `sidechain_sasa_reference` (square
+Angstroms), and `relative_sidechain_sasa` (0 to 1). They support related selections
+without recalculating, for example:
+
+```chimerax
+select #1 & :ARG,LYS,ASP,GLU & ::relative_sidechain_sasa>0.25
+```
+
+Rerun `exposedhydrophobics` after changing coordinates, radii, model composition,
+or the probe radius to refresh those values. It does not create a surface or
+change model visibility, coloring, or coordinates. Selection changes are undoable.
+
+## Binder-Accessible Hydrophobic Patches
+
+`hydrophobicpatches` screens for exposed hydrophobic clusters that a globular
+binder, approximated as a rigid sphere, could contact. It selects the reported
+patches and, by default, gives each patch a distinct atom/cartoon color.
+
+```chimerax
+hydrophobicpatches #1 binder_radius 15
+hydrophobicpatches #1/A binder_mass 15 context #2
+hydrophobicpatches #1 binder_radius 15 samples 128 highlight false
+select #1 & ::hydrophobic_patch_rank=1
+```
+
+Supply exactly one of `binder_radius` (Angstroms) and `binder_mass` (kDa).
+Mass is converted to an equivalent dry sphere at an assumed protein density of
+1.35 g/cm^3; 15 kDa corresponds to about 16.4 Angstroms radius. Use a radius when
+you have a better estimate of the binder's effective steric size.
+
+| Option | Meaning | Default |
+| --- | --- | --- |
+| Atom specification | Candidate residues; the full containing model remains the steric environment | Required |
+| `binder_radius` | Binder sphere radius in Angstroms | Supply this or `binder_mass` |
+| `binder_mass` | Approximate globular binder mass in kDa | Supply this or `binder_radius` |
+| `context` | Additional blocker atoms from separate models, e.g. glycans or assembly partners | None |
+| `minimum_exposure` | Minimum relative sidechain exposure with the solvent probe | `0.25` |
+| `probe_radius` | Solvent probe radius in Angstroms, distinct from the binder radius | `1.4` |
+| `minimum_residues` | Minimum hydrophobic residues in a patch | `3` |
+| `contact_distance` | Maximum atom-surface to binder-surface gap in Angstroms | `3` |
+| `link_distance` | Maximum distance between exposed sidechain atom centers linking residues | `6` |
+| `samples` | Deterministic sphere-placement directions per exposed heavy sidechain atom | `64` |
+| `max_patches` | Maximum number of distinct, non-overlapping patches reported | `10` |
+| `approach` | Require a straight, collision-free approach from outside | `true` |
+| `highlight` | Color patch atoms and cartoons | `true` |
+| `gui` | Automatically open or refresh the patch browser in GUI sessions | `true` |
+| `residue_names` | Hydrophobic residue names | `ALA,VAL,ILE,LEU,MET,PHE,TRP,PRO` |
+
+The screen first applies the same relative sidechain-exposure definition as
+`exposedhydrophobics`, using the solvent probe (1.4 Angstroms by default). It then samples sphere
+placements tangent to exposed sidechain atoms. Every reported patch must have
+one shared clash-free placement near all its reported residues, and its residues
+must form a connected cluster at `link_distance`. With `approach true`, the sphere
+must also have an unobstructed straight outward path to infinity. This is stricter
+than testing whether individual residues are independently accessible.
+
+All non-water atoms in the containing model contribute to exposure and steric
+occlusion, including hidden chains, ligands, and modeled glycans. Each candidate
+model is screened independently; `context` adds blockers from separate models.
+Patches may span chains within a model, but are not combined across models.
+
+Patches are ranked by the summed water-probe SASA of hydrophobic sidechain atoms
+near the sampled binder sphere. This is nearby exposed area, not predicted buried
+interface area or binding energy. The highest-ranked patch is kept first, then
+lower-ranked overlapping alternatives are omitted. Residue attribute
+`hydrophobic_patch_rank` is the rank, or zero for unassigned protein residues in
+the analyzed models. Placement centers and approach directions in scene coordinates
+are available in `session._trimmings_hydrophobic_patches`.
+
+Use these as candidate epitopes for inspection, not predictions of affinity,
+specificity, or binder design success. A sphere omits binder shape, sidechain
+flexibility, missing glycans, and unmodeled membrane/assembly context. Finite
+direction sampling can miss accessible placements; increase `samples` to refine
+the screen. A failed straight-approach test does not rule out a curved approach.
+Incomplete target sidechains retain the exposure limitations described above.
+
+Color and selection changes are undoable together; undo a highlight before
+comparing another set of parameters. `highlight false` leaves colors untouched.
+The command uses NumPy and SciPy supplied with ChimeraX, creates no model copies
+or probe models, and leaves coordinates, map contours, and display masks unchanged.
+
+### Patch Browser
+
+In a graphical ChimeraX session, a search automatically opens a dockable
+**Hydrophobic Patches** panel. Its list-and-navigation layout follows ResNotes,
+but ResNotes does not need to be installed.
+
+- Click a patch in the ranked list, or use **Previous** / **Next**, to select it.
+  Navigation wraps at either end.
+- **Auto-center on patch** fits the patch and adjusts local clipping. Uncheck it
+  to change selection while keeping the current camera.
+- **View from binder approach** orients focused views along the sampled approach
+  direction. Uncheck it to retain the current orientation when centering.
+- **Focus patch** centers the current patch manually.
+- **Restore view** restores the camera, clipping, and rotation center captured
+  when the panel opened. It does not restore or change model positions.
+- **Refresh list** loads the latest search results. New searches refresh the
+  existing panel, and closed-model results are removed automatically.
+
+The details show the residue specification, nearby hydrophobic area, and binder
+sphere radius. Focusing follows a moved target's current transform; rescreen after
+structural edits or changes in the target's position relative to blocker models.
+Hidden models are left hidden, and the panel does not change display masks.
+
+Reopen the latest results with `patchbrowser`. Suppress automatic opening with:
+
+```chimerax
+hydrophobicpatches #1 binder_mass 15 gui false
+```
+
+Without a GUI, searches remain command-only. Browser state is not saved in
+session files; rerun the search after reopening a session.
 
 ## Modelmotion
 
@@ -79,7 +234,8 @@ movement bindings then use the active set independently of selection.
 | Pinch | Keep the existing zoom binding |
 
 Trackpad gestures must be enabled in ChimeraX and available to it from macOS.
-Rotation uses the native active-model bounds center. Mouse bindings that currently
+Rotation uses the current ChimeraX center of rotation, including the pivot set by
+`cofron`, `cofroff`, or an explicit `cofr` position. Mouse bindings that currently
 rotate/translate models are redirected to the same active set; selection, clipping,
 and contour bindings retain their existing behavior. Trackpad movement is undoable
 after a short pause. `modelmotion off` restores the previous mouse and trackpad
