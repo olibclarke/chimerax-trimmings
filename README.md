@@ -39,7 +39,7 @@ The Python script registers:
 
 `shapealign` rigidly aligns large structures without sequence alignment or chain
 pairing. It is included in `chimerax_trimmings.py` and loaded by the usual startup
-file; no separate alignment script is required. To reload it manually:
+file. To reload it manually:
 
 ```chimerax
 runscript /path/to/chimerax_trimmings.py
@@ -57,8 +57,7 @@ shapealign #1 to #2 objective gradient
 ```
 
 The first atom specification identifies one or more moving models; `to` identifies
-one fixed reference. Each moving model is aligned **independently**, not as one
-rigid assembly. Fitting can use selected chains or residues, but each whole
+one fixed reference. Each moving model is aligned independently. Fitting can use selected chains or residues, but each whole
 moving model is repositioned. Hidden atoms in those specifications are included;
 hydrogens and water are excluded. No atom correspondence is required.
 
@@ -68,55 +67,6 @@ using a negative-Laplacian target field, used for both native optimization and
 ranking. Both complete selected densities contribute to normalization; it never
 switches to partial or chain fitting. `partial true` is incompatible with this
 mode. The existing `objective density` remains the default.
-
-Gradient mode first tries principal-axis poses; below its default quality cutoff
-of 0.5 it also searches rotations/translations with FFTs at the next finer
-resolution when available. It retains a wider set of poses through refinement.
-`fallback_correlation` overrides this heuristic cutoff; 0 disables the extra
-search. Its gradient score is not a Pearson CC or interchangeable with density
-mode's score. Optional `color_fit` still reports the separate local density CC.
-
-On the whole 1F88/2RH1 test, gradient mode finds a TM-aligned placement in about
-5-6 seconds, without chain seeds or partial scoring. Its RMSD on the 86 retained
-Matchmaker core pairs is 2.18 Angstroms, repeated across three starting poses.
-This measures core placement accuracy, not the fitting objective or an exact
-superposition of the dimer and fusion construct.
-The 8XP3/9S3D subcomplex test gives 0.79 Angstrom RMSD on retained 18S pairs but
-takes about 14 seconds; whole 6QZP/9S3D takes about 2.5 seconds without FFT backup.
-This is an experimental accuracy/speed tradeoff, not a universal improvement.
-
-The default resolution pyramid is generated from the spatial size of the fitted
-objects, not fixed at 32/16/8 Angstroms. Both endpoints and the intermediate
-resolutions adapt: small objects get a finer range and large objects a coarser
-one. `resolution` overrides the fine endpoint; the coarse endpoint remains
-size-derived. The log prints the chosen range. Temporary grids are arrays, not
-opened volume models. By default the command does not change coordinates, colors,
-visibility, lighting, maps, or the camera. A batch is one undo/redo action; if a
-fit fails, earlier changes in that batch are rolled back. The reference must not
-be part of the moving selection.
-
-The size estimate is the equivalent-volume diameter of a PCA ellipsoid, using
-all three axes of the fitted non-water heavy atoms. The smaller fitted object
-sets the scale. The automatic coarse endpoint is diameter/4; the fine endpoint
-is diameter/12, bounded to 2-8 Angstroms. Intermediate levels are geometric, with
-no greater than a twofold resolution jump. There are no protein-class presets.
-
-For subcomplexes, omitted `partial` automatically uses a partial-template search
-when the smaller/larger atom-count ratio is below 0.75. It is also a backup if
-the initial whole-shape density score is below `fallback_correlation` (default
-0.7). `partial true` forces it; `partial false` disables both automatic triggers.
-The partial method scans translations with FFTs and normalizes density correlation
-over the smaller template's support rather than requiring the entire reference
-to be reproduced. It uses no sequence correspondence.
-
-Weak partial fits (correlation below the smaller of 0.4 and
-`fallback_correlation`) also try up to four substantial polymer chains as pose
-seeds. These are refined at the final resolution and accepted only if the score
-on the same whole inputs improves. This handles cases with unmatched parts on
-both sides, such as the two rhodopsins in 1F88 versus the receptor-lysozyme fusion
-in 2RH1. Chains do not move independently. `partial false` or
-`fallback_correlation 0` disables this extra search; good fits pay no seed-search
-cost.
 
 For already globally aligned models, `radius 30` enables local refinement using
 only non-water heavy-atom centers within 30 Angstroms of the **current center of
@@ -140,24 +90,6 @@ without recoloring. Both default to false, so the normal fast path does no extra
 scoring work. Atom attribute `shape_correlation` contains sampled values; the same
 residue attribute contains their mean over defined fitted atoms.
 
-The independent scoring defaults are 8 Angstrom density resolution and a
-12 Angstrom FWHM Gaussian neighbourhood. On the ribosome test pair, full scoring
-and coloring added about 1.1 seconds. Local-region scoring
-is smaller. No displayed maps are created or modified. Scoring requires
-`move true`, so assigned values describe the applied pose rather than a hypothetical
-dry-run fit.
-
-For 1F88 chain B versus 2RH1 chain A, the automatic range is 11.7 -> 6.74 -> 3.89
-Angstroms, taking about 2-3 seconds on this Mac. Against Matchmaker's 86 retained
-atom pairs, shape fitting gives 1.98 Angstrom RMSD versus Matchmaker's 1.25.
-With both structures selected in full, the chain-seeded backup recovers a
-1.99 Angstrom RMSD on those same core pairs in about 7 seconds, reproducibly
-across three starting poses. The full dimer and fusion do not superimpose.
-The 8XP3 subcomplex selects 44.3 -> 25 -> 14.1 -> 8 Angstroms; its placement differs
-from an 18S-only Matchmaker fit by about 0.5-0.6 Angstrom RMS. These are specific
-benchmarks, not a general guarantee. Nearest-neighbour distances are not used
-as the correctness criterion.
-
 | Option | Meaning | Default |
 | --- | --- | --- |
 | `to` | Reference atom specification in a different model | Required |
@@ -173,18 +105,6 @@ as the correctness criterion.
 | `correlation_window` | Gaussian scoring-neighbourhood FWHM in Angstroms | `12` |
 | `partial` | Force (`true`) or disable (`false`) partial-template search | Automatic when omitted |
 | `fallback_correlation` | Search cutoff: partial/chain backup in density mode, same-objective FFT search in gradient mode; 0 disables quality backups | `0.7` density; `0.5` gradient |
-
-This is a rigid fit, not a sequence alignment or flexible-domain fit.
-Symmetric assemblies may match symmetry-equivalent subunits. Restrict both atom
-specifications to shared regions if their compositions differ substantially.
-`extra_starts 64` broadens the search when principal axes are ambiguous, at a
-time cost. No finite orientation search guarantees the global optimum.
-
-The implementation is CPU-only and uses ChimeraX's compiled Gaussian and fitting
-routines with NumPy; partial searches and optional scoring use bundled SciPy. No extra packages
-or GPU setup are required. See
-[SHAPE_ALIGN.md](SHAPE_ALIGN.md)
-for the method, limitations, and reproducible tests.
 
 ## Exposed Hydrophobic Residues
 
@@ -251,9 +171,8 @@ select #1 & ::hydrophobic_patch_rank=1
 ```
 
 Supply exactly one of `binder_radius` (Angstroms) and `binder_mass` (kDa).
-Mass is converted to an equivalent dry sphere at an assumed protein density of
-1.35 g/cm^3; 15 kDa corresponds to about 16.4 Angstroms radius. Use a radius when
-you have a better estimate of the binder's effective steric size.
+Mass is converted to an equivalent sphere at an assumed protein density of
+1.35 g/cm^3; e.g. 15 kDa corresponds to about 16.4 Angstroms radius.
 
 | Option | Meaning | Default |
 | --- | --- | --- |
