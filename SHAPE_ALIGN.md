@@ -1,14 +1,18 @@
 # Shape Alignment
 
-`shape_align.py` adds `shapealign`, a sequence-independent rigid alignment helper
-for large atomic structures. It is an alternative to Matchmaker when the task is
-overall superposition, not sequence correspondence. It is usable as a standalone
-ChimeraX script; it does not require the other Trimmings helpers.
+`chimerax_trimmings.py` includes `shapealign`, a sequence-independent rigid
+alignment helper for atomic structures. It is an alternative to Matchmaker when
+the task is overall superposition, not sequence correspondence. Loading the main
+Trimmings script registers this command along with the other helpers; there is no
+separate alignment script or additional startup line to install.
+
+If upgrading from the separate helper, remove any old `runscript` line for
+`shape_align.py` from Startup preferences. `map_salami.py` remains separate.
 
 ## Usage
 
 ```chimerax
-runscript /path/to/shape_align.py
+runscript /path/to/chimerax_trimmings.py
 open 6qzp
 open 9s3d
 shapealign #1 to #2
@@ -510,6 +514,9 @@ Use the Python supplied with ChimeraX, not a generic system Python:
 /Applications/ChimeraX_Daily.app/Contents/bin/python3.14 -B -m unittest discover -s tests -v
 ```
 
+The tests import the alignment helpers directly from `chimerax_trimmings.py`.
+Integration checks also load that main script with a session and verify that
+both new and existing commands register without a sibling alignment script.
 The tests do not access the network or need a GUI. For the real pair, provide
 downloaded mmCIF files to the benchmark:
 

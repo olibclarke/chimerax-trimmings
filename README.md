@@ -6,15 +6,14 @@ I would also recommend (if you are using a laptop) going through each tool in th
 This repository contains:
 
 - `chimerax_trimmings.txt`: Startup commands, aliases, keybindings, and Shortcut buttonpanel setup.
-- `chimerax_trimmings.py`: Companion ChimeraX Python script for a couple of things that are difficult or not possible to implement in ChimeraX command language.
+- `chimerax_trimmings.py`: Companion ChimeraX Python commands, including sequence-independent shape alignment and experimental whole-structure gradient scoring. See [SHAPE_ALIGN.md](SHAPE_ALIGN.md).
 - `map_salami.py`: Experimental script that , if invoked via runscript, adds a command `map_salami`, which automates the generation of section-by-section map/model density fit figures (can run as `map_salami model #1 selection /A:100-220 map #2 zone 2 patches 3 movie true movie_resolution 1080p segment_size 40 image_height 2000 output_dir ~/Desktop/map_salami_panels`, everything except for map & model is optional; patches controls `MaxComponents` of surface, defaults to `None`; `movie_resolution` can be either 4k or 1080p, defaults to 1080p; `zone` is the surface zone clipping offset, defaults to 2 Å; `segment_size` is the residue range chunk to use, defaults to 40 but will expand to include entire helix/strand or short terminal segments if needed.)
-- `shape_align.py`: Sequence-independent rigid shape alignment, with optional local refinement, density-fit coloring, and experimental whole-structure gradient scoring. See [SHAPE_ALIGN.md](SHAPE_ALIGN.md).
 - Caveat - I have re-organized, updated, and translated from the original `chimera-trimmings` with the help of an LLM (Codex). I have tried to carefully check for errors and unexpected behaviors, and inspect each ChimeraX command invoked, but if you notice anything broken or unexpected, please let me know and I will do my best to fix it.
 
 ## Installation
 
-1. Put `chimerax_trimmings.txt`, `chimerax_trimmings.py`, `map_salami.py`, and `shape_align.py` somewhere permanent on your machine.
-2. Edit the first three lines of `chimerax_trimmings.txt` so the `runscript` paths point to your local copies of the three Python scripts.
+1. Put `chimerax_trimmings.txt`, `chimerax_trimmings.py`, and `map_salami.py` somewhere permanent on your machine.
+2. Edit the first two lines of `chimerax_trimmings.txt` so the `runscript` paths point to your local copies of the two Python scripts. If upgrading, remove any older separate `runscript` line for `shape_align.py` from Startup preferences; its commands are now included in the main script.
 3. In ChimeraX on macOS, open `UCSF ChimeraX -> Preferences... -> Startup` (I think under Favorites on Windows?)
 4. Paste the contents of your edited `chimerax-trimmings.txt` into the startup commands box.
 5. Restart ChimeraX.
@@ -32,13 +31,19 @@ The Python script registers:
 - `exposedhydrophobics`
 - `hydrophobicpatches`
 - `patchbrowser`
+- `shapealign`
 
 `togglemaps` and `togglemodels` toggle the currently displayed maps/models on/off. `reorient` attempts to orient the view in a sensible direction - aligning the view to the shortest axis of an ellipsoid defined by the visible components - and repeated invocations of the command cycle through alignment to other axes of the ellipsoid. `modelmotion` activates & freezes selected models for motion, in order to mimick the behavior of legacy Chimera, described in more detail below.
 
 ## Fast Shape Alignment
 
 `shapealign` rigidly aligns large structures without sequence alignment or chain
-pairing. Load `shape_align.py` with `runscript`, or use the updated startup file.
+pairing. It is included in `chimerax_trimmings.py` and loaded by the usual startup
+file; no separate alignment script is required. To reload it manually:
+
+```chimerax
+runscript /path/to/chimerax_trimmings.py
+```
 
 ```chimerax
 shapealign #1 to #2

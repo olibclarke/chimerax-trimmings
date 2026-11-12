@@ -1,6 +1,5 @@
 runscript "/your/path/here/chimerax_trimmings.py"
 runscript "/your/path/here/map_salami.py"
-runscript "/your/path/here/shape_align.py"
 camera ortho
 cofr centerofview
 mousemode alt right contour

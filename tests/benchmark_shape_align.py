@@ -9,7 +9,7 @@ from time import perf_counter
 import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from shape_align import shape_align
+from chimerax_trimmings import shape_align
 from test_shape_align import session
 
 
