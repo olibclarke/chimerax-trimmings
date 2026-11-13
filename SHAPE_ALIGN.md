@@ -48,7 +48,39 @@ shapealign sel to #1
 
 The selected atoms determine the fit, but the entire moving model is repositioned.
 Hidden atoms in the specification are included. Hydrogens and water are excluded.
-The reference must not be included in the moving selection.
+The reference is skipped automatically if it is included in the moving selection.
+
+## Prediction Confidence
+
+`confidence auto` (the default) weights models identified by ChimeraX's
+AlphaFold database metadata. Local files without that metadata are not guessed
+from their name, colors, or B-factor range. For local predictions with pLDDT
+stored in the B-factor field, enable it explicitly:
+
+```chimerax
+shapealign #2 to #1 confidence plddt
+shapealign #2 to #1 confidence_moving plddt
+shapealign #2 to #1 confidence_reference plddt
+shapealign #2 to #1 confidence off
+```
+
+`confidence` sets the policy for both atomic inputs; `confidence_moving` and
+`confidence_reference` override it independently. Each accepts `auto`, `off`, or
+`plddt`. Use the side-specific options when only one input is a local prediction.
+Do not force `plddt` on experimental B-factors. Maps are never confidence-weighted.
+The Log reports which atomic inputs were weighted.
+
+Weights rise smoothly from 0 at pLDDT 50 to 0.5 at 70 and 1 at 90; scores below
+50 are ignored and scores above 90 have full weight. This affects centering,
+orientation seeds, automatic fitting scales, and simulated densities throughout
+search and refinement. It works with either objective, local refinement,
+model/map fits, and parallel atomic batches. The entire moving model still moves
+rigidly, including ignored atoms; no atoms are deleted or hidden.
+
+At least four non-collinear atoms with positive weight must remain in each
+atomic fitting region. Optional local correlation scores use the weighted
+densities and are assigned only to retained fitting atoms. pLDDT does not measure
+relative domain placement uncertainty, so inspect multi-domain fits carefully.
 
 ## Choose the Objective
 
@@ -172,8 +204,42 @@ quality-triggered extra searches:
 shapealign #2 to #1 objective gradient fallback_correlation 0
 ```
 
+Batch fits reuse reference densities, gradient fields, and FFTs when their
+settings match. The temporary cache is limited to 256 MiB per fitting process
+and cleared after the command; fitting scratch space is additional. The benefit
+depends on how much reference preparation the models share.
+
 For atom-only density fitting, `partial true` explicitly requests a partial fit;
 `partial false` disables partial fitting. Omitting it allows automatic selection.
+
+## Parallel Batches
+
+The reference is automatically skipped if it falls inside the moving range,
+so broad specifications such as `shapealign #2-1000 to #13` are supported.
+Selecting only the reference does nothing and adds no Undo action.
+
+Global atomic-model batches with at least four moving models automatically use
+the process-available logical CPU count minus one, capped by the number of
+moving models (minimum one worker). CPU affinity limits are respected where
+supported. To select a process count or force serial fitting:
+
+```chimerax
+shapealign #2-100 to #1 workers 4
+shapealign #2-100 to #1 workers 1
+```
+
+`workers 0` selects automatic mode. Explicit counts are limited by the
+available CPUs and number of moving models, without an additional fixed cap.
+Local refinement stays serial in
+automatic mode, but can use explicit workers. Map and mixed-input fits remain
+serial; use `workers 0` or `workers 1` for those.
+
+The command waits for the batch and shows progress. Worker fits use the same
+settings as serial fits. Results are applied in model order after all fits
+succeed, with one Undo action; a failed worker leaves the models unchanged.
+If a fitting model changes during computation, the batch is not applied.
+More workers consume more memory, including a separate preprocessing cache
+and fitting scratch space for each process.
 
 ## Optional Fit Coloring
 
@@ -199,6 +265,10 @@ time.
 
 ## Options
 
+Type `shapealign` or `shapealign help` to open the Log with a short, formatted
+quick reference and a status-bar prompt. Click **All options** or run
+`usage shapealign` for the complete syntax.
+
 | Option | Meaning | Default |
 | --- | --- | --- |
 | Moving specification | Atomic models, atom subsets, maps, or a mixture | Required |
@@ -207,6 +277,10 @@ time.
 | `resolution` | Final fitting scale in Angstroms, at least 2 | Automatic |
 | `max_points` | Maximum source density samples per stage, at least 1000 | `12000` |
 | `extra_starts` | Additional global orientation starts | `0` |
+| `workers` | `0` uses available CPUs minus one, `1` serial, or an explicit process count for atomic-model batches | `0` |
+| `confidence` | `auto`, `off`, or `plddt` weighting for atomic inputs | `auto` |
+| `confidence_moving` | Override confidence weighting for moving models | Inherit `confidence` |
+| `confidence_reference` | Override confidence weighting for the reference | Inherit `confidence` |
 | `move` | Apply the fit; false only calculates and reports it | `true` |
 | `radius_search` | Global search against a reference-map CoFR sphere; optional radius in Angstroms, or omit the value for 1.5 times the moving input's enclosing radius | Off |
 | `radius_refine` | Local refinement using both inputs' CoFR spheres, in Angstroms | None |

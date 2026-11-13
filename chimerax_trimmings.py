@@ -1415,8 +1415,12 @@ def previous_map(session):
 
 
 # Shape alignment: full implementation lives here, with no sibling-script dependency.
+from contextvars import ContextVar
 from math import pi, sqrt
 
+_SHAPE_BATCH_CACHE = ContextVar("shapealign_batch_cache", default=None)
+_SHAPE_CACHE_BYTES = 256 * 1024 ** 2  # Retained preprocessing only, not fitter scratch space.
+_SHAPE_AUTO_PARALLEL_MIN = 4
 _MAX_GRID_VOXELS = 16_000_000  # 64 MB per float32 grid, before fitter scratch space.
 _MAX_CORRELATION_VOXELS = 8_000_000  # Several moment arrays are needed at once.
 _MAX_PARTIAL_FFT_VOXELS = 4_000_000
@@ -1427,12 +1431,193 @@ _MAX_CHAIN_BACKUP_STARTS = 4
 _AUTO_FINE_LIMITS = (2.0, 8.0)  # Bound unnecessary atom-level detail and preserve helix-scale features.
 
 
-def _shape_spatial_size(xyz):
+class _ShapeBatchCache:
+    """Command-scoped LRU; retain reference work without keeping stale session data."""
+
+    def __init__(self, limit=_SHAPE_CACHE_BYTES):
+        from collections import OrderedDict
+
+        self.limit = limit
+        self.entries = OrderedDict()
+        self.bytes = 0
+
+    def __enter__(self):
+        self.token = _SHAPE_BATCH_CACHE.set(self)
+        return self
+
+    def __exit__(self, *exc):
+        _SHAPE_BATCH_CACHE.reset(self.token)
+        self.entries.clear()
+        self.bytes = 0
+
+    def get(self, key):
+        entry = self.entries.get(key)
+        if entry is None:
+            return None
+        self.entries.move_to_end(key)
+        return entry[0]
+
+    def put(self, key, value):
+        size = self._size(value)
+        old = self.entries.pop(key, None)
+        if old is not None:
+            self.bytes -= old[1]
+        if size <= self.limit:
+            while self.entries and self.bytes + size > self.limit:
+                _, (_, removed) = self.entries.popitem(last=False)
+                self.bytes -= removed
+            self.entries[key] = (value, size)
+            self.bytes += size
+        return value
+
+    @classmethod
+    def _size(cls, value):
+        import numpy as np
+
+        if isinstance(value, np.ndarray):
+            return value.nbytes
+        if isinstance(value, (tuple, list)):
+            return sum(cls._size(item) for item in value)
+        if isinstance(value, _ShapeDensityInput):
+            return ((value.matrix.nbytes if value.is_map else value.xyz.nbytes) + value.landmarks.nbytes
+                    + value.frame_landmarks.nbytes + (0 if value.weights is None else value.weights.nbytes))
+        if callable(getattr(value, "matrix", None)):
+            return value.matrix().nbytes
+        return 0
+
+
+def _shape_array_key(array):
+    """Exact snapshot identity, not a rounded geometric similarity test."""
+    from hashlib import blake2b
+    import numpy as np
+
+    array = np.ascontiguousarray(array)
+    return array.shape, array.dtype.str, blake2b(memoryview(array).cast("B"), digest_size=20).digest()
+
+
+def _shape_cached(key, prepare):
+    cache = _SHAPE_BATCH_CACHE.get()
+    if cache is None:
+        return prepare()
+    value = cache.get(key)
+    return cache.put(key, prepare()) if value is None else value
+
+
+def _shape_reference_atom_grid(xyz, resolution, weights=None):
+    def prepare():
+        points, mass = _shape_points(xyz, resolution / 6, weights)
+        return points, mass, _shape_grid(points, mass, resolution)
+
+    if _SHAPE_BATCH_CACHE.get() is None:
+        return prepare()
+    return _shape_cached(("atom_grid", _shape_array_key(xyz), resolution,
+                          None if weights is None else _shape_array_key(weights)), prepare)
+
+
+def _shape_confidence_weights(atoms, mode):
+    """Only interpret B-factors as pLDDT with provenance or explicit consent."""
+    import numpy as np
+    from chimerax.core.errors import UserError
+
+    if mode not in ("auto", "off", "plddt"):
+        raise UserError("confidence must be auto, off, or plddt.")
+    database = getattr(atoms[0].structure, "database", None) if len(atoms) else None
+    known = getattr(database, "database", None) == "AlphaFold"
+    if mode == "off" or (mode == "auto" and not known):
+        return None
+    values = atoms.bfactors.astype(np.float64)
+    if not np.isfinite(values).all() or np.any((values < 0) | (values > 100)):
+        raise UserError("pLDDT weighting requires finite B-factor confidence scores from 0 to 100; "
+                        "use confidence off for experimental B-factors.")
+    # Smoothstep: ignore <=50, half weight at 70, full weight from 90.
+    t = np.clip((values - 50) / 40, 0, 1)
+    return t * t * (3 - 2 * t)
+
+
+def _shape_center(xyz, weights=None):
+    import numpy as np
+
+    return xyz.mean(axis=0) if weights is None else np.average(xyz, weights=weights, axis=0)
+
+
+def _shape_effective_count(xyz, weights=None):
+    """Uniformly scaling confidence must not turn a whole fit into a partial fit."""
+    import numpy as np
+
+    if weights is None:
+        return len(xyz)
+    scaled = weights / weights.max()
+    return float(scaled.sum() ** 2 / np.dot(scaled, scaled))
+
+
+def _shape_weighted_atoms(atoms, xyz, mode):
+    """Drop zero-confidence atoms before allocating grids, not from the model."""
+    import numpy as np
+    from chimerax.core.errors import UserError
+
+    weights = _shape_confidence_weights(atoms, mode)
+    if weights is None:
+        return atoms, xyz, None
+    keep = weights > 0
+    atoms, xyz, weights = atoms.filter(keep), xyz[keep], weights[keep]
+    if len(xyz) < 4 or np.linalg.matrix_rank(xyz - _shape_center(xyz, weights)) < 2:
+        raise UserError("Confidence weighting leaves fewer than four non-collinear fitting atoms; "
+                        "expand the selection or use confidence off.")
+    return atoms, xyz, weights
+
+
+def _shape_log_confidence(session, model, weights, role):
+    if weights is not None:
+        session.logger.info(f"Shape alignment {role} #{model.id_string}: pLDDT weighting, "
+                            f"{len(weights)} atoms above 50; effective atom weight {weights.sum():.3g}.")
+
+
+def _shape_geometry(xyz, weights=None):
+    """Six points with the same weighted centroid/covariance, for map-fit seeds."""
+    import numpy as np
+
+    if weights is None:
+        return xyz
+    center = _shape_center(xyz, weights)
+    centered = xyz - center
+    values, axes = np.linalg.eigh((centered.T * weights) @ centered / weights.sum())
+    offsets = (axes * np.sqrt(3 * np.maximum(values, 0))).T
+    return np.concatenate((offsets, -offsets)) + center
+
+
+def _shape_reference_field(grid, objective):
+    def prepare():
+        import numpy as np
+
+        if objective == "gradient":
+            field, norm = _gradient_density_field(grid)
+        else:
+            field = grid.matrix()
+            norm = float(np.einsum("ijk,ijk->", field, field, dtype=np.float64))
+        # Retaining the grid prevents its identity being reused while a field
+        # or FFT is cached. Counting shared arrays twice is conservative.
+        return grid, field, norm
+
+    return _shape_cached(("field", id(grid), objective), prepare)[1:]
+
+
+def _shape_reference_fft(grid, field, fft_shape, objective, squared=False):
+    def prepare():
+        from scipy.fft import rfftn
+
+        return grid, rfftn(field * field if squared else field, fft_shape)
+
+    return _shape_cached(("fft", id(grid), objective, tuple(fft_shape), squared), prepare)[1]
+
+
+def _shape_spatial_size(xyz, weights=None):
     """Equivalent diameter of a uniform PCA ellipsoid, independent of atom count."""
     import numpy as np
 
-    centered = xyz - xyz.mean(axis=0)
-    variances = np.linalg.eigvalsh(centered.T @ centered / len(centered))
+    centered = xyz - _shape_center(xyz, weights)
+    covariance = (centered.T @ centered / len(centered) if weights is None else
+                  (centered.T * weights) @ centered / weights.sum())
+    variances = np.linalg.eigvalsh(covariance)
     # A uniform solid ellipsoid has variance a^2/5 along semiaxis a. Its
     # equivalent-volume diameter uses all axes, not just the longest extent.
     diameters = 2 * np.sqrt(5 * np.maximum(variances, 0))
@@ -1440,12 +1625,13 @@ def _shape_spatial_size(xyz):
     return float(np.exp(np.log(np.maximum(diameters, 2)).mean()))
 
 
-def _shape_resolution_schedule(moving, reference, resolution=None, local=False):
+def _shape_resolution_schedule(moving, reference, resolution=None, local=False,
+                               moving_weights=None, reference_weights=None):
     """Derive both endpoints and geometric intermediate levels from fitted size."""
     import numpy as np
 
-    moving_size = _shape_spatial_size(moving)
-    reference_size = _shape_spatial_size(reference)
+    moving_size = _shape_spatial_size(moving, moving_weights)
+    reference_size = _shape_spatial_size(reference, reference_weights)
     size = min(moving_size, reference_size)
     # About four broad shape features across the object at the initial scale,
     # and twelve at the fine scale. These are size ratios, not molecule presets.
@@ -1510,7 +1696,8 @@ def _local_correlation_field(first, second, sigma):
     return covariance, first
 
 
-def shape_correlations(moving, reference, resolution=8.0, window=12.0):
+def shape_correlations(moving, reference, resolution=8.0, window=12.0,
+                       moving_weights=None, reference_weights=None):
     """Sample local density CC at moving atom centers in a shared coordinate frame.
 
     window is the FWHM of the Gaussian correlation neighbourhood, in Angstroms.
@@ -1542,8 +1729,8 @@ def shape_correlations(moving, reference, resolution=8.0, window=12.0):
     first_grid = bounding_grid(bounds, step, pad)
     first = first_grid.matrix()
     second_grid = ArrayGridData(np.zeros_like(first), first_grid.origin, first_grid.step)
-    for xyz, grid in ((moving, first_grid), (reference, second_grid)):
-        points, weights = _shape_points(xyz, resolution / 6)
+    for xyz, grid, mass in ((moving, first_grid, moving_weights), (reference, second_grid, reference_weights)):
+        points, weights = _shape_points(xyz, resolution / 6, mass)
         add_gaussians(grid, points, weights, density_sigma, 4)
     field, valid = _local_correlation_field(first, second_grid.matrix(), window_sigma / step)
     points = moving.astype(np.float32)
@@ -1621,14 +1808,22 @@ def _assign_shape_correlations(session, model, atoms, scores, undo, color_fit):
         setattr(objects, attribute, new)
 
 
-def _shape_points(xyz, spacing):
-    """Collapse occupied cells to centroids, retaining the number of atoms."""
+def _shape_points(xyz, spacing, weights=None):
+    """Collapse cells to mass-weighted centroids, retaining confidence mass."""
     import numpy as np
 
     cells = np.floor(xyz / spacing).astype(np.int64)
     cells -= cells.min(axis=0)
     keys = np.ravel_multi_index(cells.T, tuple(cells.max(axis=0) + 1))
     _, inverse, counts = np.unique(keys, return_inverse=True, return_counts=True)
+    if weights is not None:
+        mass = np.bincount(inverse, weights=weights)
+        keep = mass > 0
+        centers = np.column_stack([
+            np.bincount(inverse, weights=xyz[:, axis] * weights)[keep] / mass[keep]
+            for axis in range(3)
+        ])
+        return centers.astype(np.float32), mass[keep].astype(np.float32)
     centers = np.column_stack([
         np.bincount(inverse, weights=xyz[:, axis]) / counts for axis in range(3)
     ])
@@ -1688,20 +1883,21 @@ def _gradient_density_field(grid):
     return field, energy
 
 
-def _shape_starts(moving, reference, extra_starts=0):
+def _shape_starts(moving, reference, extra_starts=0, moving_weights=None, reference_weights=None):
     """Try every proper signed permutation of the principal-axis frames."""
     from itertools import permutations, product
     import numpy as np
     from chimerax.geometry import Place
 
-    def frame(xyz):
-        center = xyz.mean(axis=0, dtype=np.float64)
+    def frame(xyz, weights):
+        center = xyz.mean(axis=0, dtype=np.float64) if weights is None else _shape_center(xyz, weights)
         centered = xyz - center
-        _, axes = np.linalg.eigh(centered.T @ centered)
+        _, axes = np.linalg.eigh(centered.T @ centered if weights is None else
+                                 (centered.T * weights) @ centered)
         return center, axes
 
-    cm, am = frame(moving)
-    cr, ar = frame(reference)
+    cm, am = frame(moving, moving_weights)
+    cr, ar = frame(reference, reference_weights)
     starts = []
     for order in permutations(range(3)):
         for signs in product((-1, 1), repeat=3):
@@ -1726,7 +1922,8 @@ def _shape_starts(moving, reference, extra_starts=0):
 
 
 def _partial_shape_starts(moving, reference, resolution, extra_starts=0, status=None,
-                          objective="density", max_starts=24):
+                          objective="density", max_starts=24,
+                          moving_weights=None, reference_weights=None):
     """Search rotations and all coarse translations of a smaller density template.
 
     Density mode uses masked Pearson normalization. Gradient mode instead uses
@@ -1741,13 +1938,12 @@ def _partial_shape_starts(moving, reference, resolution, extra_starts=0, status=
 
     step = resolution / 3
     sigma = resolution / (pi * sqrt(2))
-    mx, mw = _shape_points(moving, step / 2)
-    rx, rw = _shape_points(reference, step / 2)
-    target_grid = _shape_grid(rx, rw, resolution)
+    mx, mw = _shape_points(moving, step / 2, moving_weights)
+    rx, rw, target_grid = _shape_reference_atom_grid(reference, resolution, reference_weights)
     target = target_grid.matrix()
     gradient = objective == "gradient"
     if gradient:
-        target, target_energy = _gradient_density_field(target_grid)
+        target, target_energy = _shape_reference_field(target_grid, objective)
     radius = float(np.linalg.norm(moving, axis=1).max())
     side = int(np.ceil((2 * radius + 8 * sigma) / step))
     side += 1 - side % 2  # Odd side: the template center is an exact grid point.
@@ -1758,16 +1954,19 @@ def _partial_shape_starts(moving, reference, resolution, extra_starts=0, status=
     half = side // 2
     template = ArrayGridData(np.zeros((side,) * 3, np.float32),
                              (-step * half,) * 3, (step,) * 3)
-    target_fft = rfftn(target, fft_shape)
-    target_squared_fft = None if gradient else rfftn(target * target, fft_shape)
-    rotations = [pose.matrix[:, :3] for pose in _shape_starts(moving, reference)]
-    def proper_axes(xyz):
-        _, axes = np.linalg.eigh(xyz.T @ xyz)
+    target_fft = _shape_reference_fft(target_grid, target, fft_shape, objective)
+    target_squared_fft = None if gradient else _shape_reference_fft(
+        target_grid, target, fft_shape, objective, squared=True)
+    rotations = [pose.matrix[:, :3] for pose in _shape_starts(
+        moving, reference, moving_weights=moving_weights, reference_weights=reference_weights)]
+    def proper_axes(xyz, weights):
+        _, axes = np.linalg.eigh(xyz.T @ xyz if weights is None else (xyz.T * weights) @ xyz)
         if np.linalg.det(axes) < 0:
             axes[:, 0] *= -1
         return axes
 
-    moving_axes, reference_axes = proper_axes(moving), proper_axes(reference)
+    moving_axes = proper_axes(moving, moving_weights)
+    reference_axes = proper_axes(reference, reference_weights)
     quaternions = np.random.default_rng(0).normal(size=(96 + extra_starts, 4))
     quaternions /= np.linalg.norm(quaternions, axis=1)[:, None]
     rotations.extend(reference_axes @ quaternion_rotation(q).matrix[:, :3] @ moving_axes.T
@@ -1778,14 +1977,15 @@ def _partial_shape_starts(moving, reference, resolution, extra_starts=0, status=
     # when a small object correctly gets a finer initial density resolution.
     anchors = []
     if len(reference) > len(moving):
-        anchor = reference.mean(axis=0)
+        anchor = _shape_center(reference, reference_weights)
         nearest = np.full(len(rx), np.inf)
         for _ in range(min(8, len(rx))):
             anchors.append(anchor)
             squared = np.sum((reference - anchor) ** 2, axis=1)
             indices = np.argpartition(squared, len(moving) - 1)[:len(moving)]
             rotations.extend(pose.matrix[:, :3] for pose in
-                             _shape_starts(moving, reference[indices]))
+                             _shape_starts(moving, reference[indices], moving_weights=moving_weights,
+                                           reference_weights=None if reference_weights is None else reference_weights[indices]))
             nearest = np.minimum(nearest, np.sum((rx - anchor) ** 2, axis=1))
             anchor = rx[np.argmax(nearest)]
     peaks = []
@@ -1855,23 +2055,23 @@ def _partial_shape_starts(moving, reference, resolution, extra_starts=0, status=
 
 
 def _refine_shape_level(moving, reference, blur, candidates, max_points,
-                        partial=False, coarse=False, objective="density"):
+                        partial=False, coarse=False, objective="density",
+                        moving_weights=None, reference_weights=None):
     """Refine and rank poses against the same complete input densities."""
     import numpy as np
     from chimerax.map_fit.fitmap import locate_maximum, volume_values, overlap_and_correlation
 
     # Cell averaging preserves atom counts and hence relative density mass.
-    mx, mw = _shape_points(moving, blur / 6)
-    rx, rw = _shape_points(reference, blur / 6)
-    mg, rg = _shape_grid(mx, mw, blur), _shape_grid(rx, rw, blur)
+    mx, mw = _shape_points(moving, blur / 6, moving_weights)
+    mg = _shape_grid(mx, mw, blur)
+    _, _, rg = _shape_reference_atom_grid(reference, blur, reference_weights)
     points, weights, sampling, mnorm = _shape_samples(mg, max_points)
-    rmatrix = rg.matrix()
+    rmatrix, reference_energy = _shape_reference_field(rg, objective)
     if objective == "gradient":
         _, moving_energy = _gradient_density_field(mg)
-        rmatrix, reference_energy = _gradient_density_field(rg)
         denominator = sqrt(moving_energy * reference_energy)
     else:
-        denominator = sqrt(mnorm * float(np.einsum("ijk,ijk->", rmatrix, rmatrix, dtype=np.float64)))
+        denominator = sqrt(mnorm * reference_energy)
     results = []
     for seed_index, initial in enumerate(candidates):
         placed = initial.transform_points(points)
@@ -1891,7 +2091,8 @@ def _refine_shape_level(moving, reference, blur, candidates, max_points,
 
 
 def _fit_gradient_points(moving, reference, resolution, max_points, extra_starts,
-                          status, initial_transform, local, fallback_correlation):
+                          status, initial_transform, local, fallback_correlation,
+                          moving_weights=None, reference_weights=None):
     """Experimental whole-density gradient fit; the objective never switches.
 
     Try the cheap principal-axis search first. A weak score can trigger a wider
@@ -1905,14 +2106,15 @@ def _fit_gradient_points(moving, reference, resolution, max_points, extra_starts
     started = perf_counter()
     moving = np.asarray(moving, dtype=np.float64)
     reference = np.asarray(reference, dtype=np.float64)
-    cm, cr = moving.mean(axis=0), reference.mean(axis=0)
+    cm, cr = _shape_center(moving, moving_weights), _shape_center(reference, reference_weights)
     moving, reference = moving - cm, reference - cr
-    levels, schedule_stats = _shape_resolution_schedule(moving, reference, resolution, local)
+    levels, schedule_stats = _shape_resolution_schedule(
+        moving, reference, resolution, local, moving_weights, reference_weights)
     if local:
         initial = Place() if initial_transform is None else initial_transform
         starts = [translation(-cr) * initial * translation(cm)]
     else:
-        starts = _shape_starts(moving, reference, extra_starts)
+        starts = _shape_starts(moving, reference, extra_starts, moving_weights, reference_weights)
         if initial_transform is not None:
             starts.append(translation(-cr) * initial_transform * translation(cm))
 
@@ -1924,6 +2126,7 @@ def _fit_gradient_points(moving, reference, resolution, max_points, extra_starts
             results, points = _refine_shape_level(
                 moving, reference, blur, candidates, max_points, coarse=level == 0,
                 objective="gradient",
+                moving_weights=moving_weights, reference_weights=reference_weights,
             )
             counts.append(len(points))
             candidates = []
@@ -1949,11 +2152,13 @@ def _fit_gradient_points(moving, reference, resolution, max_points, extra_starts
         # partial-template or chain fit, despite sharing the search machinery.
         reverse = len(moving) > len(reference)
         source, target = (reference, moving) if reverse else (moving, reference)
+        sw, tw = (reference_weights, moving_weights) if reverse else (moving_weights, reference_weights)
         first_level = 1 if len(levels) > 2 else 0
         search_resolution = levels[first_level]
         seeds, search_stats = _partial_shape_starts(
             source, target, search_resolution, extra_starts, status,
             objective="gradient", max_starts=48,
+            moving_weights=sw, reference_weights=tw,
         )
         if reverse:
             seeds = [pose.inverse() for pose in seeds]
@@ -1972,7 +2177,8 @@ def _fit_gradient_points(moving, reference, resolution, max_points, extra_starts
 
 def fit_shape_points(moving, reference, resolution=None, max_points=12000,
                      extra_starts=0, status=None, initial_transform=None, local=False,
-                     partial=None, fallback_correlation=None, objective="density"):
+                     partial=None, fallback_correlation=None, objective="density",
+                     moving_weights=None, reference_weights=None):
     """Return a rigid transform and diagnostics; input arrays are never changed.
 
     local=True refines only initial_transform (identity if omitted). Centering
@@ -1986,6 +2192,8 @@ def fit_shape_points(moving, reference, resolution=None, max_points=12000,
     objective="gradient" instead uses full-density gradient normalization and
     never enters partial fitting. Its same-objective FFT backup defaults to a
     0.5 cutoff, versus 0.7 for the existing density mode's partial backup.
+    Optional per-atom weights affect geometry and density at every scale;
+    zero-weight atoms are excluded before sizing grids. Arrays are untouched.
     """
     from time import perf_counter
     import numpy as np
@@ -1996,24 +2204,43 @@ def fit_shape_points(moving, reference, resolution=None, max_points=12000,
         raise UserError("objective must be density or gradient.")
     if fallback_correlation is None:
         fallback_correlation = 0.5 if objective == "gradient" else 0.7
+    def weighted_input(xyz, weights):
+        xyz = np.asarray(xyz, dtype=np.float64)
+        if weights is None:
+            return xyz, None
+        weights = np.asarray(weights, dtype=np.float64)
+        if weights.shape != (len(xyz),) or not np.isfinite(weights).all() or np.any(weights < 0):
+            raise UserError("Shape weights must be finite, nonnegative, and match the fitting atoms.")
+        keep = weights > 0
+        xyz, weights = xyz[keep], weights[keep]
+        if len(xyz) < 4 or np.linalg.matrix_rank(xyz - _shape_center(xyz, weights)) < 2:
+            raise UserError("Confidence weighting leaves fewer than four non-collinear fitting atoms.")
+        return xyz, weights
+
+    moving, moving_weights = weighted_input(moving, moving_weights)
+    reference, reference_weights = weighted_input(reference, reference_weights)
     if objective == "gradient":
         if partial is True:
             raise UserError("objective gradient uses whole structures; do not combine it with partial true.")
         return _fit_gradient_points(moving, reference, resolution, max_points, extra_starts,
-                                    status, initial_transform, local, fallback_correlation)
+                                    status, initial_transform, local, fallback_correlation,
+                                    moving_weights, reference_weights)
 
     started = perf_counter()
     moving = np.asarray(moving, dtype=np.float64)
     reference = np.asarray(reference, dtype=np.float64)
+    moving_count = _shape_effective_count(moving, moving_weights)
+    reference_count = _shape_effective_count(reference, reference_weights)
     use_partial = not local and (partial is True or (partial is None and
-        min(len(moving), len(reference)) / max(len(moving), len(reference)) < _PARTIAL_SIZE_RATIO))
-    if use_partial and len(moving) > len(reference):
+        min(moving_count, reference_count) / max(moving_count, reference_count) < _PARTIAL_SIZE_RATIO))
+    if use_partial and moving_count > reference_count:
         # Always fit the smaller template into the larger target. Invert the
         # result, not the user-visible choice of which model is allowed to move.
         reverse, stats = fit_shape_points(
             reference, moving, resolution, max_points, extra_starts, status,
             initial_transform.inverse() if initial_transform is not None else None,
             partial=True,
+            moving_weights=reference_weights, reference_weights=moving_weights,
         )
         stats.update(moving_atoms=len(moving), reference_atoms=len(reference),
                      partial_template_reversed=True, seconds=perf_counter() - started,
@@ -2021,9 +2248,10 @@ def fit_shape_points(moving, reference, resolution=None, max_points=12000,
         stats["moving_size_diameter"], stats["reference_size_diameter"] = (
             stats["reference_size_diameter"], stats["moving_size_diameter"])
         return reverse.inverse(), stats
-    cm, cr = moving.mean(axis=0), reference.mean(axis=0)
+    cm, cr = _shape_center(moving, moving_weights), _shape_center(reference, reference_weights)
     moving, reference = moving - cm, reference - cr
-    levels, schedule_stats = _shape_resolution_schedule(moving, reference, resolution, local)
+    levels, schedule_stats = _shape_resolution_schedule(
+        moving, reference, resolution, local, moving_weights, reference_weights)
     if status:
         label = "Automatic" if resolution is None else "Size-based, explicit final"
         status(f"{label} resolution range: " + " -> ".join(f"{value:.3g}" for value in levels) +
@@ -2035,11 +2263,13 @@ def fit_shape_points(moving, reference, resolution=None, max_points=12000,
         initial = Place() if initial_transform is None else initial_transform
         starts = [translation(-cr) * initial * translation(cm)]
     elif use_partial:
-        starts, partial_stats = _partial_shape_starts(moving, reference, levels[0], extra_starts, status)
+        starts, partial_stats = _partial_shape_starts(
+            moving, reference, levels[0], extra_starts, status,
+            moving_weights=moving_weights, reference_weights=reference_weights)
         if initial_transform is not None:
             starts.append(translation(-cr) * initial_transform * translation(cm))
     else:
-        starts = _shape_starts(moving, reference, extra_starts)
+        starts = _shape_starts(moving, reference, extra_starts, moving_weights, reference_weights)
         if initial_transform is not None:
             starts.append(translation(-cr) * initial_transform * translation(cm))
     candidates = starts
@@ -2049,7 +2279,8 @@ def fit_shape_points(moving, reference, resolution=None, max_points=12000,
             mode = "Local shape alignment" if local else "Partial shape alignment" if use_partial else "Shape alignment"
             status(f"{mode}: {blur:g} A density ({len(candidates)} starts)...")
         results, points = _refine_shape_level(moving, reference, blur, candidates,
-                                              max_points, partial=use_partial, coarse=level == 0)
+                                              max_points, partial=use_partial, coarse=level == 0,
+                                              moving_weights=moving_weights, reference_weights=reference_weights)
         # Keep several basins through the intermediate scale; symmetries and
         # attached factors can make the coarsest-scale winner ambiguous.
         candidates = []
@@ -2071,6 +2302,7 @@ def fit_shape_points(moving, reference, resolution=None, max_points=12000,
         refined, stats = fit_shape_points(
             moving, reference, resolution, max_points, extra_starts, status,
             initial_transform=transform, partial=True,
+            moving_weights=moving_weights, reference_weights=reference_weights,
         )
         stats.update(seconds=perf_counter() - started, partial_trigger="low_correlation",
                      fallback_initial_score=score, fallback_correlation=fallback_correlation)
@@ -2110,7 +2342,8 @@ def _shape_chain_regions(atoms):
 
 
 def _chain_shape_backup(moving, reference, source_regions, target_regions,
-                        transform, stats, resolution, max_points, extra_starts, logger):
+                        transform, stats, resolution, max_points, extra_starts, logger,
+                        moving_weights=None, reference_weights=None):
     """Generate chain seeds, but accept them only on a common whole-input score.
 
     Non-nested complexes can contain unmatched parts on both sides. A chain
@@ -2130,9 +2363,11 @@ def _chain_shape_backup(moving, reference, source_regions, target_regions,
     for _, reverse, label, indices in regions[:_MAX_CHAIN_BACKUP_STARTS]:
         logger.status(f"Shape alignment backup: {'reference' if reverse else 'moving'} chain {label}...")
         source, target = (reference, moving) if reverse else (moving, reference)
+        sw, tw = (reference_weights, moving_weights) if reverse else (moving_weights, reference_weights)
         try:
             pose, _ = fit_shape_points(source[indices], target, resolution, max_points, extra_starts,
-                                       status=logger.status, partial=True, fallback_correlation=0)
+                                       status=logger.status, partial=True, fallback_correlation=0,
+                                       moving_weights=None if sw is None else sw[indices], reference_weights=tw)
         except UserError as error:
             # An optional seed must not invalidate an existing fit, for example
             # if its finer size-derived FFT exceeds the allocation guard.
@@ -2149,11 +2384,12 @@ def _chain_shape_backup(moving, reference, source_regions, target_regions,
     # Comparing scores from separately fitted chains would favor small subsets.
     reverse = stats["partial_template_reversed"]
     source, target = (reference, moving) if reverse else (moving, reference)
-    cm, cr = source.mean(axis=0), target.mean(axis=0)
+    sw, tw = (reference_weights, moving_weights) if reverse else (moving_weights, reference_weights)
+    cm, cr = _shape_center(source, sw), _shape_center(target, tw)
     starts = [translation(-cr) * (pose.inverse() if reverse else pose) * translation(cm)
               for pose in poses]
     results, _ = _refine_shape_level(source - cm, target - cr, stats["resolutions"][-1],
-                                      starts, max_points, partial=True)
+                                      starts, max_points, partial=True, moving_weights=sw, reference_weights=tw)
     score, best, seed_index = results[0]
     if score <= stats["score"] + 1e-6:
         return transform
@@ -2164,48 +2400,22 @@ def _chain_shape_backup(moving, reference, source_regions, target_regions,
     return result
 
 
-def _shape_align_one(session, atoms, to, resolution=None, max_points=12000,
+def _prepare_shape_atomic_fit(session, atoms, to, resolution=None, max_points=12000,
                      extra_starts=0, move=True, radius=None, correlation=False,
                      color_fit=False, correlation_resolution=8.0, correlation_window=12.0,
-                     sphere_center=None, partial=None, fallback_correlation=None, objective="density"):
-    """Rigidly align one atomic model to another by shape, without sequences.
+                     sphere_center=None, partial=None, fallback_correlation=None, objective="density",
+                     confidence="auto", confidence_moving=None, confidence_reference=None):
+    """Validate an atomic fit and snapshot its atoms, options, and scene frames.
 
-    Atom specifications restrict the fitting regions; the entire moving model
-    moves. Hydrogens and water are excluded. The Gaussian search range is
-    size-derived unless resolution overrides its final endpoint. max_points limits
-    sampled density voxels per stage. extra_starts adds reproducible global
-    orientations if the principal-axis starts are insufficient.
-    move false reports a fit without applying it. The reference, coordinates,
-    display, and camera are left unchanged.
-
-    objective gradient is experimental whole-density gradient scoring, used in
-    both optimization and ranking. It never switches to partial/chain fitting;
-    its quality cutoff defaults to 0.5 and can trigger a broader gradient search.
-
-    In density mode, weak partial fits try substantial selected polymer chains as
-    pose seeds. Candidates are refined and compared on the same complete inputs
-    at the final resolution; chains never move independently. partial false or
-    fallback_correlation 0 disables this additional quality-triggered search.
-
-    radius enables local refinement of an already aligned pair using only atom
-    centers within that many Angstroms of the current center of rotation. The
-    sphere is fixed in scene coordinates and each model's atoms are chosen once
-    before fitting. Refine only the existing relative pose, with a size-derived
-    range no broader than twice its final resolution. The whole model moves rigidly.
-
-    correlation true optionally saves local density Pearson correlations as
-    shape_correlation on fitted atoms and residue means. color_fit true implies
-    correlation and colors fitted atoms/cartoons red (0) to blue (1); undefined
-    values are gray. correlation_resolution sets the density resolution and
-    correlation_window the Gaussian neighbourhood FWHM, both in Angstroms.
-    These optional steps require move true, and their cost is reported separately.
+    Exclude water/hydrogens and optionally crop both fitting subsets to the
+    starting CoFR sphere. No density calculation or model movement happens here.
+    Keep native model/atom handles on the main thread; workers receive only the
+    numeric subset returned by _shape_atomic_snapshot().
     """
     from math import isfinite
-    from time import perf_counter
     import numpy as np
     from chimerax.atomic import Residue
     from chimerax.core.errors import UserError
-    from chimerax.core.undo import UndoState
 
     if resolution is not None and (not isfinite(resolution) or resolution < 2):
         raise UserError("resolution must be finite and at least 2 Angstroms, or omitted for automatic scaling.")
@@ -2284,22 +2494,87 @@ def _shape_align_one(session, atoms, to, resolution=None, max_points=12000,
     source_scene, reference_scene = model.scene_position, reference.scene_position
     source_atoms, source_xyz = fitting_atoms(atoms)
     reference_atoms, reference_xyz = fitting_atoms(to)
+    confidence_inputs = (source_atoms, reference_atoms)
+    source_atoms, source_xyz, source_weights = _shape_weighted_atoms(
+        source_atoms, source_xyz, confidence_moving or confidence)
+    reference_atoms, reference_xyz, reference_weights = _shape_weighted_atoms(
+        reference_atoms, reference_xyz, confidence_reference or confidence)
+    _shape_log_confidence(session, model, source_weights, "moving")
+    _shape_log_confidence(session, reference, reference_weights, "reference")
+    options = dict(resolution=resolution, max_points=max_points, extra_starts=extra_starts,
+                   move=move, radius=radius, correlation=correlation, color_fit=color_fit,
+                   correlation_resolution=correlation_resolution, correlation_window=correlation_window,
+                   partial=partial, fallback_correlation=fallback_correlation, objective=objective)
+    backup = objective == "density" and radius is None and partial is not False and fallback_correlation > 0
+    return dict(model=model, reference=reference, source_atoms=source_atoms, reference_atoms=reference_atoms,
+                source_xyz=source_xyz.astype(np.float64), reference_xyz=reference_xyz.astype(np.float64),
+                source_weights=source_weights, reference_weights=reference_weights,
+                confidence_inputs=[(selected[0].structure, selected, selected.pointers.copy(), selected.bfactors.copy())
+                                   for selected, weights in zip(confidence_inputs, (source_weights, reference_weights))
+                                   if weights is not None],
+                source_scene=source_scene, reference_scene=reference_scene, center=center, options=options,
+                source_pointers=source_atoms.pointers.copy(), reference_pointers=reference_atoms.pointers.copy(),
+                source_regions=_shape_chain_regions(source_atoms) if backup else [],
+                reference_regions=_shape_chain_regions(reference_atoms) if backup else [])
+
+
+def _compute_shape_atomic_fit(data, logger):
+    """Numerical work only: no session, atom, model, or GUI objects are required."""
+    from time import perf_counter
+    from chimerax.geometry import Place
+
     fitting_started = perf_counter()
+    source_xyz, reference_xyz = data["source_xyz"], data["reference_xyz"]
+    source_weights, reference_weights = data.get("source_weights"), data.get("reference_weights")
+    options = data["options"]
+    resolution, max_points, extra_starts = (options[name] for name in ("resolution", "max_points", "extra_starts"))
+    radius, partial, objective = (options[name] for name in ("radius", "partial", "objective"))
+    fallback_correlation = options["fallback_correlation"]
     local_transform, stats = fit_shape_points(
         source_xyz, reference_xyz, resolution, max_points, extra_starts,
-        status=session.logger.status,
-        initial_transform=reference_scene.inverse() * source_scene,
+        status=logger.status,
+        initial_transform=Place(matrix=data["initial_matrix"]),
         local=radius is not None,
         partial=partial, fallback_correlation=fallback_correlation, objective=objective,
+        moving_weights=source_weights, reference_weights=reference_weights,
     )
     if (objective == "density" and radius is None and partial is not False and stats["partial"] and
             stats["score"] < min(_CHAIN_BACKUP_CORRELATION, fallback_correlation)):
         local_transform = _chain_shape_backup(
-            source_xyz, reference_xyz, _shape_chain_regions(source_atoms),
-            _shape_chain_regions(reference_atoms), local_transform, stats,
-            resolution, max_points, extra_starts, session.logger,
+            source_xyz, reference_xyz, data["source_regions"],
+            data["reference_regions"], local_transform, stats,
+            resolution, max_points, extra_starts, logger,
+            source_weights, reference_weights,
         )
     stats["seconds"] = perf_counter() - fitting_started
+    stats.update(moving_confidence="off" if source_weights is None else "plddt",
+                 reference_confidence="off" if reference_weights is None else "plddt")
+    return local_transform, stats
+
+
+def _shape_atomic_snapshot(prepared):
+    return dict(source_xyz=prepared["source_xyz"], reference_xyz=prepared["reference_xyz"],
+                source_weights=prepared["source_weights"], reference_weights=prepared["reference_weights"],
+                initial_matrix=(prepared["reference_scene"].inverse() * prepared["source_scene"]).matrix,
+                options=prepared["options"], source_regions=prepared["source_regions"],
+                reference_regions=prepared["reference_regions"])
+
+
+def _finish_shape_atomic_fit(session, prepared, result):
+    """Apply one computed result and its optional coloring on the main thread."""
+    from time import perf_counter
+    from chimerax.core.undo import UndoState
+
+    model, reference = prepared["model"], prepared["reference"]
+    source_atoms = prepared["source_atoms"]
+    source_xyz, reference_xyz = prepared["source_xyz"], prepared["reference_xyz"]
+    source_scene, reference_scene = prepared["source_scene"], prepared["reference_scene"]
+    center, options = prepared["center"], prepared["options"]
+    radius, move, objective = (options[name] for name in ("radius", "move", "objective"))
+    score_fit, color_fit = options["correlation"] or options["color_fit"], options["color_fit"]
+    correlation_resolution, correlation_window = options["correlation_resolution"], options["correlation_window"]
+    fallback_correlation = options["fallback_correlation"]
+    local_transform, stats = result
     if center is not None:
         stats.update(radius=radius, radius_refine=radius, center_of_rotation=center.copy())
     transform = reference_scene * local_transform * source_scene.inverse()
@@ -2312,6 +2587,7 @@ def _shape_align_one(session, atoms, to, resolution=None, max_points=12000,
         scores, correlation_stats = shape_correlations(
             local_transform.transform_points(source_xyz), reference_xyz,
             correlation_resolution, correlation_window,
+            prepared["source_weights"], prepared["reference_weights"],
         )
         stats.update(correlation_stats)
     undo = UndoState("shape align")
@@ -2380,10 +2656,270 @@ def _shape_align_one(session, atoms, to, resolution=None, max_points=12000,
     return transform, stats
 
 
+def _shape_align_one(session, atoms, to, resolution=None, max_points=12000,
+                     extra_starts=0, move=True, radius=None, correlation=False,
+                     color_fit=False, correlation_resolution=8.0, correlation_window=12.0,
+                     sphere_center=None, partial=None, fallback_correlation=None, objective="density",
+                     confidence="auto", confidence_moving=None, confidence_reference=None):
+    prepared = _prepare_shape_atomic_fit(
+        session, atoms, to, resolution, max_points, extra_starts, move, radius, correlation,
+        color_fit, correlation_resolution, correlation_window, sphere_center, partial,
+        fallback_correlation, objective, confidence, confidence_moving, confidence_reference)
+    result = _compute_shape_atomic_fit(_shape_atomic_snapshot(prepared), session.logger)
+    return _finish_shape_atomic_fit(session, prepared, result)
+
+
+def _shape_available_cpus():
+    """Respect process CPU limits where supported, not just host hardware size."""
+    import os
+
+    count = getattr(os, "process_cpu_count", lambda: None)()
+    if count is not None:
+        return max(1, count)
+    if hasattr(os, "sched_getaffinity"):
+        try:
+            return max(1, len(os.sched_getaffinity(0)))
+        except (OSError, NotImplementedError):
+            pass
+    return os.cpu_count() or 1
+
+
+def _shape_worker_count(workers, models, local=False):
+    from chimerax.core.errors import UserError
+
+    if isinstance(workers, bool) or not isinstance(workers, int) or workers < 0:
+        raise UserError("workers must be a nonnegative integer: 0 automatic, 1 serial, or a process count.")
+    cpus = _shape_available_cpus()
+    if workers == 0:
+        return min(max(1, cpus - 1), models) if models >= _SHAPE_AUTO_PARALLEL_MIN and not local else 1
+    return min(workers, cpus, models)
+
+
+def _shape_atomic_worker_main(directory):
+    """Private subprocess entry point; exchange only arrays and JSON, never models."""
+    import json
+    from pathlib import Path
+    import sys
+    import traceback
+    import numpy as np
+
+    directory = Path(directory)
+    config = json.loads((directory / "config.json").read_text())
+    reference = np.load(directory / "reference.npy", mmap_mode="r", allow_pickle=False)
+    reference_weights = (np.load(directory / "reference_weights.npy", mmap_mode="r", allow_pickle=False)
+                         if config.get("reference_weighted") else None)
+
+    class Logger:
+        def __init__(self):
+            self.warnings = []
+
+        def status(self, message):
+            pass
+
+        def warning(self, message):
+            self.warnings.append(str(message))
+
+    def json_value(value):
+        return value.tolist() if isinstance(value, np.ndarray) else value.item()
+
+    with _ShapeBatchCache():
+        for line in sys.stdin:
+            job = json.loads(line)
+            logger = Logger()
+            try:
+                data = dict(source_xyz=np.load(directory / f"source_{job['index']}.npy", allow_pickle=False),
+                            reference_xyz=reference, options=config["options"],
+                            source_weights=(np.load(directory / f"weights_{job['index']}.npy", allow_pickle=False)
+                                            if job.get("source_weighted") else None),
+                            reference_weights=reference_weights,
+                            initial_matrix=job["initial_matrix"], source_regions=job["source_regions"],
+                            reference_regions=config["reference_regions"])
+                pose, stats = _compute_shape_atomic_fit(data, logger)
+                result = dict(index=job["index"], pose=pose.matrix, stats=stats, warnings=logger.warnings)
+            except Exception:
+                result = dict(index=job["index"], error=traceback.format_exc())
+            # A prefix keeps occasional native-library stdout messages out of
+            # the protocol. Worker diagnostics go to a separate temporary file.
+            print("SHAPEALIGN:" + json.dumps(result, default=json_value), flush=True)
+
+
+def _shape_atomic_workers(session, prepared, workers):
+    """Run a bounded pool; only pipe I/O is threaded in the parent process."""
+    import json
+    import os
+    from pathlib import Path
+    import queue
+    from shutil import copyfile
+    import subprocess
+    import sys
+    import tempfile
+    import threading
+    from chimerax.core.errors import UserError
+    from chimerax.geometry import Place
+    import numpy as np
+
+    try:
+        from chimerax.core.python_utils import chimerax_python_executable
+
+        executable = chimerax_python_executable()
+    except ImportError:
+        executable = ""
+    if not Path(executable).is_file():
+        if Path(sys.executable).name.lower().startswith("python"):
+            executable = sys.executable
+        else:
+            raise UserError("Cannot locate ChimeraX's Python executable; use workers 1.")
+    script = Path(__file__).resolve()
+    if not script.is_file():
+        raise UserError("Cannot locate chimerax_trimmings.py for worker startup; use workers 1.")
+    environment = os.environ.copy()
+    for variable in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS",
+                     "VECLIB_MAXIMUM_THREADS", "NUMEXPR_NUM_THREADS"):
+        environment[variable] = "1"
+    environment.pop("PYTHONHOME", None)
+    environment["PYTHONDONTWRITEBYTECODE"] = "1"
+    stop = threading.Event()
+    waiting, completed = queue.Queue(), queue.Queue()
+    processes, threads, diagnostics = [], [], []
+    results = [None] * len(prepared)
+
+    def exchange(process, diagnostic_path):
+        try:
+            while not stop.is_set():
+                try:
+                    job = waiting.get_nowait()
+                except queue.Empty:
+                    break
+                process.stdin.write(json.dumps(job) + "\n")
+                process.stdin.flush()
+                while True:
+                    line = process.stdout.readline()
+                    if not line:
+                        raise RuntimeError("A shapealign worker exited unexpectedly; try workers 1.")
+                    position = line.find("SHAPEALIGN:")
+                    if position >= 0:
+                        result = json.loads(line[position + len("SHAPEALIGN:"):])
+                        if result["index"] != job["index"]:
+                            raise RuntimeError("A shapealign worker returned an unexpected job index.")
+                        completed.put(result)
+                        break
+        except Exception as error:
+            details = Path(diagnostic_path).read_text(errors="replace")[-4000:]
+            completed.put(dict(error=str(error) + ("\n" + details if details else "")))
+
+    def regions(values):
+        return [(label, indices.tolist()) for label, indices in values]
+
+    with tempfile.TemporaryDirectory(prefix="shapealign_") as temporary:
+        directory = Path(temporary)
+        try:
+            worker_source = directory / "trimmings.py"
+            copyfile(script, worker_source)
+            np.save(directory / "reference.npy", prepared[0]["reference_xyz"], allow_pickle=False)
+            reference_weights = prepared[0]["reference_weights"]
+            if reference_weights is not None:
+                np.save(directory / "reference_weights.npy", reference_weights, allow_pickle=False)
+            config = dict(script=str(worker_source), sys_path=[os.path.abspath(p) for p in sys.path],
+                          options=prepared[0]["options"], reference_regions=regions(prepared[0]["reference_regions"]),
+                          reference_weighted=reference_weights is not None)
+            (directory / "config.json").write_text(json.dumps(config))
+            for index, item in enumerate(prepared):
+                data = _shape_atomic_snapshot(item)
+                np.save(directory / f"source_{index}.npy", data["source_xyz"], allow_pickle=False)
+                if data["source_weights"] is not None:
+                    np.save(directory / f"weights_{index}.npy", data["source_weights"], allow_pickle=False)
+                waiting.put(dict(index=index, initial_matrix=data["initial_matrix"].tolist(),
+                                 source_regions=regions(data["source_regions"]),
+                                 source_weighted=data["source_weights"] is not None))
+            bootstrap = directory / "worker.py"
+            bootstrap.write_text(
+                "import json, pathlib, runpy, sys\n"
+                "root = pathlib.Path(sys.argv[1])\n"
+                "config = json.loads((root / 'config.json').read_text())\n"
+                "sys.path[:] = config['sys_path']\n"
+                "namespace = runpy.run_path(config['script'])\n"
+                "namespace['_shape_atomic_worker_main'](root)\n")
+            for number in range(workers):
+                diagnostic = (directory / f"worker_{number}.log").open("w+")
+                diagnostics.append(diagnostic)
+                process = subprocess.Popen(
+                    [executable, "-u", str(bootstrap), str(directory)], stdin=subprocess.PIPE,
+                    stdout=subprocess.PIPE, stderr=diagnostic, text=True, encoding="utf-8",
+                    env=environment, **({"creationflags": subprocess.CREATE_NO_WINDOW} if sys.platform == "win32" else {}))
+                processes.append(process)
+                thread = threading.Thread(target=exchange, args=(process, diagnostic.name), daemon=True)
+                threads.append(thread)
+                thread.start()
+            count = 0
+            while count < len(prepared):
+                session.logger.status(f"Shape alignment: {count}/{len(prepared)} fits complete ({workers} workers)...")
+                if session.ui.is_gui:
+                    from Qt.QtCore import QCoreApplication, QEventLoop
+
+                    # Repaint progress without accepting reentrant user commands
+                    # while this synchronous batch owns the pending snapshots.
+                    QCoreApplication.processEvents(QEventLoop.ProcessEventsFlag.ExcludeUserInputEvents)
+                try:
+                    result = completed.get(timeout=.1)
+                except queue.Empty:
+                    continue
+                if "error" in result:
+                    raise UserError("Shape alignment worker failed; no results were applied.\n" + result["error"])
+                index = result["index"]
+                pose = Place(matrix=np.array(result["pose"], dtype=float))
+                if not np.isfinite(pose.matrix).all():
+                    raise UserError("A shapealign worker returned a nonfinite transform; no results were applied.")
+                results[index] = pose, result["stats"]
+                for warning in result["warnings"]:
+                    session.logger.warning(f"Shape alignment #{prepared[index]['model'].id_string}: {warning}")
+                count += 1
+        except OSError as error:
+            raise UserError(f"Could not start shapealign workers; use workers 1. {error}") from error
+        finally:
+            stop.set()
+            for process in processes:
+                if process.poll() is None:
+                    process.terminate()
+            for process in processes:
+                try:
+                    process.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    process.wait()
+            for thread in threads:
+                thread.join(timeout=5)
+            for process in processes:
+                process.stdin.close()
+                process.stdout.close()
+            for diagnostic in diagnostics:
+                diagnostic.close()
+    return results
+
+
+def _validate_shape_atomic_snapshot(prepared):
+    import numpy as np
+    from chimerax.core.errors import UserError
+
+    for prefix, model_key, atoms_key in (("source", "model", "source_atoms"),
+                                         ("reference", "reference", "reference_atoms")):
+        model, atoms = prepared[model_key], prepared[atoms_key]
+        if (model.deleted or not np.array_equal(model.scene_position.matrix, prepared[prefix + "_scene"].matrix)
+                or not np.isin(prepared[prefix + "_pointers"], model.atoms.pointers).all()
+                or not np.array_equal(atoms.pointers, prepared[prefix + "_pointers"])
+                or not np.array_equal(atoms.coords, prepared[prefix + "_xyz"])):
+            raise UserError("A fitting model changed while workers were running; no results were applied.")
+    for model, atoms, pointers, values in prepared.get("confidence_inputs", ()):
+        # Check liveness before accessing a collection that may contain deleted atoms.
+        if (model.deleted or not np.isin(pointers, model.atoms.pointers).all()
+                or not np.array_equal(atoms.bfactors, values)):
+            raise UserError("Fitting confidence scores changed while workers were running; no results were applied.")
+
+
 def _shape_align_atomic_models(session, atoms, to, resolution=None, max_points=12000,
                 extra_starts=0, move=True, radius=None, correlation=False,
                 color_fit=False, correlation_resolution=8.0, correlation_window=12.0,
-                partial=None, fallback_correlation=None, objective="density"):
+                partial=None, fallback_correlation=None, objective="density", workers=0,
+                confidence="auto", confidence_moving=None, confidence_reference=None):
     """Independently fit each moving model to one fixed reference by shape.
 
     Atom specifications restrict fitting regions; each whole moving model gets
@@ -2395,6 +2931,7 @@ def _shape_align_atomic_models(session, atoms, to, resolution=None, max_points=1
     fit fails. Single fits return (transform, stats); batches return those pairs.
     """
     from contextlib import nullcontext
+    from time import perf_counter
     from chimerax.core.errors import UserError
 
     targets = to.unique_structures
@@ -2403,7 +2940,14 @@ def _shape_align_atomic_models(session, atoms, to, resolution=None, max_points=1
         raise UserError("Specify moving atomic models and exactly one reference model.")
     reference = targets[0]
     if reference in moving:
-        raise UserError("The reference must not be included in the moving selection.")
+        from chimerax.atomic import concatenate
+
+        items = _shape_exclude_reference(session, list(atoms.by_structure), reference)
+        if not items:
+            return []
+        atoms = concatenate([selected for _, selected in items])
+        moving = atoms.unique_structures
+    worker_count = _shape_worker_count(workers, len(moving), radius is not None)
     for model in moving:
         if reference in model.drawing_lineage or model in reference.drawing_lineage:
             raise UserError("The moving and reference models must not contain one another.")
@@ -2412,18 +2956,32 @@ def _shape_align_atomic_models(session, atoms, to, resolution=None, max_points=1
     options = dict(resolution=resolution, max_points=max_points, extra_starts=extra_starts,
                    move=move, radius=radius, correlation=correlation, color_fit=color_fit,
                    correlation_resolution=correlation_resolution, correlation_window=correlation_window,
-                   partial=partial, fallback_correlation=fallback_correlation, objective=objective)
+                   partial=partial, fallback_correlation=fallback_correlation, objective=objective,
+                   confidence=confidence, confidence_moving=confidence_moving, confidence_reference=confidence_reference)
     if len(moving) == 1:
         return _shape_align_one(session, atoms, to, **options)
     if radius is not None:
         # Read once: automatic CoFR modes must not change the sphere mid-batch.
         options["sphere_center"] = session.main_view.center_of_rotation.copy()
+    ordered = sorted(atoms.by_structure, key=lambda item: item[0].id)
+    prepared = computed = None
+    started = perf_counter()
+    if worker_count > 1:
+        prepared = [_prepare_shape_atomic_fit(session, selected, to, **options) for _, selected in ordered]
+        session.logger.info(f"Shape alignment: fitting {len(prepared)} atomic models with {worker_count} workers.")
+        computed = _shape_atomic_workers(session, prepared, worker_count)
+        for item in prepared:
+            _validate_shape_atomic_snapshot(item)
     results = []
     context = session.undo.aggregate("shape align models") if move else nullcontext()
-    with context as batch:
+    with _ShapeBatchCache(), context as batch:
         try:
-            for _, selected in sorted(atoms.by_structure, key=lambda item: item[0].id):
-                results.append(_shape_align_one(session, selected, to, **options))
+            for index, (_, selected) in enumerate(ordered):
+                if prepared is None:
+                    results.append(_shape_align_one(session, selected, to, **options))
+                else:
+                    computed[index][1]["workers"] = worker_count
+                    results.append(_finish_shape_atomic_fit(session, prepared[index], computed[index]))
         except BaseException:
             if batch is not None:
                 for action in reversed(batch.actions):
@@ -2431,7 +2989,23 @@ def _shape_align_atomic_models(session, atoms, to, resolution=None, max_points=1
                 if batch.actions:
                     session.logger.warning("Shape alignment batch failed; earlier changes were undone.")
             raise
+    if worker_count > 1:
+        message = (f"Shape alignment: {len(results)} atomic models fitted with {worker_count} workers "
+                   f"in {perf_counter() - started:.2f} s; " + ("one Undo action." if move else "not moved."))
+        session.logger.info(message)
+        session.logger.status(message)
     return results
+
+
+def _shape_exclude_reference(session, items, reference):
+    remaining = [(model, selected) for model, selected in items if model is not reference]
+    if len(remaining) != len(items):
+        message = f"Shape alignment: skipping reference #{reference.id_string} in the moving selection."
+        if not remaining:
+            message += " No other moving models remain."
+            session.logger.status(message)
+        session.logger.info(message)
+    return remaining
 
 
 def _shape_input_items(selection):
@@ -2445,7 +3019,7 @@ def _shape_input_items(selection):
     if isinstance(selection, Structure):
         return [(selection, selection.atoms)]
     if isinstance(selection, Atoms):
-        return list(selection.by_structure)
+        return sorted(selection.by_structure, key=lambda item: item[0].id)
     atoms = selection.atoms
     items = dict(atoms.by_structure)
     models = selection.models
@@ -2493,7 +3067,7 @@ def _resample_shape_density(grid, origin, size, step, pose=None):
 class _ShapeDensityInput:
     """A selected atomic density or native full map, in the owner's local frame."""
 
-    def __init__(self, model, atoms, center=None, radius=None):
+    def __init__(self, model, atoms, center=None, radius=None, confidence="auto"):
         from itertools import product
         import numpy as np
         from chimerax.atomic import Residue
@@ -2502,7 +3076,10 @@ class _ShapeDensityInput:
 
         self.model, self.atoms = model, atoms
         self.is_map = atoms is None
+        self.weights = None
         self._cache = {}
+        self._grid_cache_key = object()
+        self._shared_reference = False
         if atoms is not None:
             keep = (atoms.element_numbers > 1) & ~np.isin(atoms.residues.names, list(Residue.water_res_names))
             self.atoms = atoms.filter(keep)
@@ -2514,9 +3091,11 @@ class _ShapeDensityInput:
                 xyz, self.atoms = xyz[inside], self.atoms.filter(inside)
             if len(xyz) < 4 or np.linalg.matrix_rank(xyz - xyz.mean(axis=0)) < 2:
                 raise UserError("Each atomic fitting region needs four non-collinear non-water heavy atoms.")
+            self.atoms, xyz, self.weights = _shape_weighted_atoms(self.atoms, xyz, confidence)
             self.xyz = xyz
-            self.center = xyz.mean(axis=0)
+            self.center = _shape_center(xyz, self.weights)
             self.landmarks = xyz - self.center
+            self.frame_landmarks = _shape_geometry(self.landmarks, self.weights)
             return
 
         data = model.data
@@ -2589,6 +3168,7 @@ class _ShapeDensityInput:
         self.center = data.ijk_to_xyz_transform * mean
         offsets = axes * np.sqrt(3 * np.maximum(values, 0))
         self.landmarks = np.concatenate((offsets.T, -offsets.T))
+        self.frame_landmarks = self.landmarks
         self.lower, self.upper = lower, upper
 
     def grid(self, resolution):
@@ -2596,10 +3176,16 @@ class _ShapeDensityInput:
         from chimerax.core.errors import UserError
         from chimerax.map_data import ArrayGridData
 
-        if resolution in self._cache:
+        cache = _SHAPE_BATCH_CACHE.get() if self._shared_reference else None
+        cache_key = ("density_grid", self._grid_cache_key, resolution)
+        if cache is not None:
+            grid = cache.get(cache_key)
+            if grid is not None:
+                return grid
+        elif resolution in self._cache:
             return self._cache[resolution]
         if not self.is_map:
-            grid = _shape_grid(*_shape_points(self.landmarks, resolution / 6), resolution)
+            grid = _shape_grid(*_shape_points(self.landmarks, resolution / 6, self.weights), resolution)
         else:
             # Cell-average before decimation, retaining boundary bins through
             # zero extension. This avoids point-sampling a fine map at coarse steps.
@@ -2652,9 +3238,29 @@ class _ShapeDensityInput:
         if not np.isfinite(peak) or peak == 0:
             raise UserError("No finite nonzero density remains at this fitting scale.")
         grid.matrix()[:] /= peak
-        self._cache.clear()  # One level per input, not a retained pyramid of large arrays.
-        self._cache[resolution] = grid
+        if cache is not None:
+            cache.put(cache_key, grid)
+        else:
+            self._cache.clear()  # Moving inputs and single fits retain only one level.
+            self._cache[resolution] = grid
         return grid
+
+
+def _shape_reference_input(model, atoms, center, radius, confidence="auto"):
+    def prepare():
+        value = _ShapeDensityInput(model, atoms, center, radius, confidence)
+        value._shared_reference = True
+        return value
+
+    if _SHAPE_BATCH_CACHE.get() is None:
+        return prepare()
+    selection = None if atoms is None else (_shape_array_key(atoms.pointers), _shape_array_key(atoms.coords))
+    confidence_key = None if atoms is None or confidence == "off" else (
+        confidence, getattr(getattr(model, "database", None), "database", None), _shape_array_key(atoms.bfactors))
+    key = ("reference_input", id(model), selection,
+           None if center is None else tuple(center), radius, model.scene_position.matrix.tobytes(),
+           confidence_key)
+    return _shape_cached(key, prepare)
 
 
 def _shape_density_samples(grid, maximum):
@@ -2689,13 +3295,11 @@ def _refine_density_grids(source, target, candidates, maximum, objective):
     from chimerax.map_fit.fitmap import locate_maximum, volume_values
 
     points, weights = _shape_density_samples(source, maximum)
-    field = target.matrix()
+    field, second = _shape_reference_field(target, objective)
     if objective == "gradient":
         _, first = _gradient_density_field(source)
-        field, second = _gradient_density_field(target)
     else:
         first = np.einsum("ijk,ijk->", source.matrix(), source.matrix(), dtype=np.float64)
-        second = np.einsum("ijk,ijk->", field, field, dtype=np.float64)
     denominator = sqrt(first * second)
     results = []
     for index, initial in enumerate(candidates):
@@ -2729,14 +3333,12 @@ def _shape_map_fft_starts(source, target, source_landmarks, target_landmarks, ob
         raise UserError("The map FFT search exceeds its memory limit; use a coarser resolution or smaller region.")
     half = side // 2
     origin = np.full(3, -half * step)
-    field = target.matrix()
+    field, second = _shape_reference_field(target, objective)
     if objective == "gradient":
         _, first = _gradient_density_field(source)
-        field, second = _gradient_density_field(target)
     else:
         first = np.sum(source.matrix().astype(float) ** 2)
-        second = np.sum(field.astype(float) ** 2)
-    target_fft = rfftn(field, fft_shape)
+    target_fft = _shape_reference_fft(target, field, fft_shape, objective)
     peaks = []
     for initial in _shape_starts(source_landmarks, target_landmarks, 96 + extra_starts):
         rotation = Place(matrix=np.column_stack((initial.matrix[:, :3], np.zeros(3))))
@@ -2768,20 +3370,20 @@ def _fit_shape_density_inputs(source, target, options, center):
     from chimerax.geometry import translation
 
     objective, radius = options["objective"], options["radius"]
-    levels, stats = _shape_resolution_schedule(source.landmarks, target.landmarks,
+    levels, stats = _shape_resolution_schedule(source.frame_landmarks, target.frame_landmarks,
                                               options["resolution"], radius is not None)
     initial = (translation(-target.center) * target.model.scene_position.inverse() *
                source.model.scene_position * translation(source.center))
     starts = [initial] if radius is not None else [*_shape_starts(
-        source.landmarks, target.landmarks, options["extra_starts"]), initial]
+        source.frame_landmarks, target.frame_landmarks, options["extra_starts"]), initial]
     search_radius = options.get("radius_search")
     if search_radius is not None:
         # A regional global search must explore translations even when PCA
         # already gives a good score. Only the reference density was cropped.
         source.model.session.logger.status("Shape alignment: global search of the reference CoFR sphere...")
         starts.extend(_shape_map_fft_starts(
-            source.grid(levels[0]), target.grid(levels[0]), source.landmarks,
-            target.landmarks, objective, options["extra_starts"]))
+            source.grid(levels[0]), target.grid(levels[0]), source.frame_landmarks,
+            target.frame_landmarks, objective, options["extra_starts"]))
 
     def refine(candidates, first=0):
         for blur in levels[first:]:
@@ -2808,8 +3410,8 @@ def _fit_shape_density_inputs(source, target, options, center):
     elif radius is None and options["fallback_correlation"] > 0 and score < options["fallback_correlation"]:
         first = 1 if len(levels) > 2 else 0
         blur = levels[first]
-        seeds = _shape_map_fft_starts(source.grid(blur), target.grid(blur), source.landmarks,
-                                      target.landmarks, objective, options["extra_starts"])
+        seeds = _shape_map_fft_starts(source.grid(blur), target.grid(blur), source.frame_landmarks,
+                                      target.frame_landmarks, objective, options["extra_starts"])
         proposed_score, proposed = refine([pose, *seeds], first)
         stats.update(map_search=True, map_search_resolution=blur, map_initial_score=score)
         if proposed_score > score:
@@ -2856,16 +3458,22 @@ def _shape_align_with_map(session, source_item, target_item, options, center, ta
     radius = options["radius"]
     # Local refinement crops both inputs; global search keeps the moving input
     # intact, including when it starts completely outside the reference sphere.
-    source = _ShapeDensityInput(*source_item, center if radius is not None else None, radius)
+    source = _ShapeDensityInput(*source_item, center if radius is not None else None, radius,
+                                options.get("confidence_moving") or options.get("confidence", "auto"))
     auto_search = options.get("radius_search") is True
     if auto_search:
         search_radius = _shape_search_radius(source)
         options = dict(options, radius_search=search_radius)
         session.logger.info(f"Automatic radius_search for #{source.model.id_string}: {search_radius:.3g} A "
                             "(1.5 times the moving input's enclosing radius).")
-    target = target_input if target_input is not None else _ShapeDensityInput(
-        *target_item, center, radius if radius is not None else options.get("radius_search"))
+    target = target_input if target_input is not None else _shape_reference_input(
+        *target_item, center, radius if radius is not None else options.get("radius_search"),
+        options.get("confidence_reference") or options.get("confidence", "auto"))
+    _shape_log_confidence(session, source.model, source.weights, "moving")
+    _shape_log_confidence(session, target.model, target.weights, "reference")
     pose, stats = _fit_shape_density_inputs(source, target, options, center)
+    stats.update(moving_confidence="off" if source.weights is None else "plddt",
+                 reference_confidence="off" if target.weights is None else "plddt")
     if options.get("radius_search") is not None:
         stats["radius_search_automatic"] = auto_search
     stats["seconds"] = perf_counter() - started
@@ -2931,11 +3539,49 @@ def _shape_search_radius(source):
     return 1.5 * float(np.linalg.norm(points, axis=1).max())
 
 
-def shape_align(session, moving, to, resolution=None, max_points=12000,
+def _shape_align_help(session):
+    """Show a compact quick reference; native usage supplies the full option list."""
+    rows = (
+        ("radius_search [A]", "Global search in a reference-map CoFR sphere; omit A for 1.5x model radius."),
+        ("radius_refine A", "Local refinement at CoFR. Use only one radius; both are in Angstroms."),
+        ("objective density|gradient", "Scoring method; default: density."),
+        ("resolution A", "Final fitting scale; default: automatic."),
+        ("confidence auto|off|plddt", "Weight known AlphaFold models automatically; off disables; plddt forces B-factor confidence."),
+        ("color_fit true", "Color moving atoms by local density agreement; default: off."),
+        ("workers 0|N", "Atomic batches: 0 available CPUs minus one, 1 serial, or an explicit count."),
+    )
+    description = "Rigidly fit models/maps; only the moving inputs move. Supports Undo."
+    example = "shapealign #2 to #1 radius_search"
+    if session.ui.is_gui:
+        from html import escape
+        from chimerax.log.cmd import log_show
+
+        log_show(session)
+        table = "".join(f"<tr><td><b>{escape(option)}</b></td><td>{escape(text)}</td></tr>"
+                        for option, text in rows)
+        session.logger.info(
+            "<b>shapealign</b> <i>moving-spec</i> <b>to</b> <i>reference-spec</i> [options]"
+            f"<br>{description}<table cellpadding=\"2\">{table}</table>"
+            f"Example: <code>{example}</code><br>"
+            '<a href="cxcmd:usage%20shapealign">All options</a> '
+            "(<b>usage shapealign</b>); <b>radius</b> is the legacy local-refinement alias.",
+            is_html=True,
+        )
+        session.logger.status("shapealign help is shown in the Log.")
+    else:
+        session.logger.info(
+            "Usage: shapealign <moving-spec> to <reference-spec> [options]\n" + description + "\n" +
+            "\n".join(f"  {option}: {text}" for option, text in rows) +
+            f"\nExample: {example}. All options: usage shapealign (radius is the legacy local-refinement alias)."
+        )
+
+
+def shape_align(session, moving=None, to=None, resolution=None, max_points=12000,
                 extra_starts=0, move=True, radius=None, correlation=False,
                 color_fit=False, correlation_resolution=8.0, correlation_window=12.0,
                 partial=None, fallback_correlation=None, objective="density",
-                radius_search=None, radius_refine=None):
+                radius_search=None, radius_refine=None, workers=0,
+                confidence="auto", confidence_moving=None, confidence_reference=None):
     """Align independent inputs globally, regionally, or by local refinement.
 
     radius_search globally searches a reference-map CoFR sphere, keeping the
@@ -2949,9 +3595,18 @@ def shape_align(session, moving, to, resolution=None, max_points=12000,
     import numpy as np
     from chimerax.core.errors import UserError
 
+    if moving is None and to is None:
+        return _shape_align_help(session)
+    if moving is None or to is None:
+        raise UserError("Specify both moving and reference inputs: shapealign <moving-spec> to <reference-spec>. "
+                        "Type shapealign help for options.")
     sources, targets = _shape_input_items(moving), _shape_input_items(to)
     if not sources or len(targets) != 1:
         raise UserError("Specify moving atomic models/maps and exactly one reference model or map.")
+    _shape_worker_count(workers, len(sources))
+    for value in (confidence, confidence_moving, confidence_reference):
+        if value is not None and value not in ("auto", "off", "plddt"):
+            raise UserError("confidence, confidence_moving, and confidence_reference must be auto, off, or plddt.")
     if sum(value is not None for value in (radius, radius_refine, radius_search)) > 1:
         raise UserError("Use only one of radius_search (global), radius_refine (local), or its legacy alias radius.")
     if radius_refine is not None:
@@ -2962,18 +3617,26 @@ def shape_align(session, moving, to, resolution=None, max_points=12000,
     if radius_search is not None and targets[0][1] is not None:
         raise UserError("radius_search requires a density map as the reference; use radius_refine for local model/model fitting.")
     target = targets[0][0]
+    sources = _shape_exclude_reference(session, sources, target)
+    if not sources:
+        return []
     for model, _ in sources:
         if target in model.drawing_lineage or model in target.drawing_lineage:
-            raise UserError("The reference must be distinct from, and not contain, any moving model.")
+            raise UserError("Moving and reference models must not contain one another.")
         if any(other in model.drawing_lineage[:-1] for other, _ in sources):
             raise UserError("Moving inputs must be independent models, not ancestor/descendant pairs.")
     options = dict(resolution=resolution, max_points=max_points, extra_starts=extra_starts, move=move,
                    radius=radius, correlation=correlation, color_fit=color_fit,
                    correlation_resolution=correlation_resolution, correlation_window=correlation_window,
-                   partial=partial, fallback_correlation=fallback_correlation, objective=objective)
+                   partial=partial, fallback_correlation=fallback_correlation, objective=objective,
+                   confidence=confidence, confidence_moving=confidence_moving, confidence_reference=confidence_reference)
     if all(atoms is not None for _, atoms in [*sources, *targets]):
-        return _shape_align_atomic_models(session, moving.atoms if hasattr(moving, "atoms") else moving,
-                                          to.atoms if hasattr(to, "atoms") else to, **options)
+        from chimerax.atomic import concatenate
+
+        return _shape_align_atomic_models(session, concatenate([selected for _, selected in sources]),
+                                          targets[0][1], workers=workers, **options)
+    if workers > 1:
+        raise UserError("Parallel workers currently support atomic model/model batches only; use workers 1 for maps.")
     if radius_search is not None:
         options["radius_search"] = radius_search
     if objective not in ("density", "gradient") or partial not in (None, False):
@@ -3006,7 +3669,9 @@ def shape_align(session, moving, to, resolution=None, max_points=12000,
                 raise UserError("Instanced models are not supported; use a single model copy.")
     results = []
     target_input = None
-    with session.undo.aggregate("shape align models") if move and len(sources) > 1 else nullcontext() as batch:
+    cache_context = _ShapeBatchCache() if len(sources) > 1 else nullcontext()
+    undo_context = session.undo.aggregate("shape align models") if move and len(sources) > 1 else nullcontext()
+    with cache_context, undo_context as batch:
         try:
             for item in sources:
                 if item[1] is not None and targets[0][1] is not None:
@@ -3016,7 +3681,8 @@ def shape_align(session, moving, to, resolution=None, max_points=12000,
                     # Automatic search sizes are per moving input, not inherited
                     # from the first member of a batch.
                     if target_input is None and radius_search is not True:
-                        target_input = _ShapeDensityInput(*targets[0], center, region_radius)
+                        target_input = _shape_reference_input(
+                            *targets[0], center, region_radius, confidence_reference or confidence)
                     result = _shape_align_with_map(session, item, targets[0], options, center, target_input, started)
                 results.append(result)
         except BaseException:
@@ -3041,7 +3707,7 @@ def _register_shape_align_command(logger):
             return "" if value is True else FloatArg.unparse(value, session)
 
     register("shapealign", CmdDesc(
-        required=[("moving", ObjectsArg)],
+        optional=[("moving", ObjectsArg)],
         keyword=[("to", ObjectsArg), ("resolution", FloatArg),
                  ("max_points", IntArg), ("extra_starts", IntArg), ("move", BoolArg),
                  ("radius_search", SearchRadiusArg(FloatArg, NoArg, name="radius in Angstroms or no value (automatic)")),
@@ -3049,10 +3715,15 @@ def _register_shape_align_command(logger):
                  ("correlation", BoolArg), ("color_fit", BoolArg),
                  ("correlation_resolution", FloatArg), ("correlation_window", FloatArg),
                  ("partial", BoolArg), ("fallback_correlation", FloatArg),
+                 ("workers", IntArg),
+                 ("confidence", EnumOf(("auto", "off", "plddt"))),
+                 ("confidence_moving", EnumOf(("auto", "off", "plddt"))),
+                 ("confidence_reference", EnumOf(("auto", "off", "plddt"))),
                  ("objective", EnumOf(("density", "gradient")))],
-        required_arguments=["to"],
         synopsis="Align models/maps by shape; radius_search searches a map region, radius_refine refines locally",
     ), shape_align, logger=logger)
+    register("shapealign help", CmdDesc(synopsis="Show shapealign usage, options, and examples"),
+             _shape_align_help, logger=logger)
 
 
 
@@ -4095,11 +4766,343 @@ def annotate_domains(session, atoms, color=True, include_overlaps=False,
         Thread(target=lookup, name="ChimeraX domains", daemon=True).start()
 
 
+_TM_APP = "DTU/DeepTMHMM"
+_TM_COLORS = {"M": (255, 145, 45, 255), "B": (40, 200, 230, 255), "": (190, 190, 190, 255)}
+_TM_NAMES = {"M": "TM helix", "B": "TM beta strand"}
+
+
+def _tm_parse_topologies(text):
+    """Read DeepTMHMM 1.x three-line output, keyed by exact sequence.
+
+    M and B are distinct predictions. S is a signal peptide, never a TM segment.
+    Do not infer topology from the model's secondary-structure assignment.
+    """
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    if not lines or len(lines) % 3:
+        raise ValueError("Expected DeepTMHMM predicted_topologies.3line output (header, sequence, topology).")
+    predictions, identifiers = {}, set()
+    for index in range(0, len(lines), 3):
+        header, sequence, topology = lines[index:index + 3]
+        sequence = sequence.upper()
+        if not header.startswith(">") or not header[1:].strip():
+            raise ValueError("Invalid DeepTMHMM sequence header.")
+        identifier = header[1:].split()[0]
+        if identifier in identifiers:
+            raise ValueError(f"Duplicate DeepTMHMM sequence identifier: {identifier}")
+        identifiers.add(identifier)
+        if not sequence or set(sequence) - set("ACDEFGHIKLMNPQRSTVWY"):
+            raise ValueError(f"Invalid amino-acid sequence in DeepTMHMM result for {identifier}.")
+        if len(sequence) != len(topology) or set(topology) - set("IOMBPS"):
+            raise ValueError(f"Invalid DeepTMHMM topology or sequence/topology length mismatch for {identifier}.")
+        if sequence in predictions and predictions[sequence] != topology:
+            raise ValueError("Conflicting DeepTMHMM predictions for identical sequences.")
+        predictions[sequence] = topology
+    return predictions
+
+
+def _tm_segments(topology):
+    """Return inclusive, one-based ranges for contiguous M or B runs."""
+    from itertools import groupby
+
+    segments, offset = [], 1
+    for label, group in groupby(topology):
+        length = sum(1 for _ in group)
+        if label in _TM_NAMES:
+            segments.append({"label": label, "start": offset, "end": offset + length - 1,
+                             "number": len(segments) + 1})
+        offset += length
+    return segments
+
+
+def _tm_biolib_worker():
+    """Private child entry point; run in an external Python with pybiolib installed."""
+    from pathlib import Path
+    try:
+        import biolib
+    except ImportError:
+        raise RuntimeError("Install pybiolib in the external Python environment: python -m pip install pybiolib") from None
+
+    app = biolib.load(_TM_APP)
+    job = app.cli(args="--fasta input.fasta", check=True)
+    # Avoid downloading embeddings, plots, and other large outputs.
+    job.save_files("output", path_filter=lambda path: Path(path).name == "predicted_topologies.3line")
+    files = list(Path("output").rglob("predicted_topologies.3line"))
+    if len(files) != 1:
+        raise RuntimeError("DeepTMHMM did not return one predicted_topologies.3line file.")
+    Path("topologies.3line").write_text(files[0].read_text(encoding="utf-8"), encoding="utf-8")
+
+
+def _tm_python_executable(python=None):
+    import os
+    import shutil
+    from pathlib import Path
+
+    configured = python or os.environ.get("CHIMERAX_DEEPTMHMM_PYTHON")
+    default = Path.home() / ".local/share/chimerax-trimmings/deeptmhmm/bin/python"
+    candidate = str(Path(configured).expanduser()) if configured else str(default)
+    resolved = shutil.which(candidate)
+    if resolved is None:
+        raise ValueError("BioLib Python was not found. Create the environment described in README.MD, "
+                         "or supply 'python /absolute/path/to/venv/bin/python'. "
+                         "Alternatively import a prediction with 'results /path/predicted_topologies.3line'.")
+    # Do not resolve the symlink: a venv's Python must retain its venv path.
+    return str(Path(resolved).absolute())
+
+
+def _tm_predict(sequences, executable, timeout, cancel, status=None):
+    """Only strings/files cross the process boundary; the child never sees models."""
+    import os
+    from pathlib import Path
+    import subprocess
+    import tempfile
+    from time import monotonic
+
+    environment = os.environ.copy()
+    for key in ("PYTHONHOME", "PYTHONPATH", "PYTHONSTARTUP", "PYTHONEXECUTABLE", "__PYVENV_LAUNCHER__"):
+        environment.pop(key, None)
+    bootstrap = "import runpy,sys; runpy.run_path(sys.argv[1])['_tm_biolib_worker']()"
+    script = str(Path(__file__).absolute())
+    started = monotonic()
+    deadline, next_status = started + timeout, started + 1
+    with tempfile.TemporaryDirectory(prefix="chimerax-deeptmhmm-") as directory:
+        directory = Path(directory)
+        (directory / "input.fasta").write_text(
+            "".join(f">query_{i}\n{seq}\n" for i, seq in enumerate(sequences)), encoding="utf-8")
+        with (directory / "client.log").open("w+", encoding="utf-8") as log:
+            if cancel.is_set():
+                raise RuntimeError("DeepTMHMM prediction cancelled locally.")
+            process = subprocess.Popen([executable, "-u", "-c", bootstrap, script], cwd=directory,
+                                       env=environment, stdin=subprocess.DEVNULL, stdout=log, stderr=log)
+            try:
+                while process.poll() is None:
+                    if cancel.wait(0.1):
+                        raise RuntimeError("DeepTMHMM prediction cancelled locally; the remote job may continue.")
+                    now = monotonic()
+                    if now >= deadline:
+                        raise TimeoutError("DeepTMHMM timed out; the remote job may continue. Increase timeout to wait longer.")
+                    if status is not None and now >= next_status:
+                        status(int(now - started))
+                        next_status = now + 1
+                if process.returncode:
+                    log.seek(0)
+                    detail = log.read()[-2000:].strip()
+                    raise RuntimeError("BioLib client failed: " + (detail or f"exit code {process.returncode}"))
+                text = (directory / "topologies.3line").read_text(encoding="utf-8")
+            finally:
+                if process.poll() is None:
+                    process.terminate()
+                    try:
+                        process.wait(timeout=3)
+                    except subprocess.TimeoutExpired:
+                        process.kill()
+                        process.wait()
+        predictions = _tm_parse_topologies(text)
+        if set(predictions) != set(sequences):
+            raise ValueError("DeepTMHMM returned sequences that do not exactly match the submitted sequences.")
+        return predictions
+
+
+def _apply_tm_results(session, entries, predictions, color=True, elapsed=None):
+    from html import escape
+    from types import SimpleNamespace
+    from urllib.parse import quote
+    from chimerax.atomic import Residue, Residues, concise_residue_spec
+    from chimerax.core.colors import Color
+    from chimerax.core.objects import Objects
+    from chimerax.core.undo import UndoState
+    from chimerax.std_commands.color import color as color_objects
+
+    for name, kind in (("tm_topology", str), ("tm_type", str), ("tm_segment", int)):
+        Residue.register_attr(session, name, "Trimmings DeepTMHMM", attr_type=kind)
+    previous = getattr(session, "_trimmings_tm_records", [])
+    records, rows, updated, residue_count = [], [], set(), 0
+    with session.undo.aggregate("annotate transmembrane segments"):
+        undo = UndoState("DeepTMHMM annotations")
+        for entry in entries:
+            chain = entry["chain"]
+            if not _domain_chain_is_current(chain, entry["sequence"], entry["residues"]):
+                session.logger.warning(f"Skipped {entry['spec']}: chain changed during DeepTMHMM prediction.")
+                continue
+            updated.add(chain)
+            topology = predictions[entry["sequence"]]
+            assignments = {}
+            for segment in _tm_segments(topology):
+                members = [r for r in entry["residues"][segment["start"] - 1:segment["end"]] if r is not None]
+                for residue in members:
+                    assignments[residue] = segment
+                modeled = Residues(members)
+                records.append({**segment, "structure": chain.structure, "chain": chain,
+                                "sequence": entry["sequence"], "sequence_residues": entry["residues"],
+                                "residues": modeled})
+                spec = concise_residue_spec(session, modeled) if members else ""
+                if spec and not spec.startswith("#"):
+                    spec = f"#{chain.structure.id_string}" + spec
+                link = (f'<a href="cxcmd:{quote("select " + spec, safe="")}">{escape(spec)}</a>'
+                        if spec else "No modeled residues")
+                swatch = "#ff912d" if segment["label"] == "M" else "#28c8e6"
+                rows.append(f'<tr><td>{escape(entry["spec"])}</td><td style="background:{swatch}">'
+                            f'{_TM_NAMES[segment["label"]]}</td><td>{segment["number"]}</td>'
+                            f'<td>{segment["start"]}&ndash;{segment["end"]}</td><td>{link}</td></tr>')
+            groups = {}
+            for residue, label in zip(entry["residues"], topology):
+                if residue is None:
+                    continue
+                segment = assignments.get(residue)
+                kind = {"M": "helix", "B": "strand"}.get(label, "")
+                for name, value in (("tm_topology", label), ("tm_type", kind),
+                                    ("tm_segment", segment["number"] if segment else 0)):
+                    undo.add(residue, name, getattr(residue, name, None), value)
+                    setattr(residue, name, value)
+                groups.setdefault(label if label in _TM_NAMES else "", []).append(residue)
+                residue_count += bool(segment)
+            if color:
+                for label, members in groups.items():
+                    color_objects(session, Objects(atoms=Residues(members).atoms),
+                                  Color(tuple(c / 255 for c in _TM_COLORS[label])), target="ac")
+        combined = [record for record in previous if record["chain"] not in updated
+                    and _domain_chain_is_current(record["chain"], record["sequence"], record["sequence_residues"])] + records
+        state = SimpleNamespace(set_records=lambda value: setattr(session, "_trimmings_tm_records", value))
+        undo.add(state, "set_records", previous, combined, option="M")
+        state.set_records(combined)
+        session.undo.register(undo)
+    helices = sum(record["label"] == "M" for record in records)
+    strands = sum(record["label"] == "B" for record in records)
+    session.logger.info(f"DeepTMHMM: {helices} TM helices, {strands} TM beta strands; "
+                        f"{residue_count} modeled TM residues across {len(updated)} chains. "
+                        "Signal peptides (S) are annotated separately from membrane segments.")
+    if rows:
+        color_note = ("Orange = TM helix; cyan = TM beta strand; other residues are gray. " if color
+                      else "Existing model colors were retained. Table colors identify segment types. ")
+        session.logger.info('<b>DeepTMHMM predictions</b>. ' + color_note +
+                            'Click structure residues to select a segment. Ranges refer to the submitted chain sequence.'
+                            '<table border="1" cellpadding="3"><tr><th>Chain</th><th>Type</th><th>Segment</th>'
+                            '<th>Sequence positions</th><th>Structure residues</th></tr>' + "".join(rows) + '</table>',
+                            is_html=True)
+    duration = f" in {elapsed:.0f}s" if elapsed is not None else ""
+    session.logger.status(f"DeepTMHMM complete{duration}: {helices} TM helices, {strands} TM beta strands "
+                          f"across {len(updated)} chains.")
+    return records
+
+
+def tm_segments_cancel(session):
+    cancel = getattr(session, "_trimmings_tm_job", None)
+    if cancel is not None:
+        cancel.set()
+        session._trimmings_tm_job = None
+        session.logger.status("DeepTMHMM cancelled locally; the remote job may continue.")
+        session.logger.info("Cancelled DeepTMHMM locally; BioLib may finish a submitted remote job.")
+    else:
+        session.logger.info("No DeepTMHMM prediction is running.")
+
+
+def annotate_tm_segments(session, atoms, color=True, results=None, python=None,
+                         refresh=False, timeout=1200, wait=False):
+    """Predict or import topology for complete protein chains touched by atoms."""
+    from math import isfinite
+    from pathlib import Path
+    from threading import Event, Thread
+    from time import monotonic
+    from chimerax.core.errors import UserError
+
+    if not isfinite(timeout) or timeout <= 0:
+        raise UserError("timeout must be finite and greater than zero (seconds).")
+    if getattr(session, "_trimmings_tm_job", None) is not None:
+        raise UserError("A DeepTMHMM prediction is running; use 'tmsegments cancel' before starting another.")
+    entries = _domain_chain_inputs(atoms)
+    for entry in entries:
+        if set(entry["sequence"]) - set("ACDEFGHIKLMNPQRSTVWY"):
+            raise UserError(f"{entry['spec']}: DeepTMHMM requires the 20 standard amino-acid letters; "
+                            "this chain contains unknown or unsupported letters. Supply a complete, unambiguous sequence.")
+        if not entry["chain"].full_sequence_known:
+            session.logger.warning(f"{entry['spec']}: full polymer sequence is unavailable; "
+                                   "using ChimeraX's inferred chain sequence. Missing sequence can affect topology prediction.")
+    sequences = list(dict.fromkeys(entry["sequence"] for entry in entries))
+    cache = getattr(session, "_trimmings_tm_cache", {})
+    cached = {seq: cache[seq] for seq in sequences if not refresh and seq in cache}
+    if results is not None:
+        try:
+            imported = _tm_parse_topologies(Path(results).expanduser().read_text(encoding="utf-8"))
+            if any(seq not in imported for seq in sequences):
+                raise ValueError("The result file must contain an exact sequence match for every requested chain.")
+        except (OSError, ValueError) as error:
+            raise UserError(f"Cannot import DeepTMHMM results: {error}") from None
+        # Imported predictions take precedence but do not pollute the remote cache.
+        return _apply_tm_results(session, entries, imported, color)
+    missing = [seq for seq in sequences if seq not in cached]
+    if not missing:
+        return _apply_tm_results(session, entries, cached, color)
+    try:
+        executable = _tm_python_executable(python)
+    except ValueError as error:
+        raise UserError(str(error)) from None
+    cancel = Event()
+    started = monotonic()
+    session._trimmings_tm_job = cancel
+    session.logger.info(f"Submitting {len(missing)} distinct chain sequence(s) to {_TM_APP} on BioLib; "
+                        "coordinates stay local. Use 'tmsegments cancel' to stop waiting.")
+
+    def update_status(seconds):
+        # A queued update must not replace completion/cancellation or a newer job's status.
+        if getattr(session, "_trimmings_tm_job", None) is cancel and not cancel.is_set():
+            session.logger.status(f"DeepTMHMM running: {len(missing)} distinct sequence(s), "
+                                  f"{seconds}s elapsed (queued or processing on BioLib)...", blank_after=0)
+
+    def progress(seconds):
+        if wait or not session.ui.is_gui:
+            update_status(seconds)
+        else:
+            session.ui.thread_safe(update_status, seconds)
+
+    update_status(0)
+
+    def finish(predictions, error):
+        if getattr(session, "_trimmings_tm_job", None) is not cancel:
+            return
+        session._trimmings_tm_job = None
+        if cancel.is_set():
+            return
+        if error is not None:
+            session.logger.status("DeepTMHMM timed out." if isinstance(error, TimeoutError)
+                                  else "DeepTMHMM prediction failed; see Log for details.")
+            if wait or not session.ui.is_gui:
+                raise UserError(f"DeepTMHMM prediction failed: {error}")
+            session.logger.error(f"DeepTMHMM prediction failed: {error}")
+            return
+        cache = getattr(session, "_trimmings_tm_cache", {})
+        cache.update(predictions)
+        session._trimmings_tm_cache = cache
+        _apply_tm_results(session, entries, {**cached, **predictions}, color, elapsed=monotonic() - started)
+
+    def predict():
+        try:
+            predictions = _tm_predict(missing, executable, timeout, cancel, status=progress)
+            error = None
+        except Exception as err:
+            predictions, error = None, err
+        if wait or not session.ui.is_gui:
+            finish(predictions, error)
+        else:
+            session.ui.thread_safe(finish, predictions, error)
+
+    if wait or not session.ui.is_gui:
+        predict()
+    else:
+        Thread(target=predict, name="ChimeraX DeepTMHMM", daemon=True).start()
+
+
 def register_command(logger):
     from chimerax.atomic import AtomsArg
-    from chimerax.core.commands import BoolArg, CmdDesc, EnumOf, FloatArg, IntArg, ModelsArg, StringArg, register
+    from chimerax.core.commands import BoolArg, CmdDesc, EnumOf, FloatArg, IntArg, ModelsArg, OpenFileNameArg, StringArg, register
 
     _register_shape_align_command(logger)
+
+    register("tmsegments", CmdDesc(required=[("atoms", AtomsArg)], keyword=[
+        ("color", BoolArg), ("results", OpenFileNameArg), ("python", OpenFileNameArg),
+        ("refresh", BoolArg), ("timeout", FloatArg), ("wait", BoolArg),
+    ], synopsis="Annotate and color predicted transmembrane helices and beta strands with DeepTMHMM"),
+        annotate_tm_segments, logger=logger)
+    register("tmsegments cancel", CmdDesc(synopsis="Stop waiting for the current DeepTMHMM prediction"),
+             tm_segments_cancel, logger=logger)
 
     register(
         "domains",
@@ -4116,7 +5119,6 @@ def register_command(logger):
     register("domainbrowser", CmdDesc(optional=[("models", ModelsArg)],
                                       synopsis="Browse domains for all analyzed models or one specified model"),
              domain_browser, logger=logger)
-
 
     register(
         "hydrophobicpatches",

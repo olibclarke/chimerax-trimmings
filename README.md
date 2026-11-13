@@ -34,6 +34,8 @@ The Python script registers:
 - `domains`
 - `domains cancel`
 - `domainbrowser`
+- `tmsegments`
+- `tmsegments cancel`
 
 `togglemaps` and `togglemodels` toggle the currently displayed maps/models on/off. `reorient` attempts to orient the view in a sensible direction - aligning the view to the shortest axis of an ellipsoid defined by the visible components - and repeated invocations of the command cycle through alignment to other axes of the ellipsoid. `modelmotion` activates & freezes selected models for motion, in order to mimick the behavior of legacy Chimera, described in more detail below.
 
@@ -57,6 +59,19 @@ shapealign #2 to #1 color_fit true
 The first input moves; `to` identifies one fixed reference. Multiple moving
 inputs align independently. Atomic selections restrict fitting atoms but the
 whole moving model is repositioned.
+The reference is skipped automatically if it is included in the moving range.
+
+Known AlphaFold database models are automatically weighted by pLDDT to reduce
+the influence of uncertain tails. For local prediction files, use
+`confidence_moving plddt`, `confidence_reference plddt`, or `confidence plddt`
+for both inputs. These settings expect pLDDT in the B-factor field, not
+experimental B-factors. `confidence off` disables weighting. The whole model
+still moves rigidly; maps are unchanged.
+
+Global atomic batches with at least four moving models automatically use the
+available logical CPU count minus one, capped by the number of moving models.
+Use `workers 1` to run serially or `workers N` to request a process count.
+Map fits remain serial. Results retain one Undo action.
 
 Unless a CoFR sphere is requested, maps use full density, independent of contours
 and display regions. Map values,
@@ -72,6 +87,8 @@ refines an existing alignment using both inputs' density inside that sphere.
 Both radii are in Angstroms and cannot be combined. `color_fit true` colors moving atomic
 models by local density agreement; it is not available for moving maps.
 
+Type `shapealign` or `shapealign help` to open the Log with a short, formatted
+summary. Click **All options** or run `usage shapealign` for complete syntax.
 The command is included in `chimerax_trimmings.py` and supports Undo/Redo.
 See [Shape Alignment](SHAPE_ALIGN.md) for installation, all options, examples,
 and practical limitations.
@@ -136,6 +153,104 @@ loading a saved session to rebuild the browser.
 Residue attributes `domain_name` and `domain_accession` hold the primary match;
 `domain_names` and `domain_accessions` retain overlapping matches separated by
 ` | `. For example: `select #1 & ::domain_accession=PF00071`.
+
+
+## Transmembrane Helices and Beta Strands
+
+`tmsegments` runs [DeepTMHMM](https://dtu.biolib.com/DeepTMHMM) on BioLib and
+annotates both predicted **TM helices** (`M`, orange) and **TM beta strands**
+(`B`, cyan). Other residues are gray. Both atom and cartoon colors are updated;
+use `color false` to assign attributes while retaining existing colors. Predictions
+do not change the model's secondary-structure assignments or coordinates.
+
+```chimerax
+tmsegments #1
+tmsegments #1/A
+tmsegments #1-3 wait true
+tmsegments #1 color false
+tmsegments #1 refresh true timeout 1800
+tmsegments cancel
+```
+
+The atom specification identifies **complete chains** to analyze: touching one
+residue requests its whole protein chain. Full chain sequences, where available,
+are sent to BioLib; coordinates stay local. Identical sequences are predicted
+once and results are cached for the current ChimeraX session. `refresh true`
+requests fresh predictions. GUI submissions run in the background; `wait true`
+waits for completion and is useful in scripts. Headless sessions always wait.
+While a remote job is pending, the status bar shows a running message with an
+elapsed-seconds counter, updated about once per second. This includes time queued
+on BioLib. Completion replaces it with the elapsed time and counts of TM helices
+and TM beta strands. Cancellation, timeout, and failure also update the status bar.
+The default timeout is 1200 seconds. Cancellation/timeout stops the local client;
+an already submitted remote job may continue on BioLib.
+
+### BioLib setup
+
+The command is included in `chimerax_trimmings.py`; no extra startup script is
+needed. The BioLib client runs in a separate Python environment. On macOS, create
+the default environment in Terminal (using an installed Python 3):
+
+```bash
+python3 -m venv ~/.local/share/chimerax-trimmings/deeptmhmm
+~/.local/share/chimerax-trimmings/deeptmhmm/bin/python -m pip install pybiolib
+```
+
+To use another environment, pass its Python executable explicitly:
+
+```chimerax
+tmsegments #1 python /absolute/path/to/venv/bin/python
+```
+
+Alternatively set `CHIMERAX_DEEPTMHMM_PYTHON` in the environment from which
+ChimeraX is launched. If BioLib requires authentication, log in once from Terminal
+with that environment's `biolib login`, or supply `BIOLIB_TOKEN` in ChimeraX's
+launch environment. Tokens are not command arguments. See the
+[BioLib Python documentation](https://biolib.com/docs/using-applications/python/).
+The client interface was checked against pybiolib 1.4.647.
+
+### Import and inspect predictions
+
+An existing DeepTMHMM `predicted_topologies.3line` file can be imported without
+installing the BioLib client or submitting a remote job:
+
+```chimerax
+tmsegments #1 results /absolute/path/predicted_topologies.3line
+select #1 & ::tm_type=helix
+select #1 & ::tm_type=strand
+select #1 & ::tm_topology=S
+select #1/A & ::tm_segment=2
+```
+
+The file must contain an **exact sequence match** for each requested chain;
+identifiers need not match model or chain names. Extra sequences in a batch file
+are allowed. Imported predictions take precedence over cached remote results
+for that run and do not replace the remote cache.
+
+| Residue attribute | Meaning |
+| --- | --- |
+| `tm_topology` | Original DeepTMHMM label: `M`, `B`, `S`, `I`, `O`, or `P` |
+| `tm_type` | `helix`, `strand`, or an empty string for other residues |
+| `tm_segment` | One-based TM segment number within the chain; `0` outside TM segments |
+
+Signal peptides (`S`) retain their own topology label and are excluded from TM
+segment counts. `I`, `O`, and `P` retain DeepTMHMM's inside/outside/periplasm labels;
+these are sequence predictions, not an estimated membrane plane in 3D.
+
+The Log shows a clickable list of both segment types, including sequence ranges
+and their corresponding structure residue specifications. Missing coordinates,
+residue-number offsets, and insertion codes are respected. A segment with no
+modeled residues is still reported. Unknown/nonstandard sequence letters are
+rejected rather than silently deleted or replaced. If the full polymer sequence
+is unavailable, the helper warns before using ChimeraX's inferred chain sequence.
+
+Annotations and coloring support Undo/Redo. Reanalyzing a chain replaces its TM
+annotations, including clearing earlier assignments when no TM segments are
+predicted; other chains' records remain available. Predictions for a chain that
+was deleted or whose sequence/residue mapping changed during submission are
+skipped. The combined records are available as `session._trimmings_tm_records`.
+Attributes/records are session annotations; this helper does not add a custom
+mmCIF export or persist the prediction cache across ChimeraX sessions.
 
 
 ## Exposed Hydrophobic Residues
