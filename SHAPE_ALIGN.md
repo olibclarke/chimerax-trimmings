@@ -74,7 +74,7 @@ inspect the result. Scores from the two objectives are not directly comparable.
 
 ## Fitting Maps
 
-Maps use their full density, independently of the displayed contour, surface
+Unless a CoFR sphere is requested, maps use their full density, independently of the displayed contour, surface
 zone, displayed subregion, or display step. Positive and negative values are
 retained. There is no automatic background subtraction, thresholding, or sign
 inversion.
@@ -95,14 +95,43 @@ associated atomic model moves.
 Large nonzero backgrounds or noise can affect a full-density fit. Use an
 appropriately prepared map or restrict fitting with a local sphere.
 
-## Local Refinement
+## Regional Global Search
 
-Use `radius` after the inputs are already approximately aligned. Position the
-ChimeraX center of rotation at the region of interest, then run:
+For a small model in a large map, position the ChimeraX center of rotation at
+the expected binding site and search the surrounding reference density:
 
 ```chimerax
-shapealign #2 to #1 radius 30
-shapealign #2 to #1 radius 30 objective gradient
+shapealign #2 to #1 radius_search
+shapealign #2 to #1 radius_search 60
+shapealign #2 to #1 radius_search 60 objective gradient
+```
+
+With no value, `radius_search` uses 1.5 times the maximum distance from the moving
+fitting atoms' centroid to any fitting atom, giving 50% padding around an enclosing
+sphere. This is independent of the model's position or orientation and respects
+atomic selections. For moving maps, it uses the farthest corner of the full
+nonzero density bounds from the density center. In a batch, the automatic radius
+is calculated separately for each moving input. The chosen radius is logged.
+
+`to` must specify a map. `radius_search` is in Angstroms and selects reference
+voxel centers inside the starting CoFR sphere. The entire moving selection is
+used, even if it starts outside that sphere. A global orientation and translation
+search is always performed; `fallback_correlation 0` does not disable this
+explicitly requested search. `extra_starts` can extend the orientation search.
+
+The radius selects the reference density used for scoring, not a maximum movement
+distance or a requirement that every moving atom stay inside the sphere. Choose
+a sphere large enough to contain the expected fit. Only temporary numerical
+density is cropped: the input map, its surfaces, and display remain unchanged.
+
+## Local Refinement
+
+Use `radius_refine` after the inputs are already approximately aligned. Position
+the ChimeraX center of rotation at the region of interest, then run:
+
+```chimerax
+shapealign #2 to #1 radius_refine 30
+shapealign #2 to #1 radius_refine 30 objective gradient
 ```
 
 The radius is in Angstroms. Only atom or voxel centers inside the starting sphere
@@ -110,8 +139,10 @@ contribute. The sphere is fixed for the command; each whole moving input still
 moves rigidly. There is no global orientation search in this mode.
 
 Atomic specifications can further restrict the sphere. For maps, the input map
-is not cropped or zoned. `radius` cannot be combined with `partial true` or
-nonzero `extra_starts`.
+is not cropped or zoned. `radius_refine` cannot be combined with `partial true`
+or nonzero `extra_starts`. `radius_search` and `radius_refine` are mutually
+exclusive. The old `radius` spelling remains an alias for `radius_refine`;
+specify only one spelling.
 
 ## Resolution and Search
 
@@ -177,7 +208,9 @@ time.
 | `max_points` | Maximum source density samples per stage, at least 1000 | `12000` |
 | `extra_starts` | Additional global orientation starts | `0` |
 | `move` | Apply the fit; false only calculates and reports it | `true` |
-| `radius` | Local fitting sphere at the current center of rotation, in Angstroms | None |
+| `radius_search` | Global search against a reference-map CoFR sphere; optional radius in Angstroms, or omit the value for 1.5 times the moving input's enclosing radius | Off |
+| `radius_refine` | Local refinement using both inputs' CoFR spheres, in Angstroms | None |
+| `radius` | Compatibility alias for `radius_refine` | None |
 | `partial` | `true` requests atom-only partial density fitting; `false` disables it | Automatic for atom-only density fitting |
 | `fallback_correlation` | Cutoff for an additional search; 0 disables quality-triggered searches | `0.7` density; `0.5` gradient |
 | `correlation` | Save local density CC on moving atoms/residues | `false` |
@@ -197,8 +230,9 @@ transform. Restrict atomic selections or use local refinement to focus on the
 region you need.
 
 If memory limits are reached, use a coarser `resolution`, a smaller atomic
-selection, or a local `radius`. The command cannot fit instanced model copies or
-treat both a parent and its descendant as independent moving inputs.
+selection, a regional `radius_search`, or a local `radius_refine`. The command
+cannot fit instanced model copies or treat both a parent and its descendant as
+independent moving inputs.
 
 No finite search guarantees the global optimum. Inspect the aligned structures
 and maps rather than treating the reported score as proof of a correct fit.

@@ -2234,9 +2234,9 @@ def _shape_align_one(session, atoms, to, resolution=None, max_points=12000,
         if not isfinite(radius) or radius <= 0:
             raise UserError("radius must be finite and greater than zero (Angstroms).")
         if extra_starts:
-            raise UserError("extra_starts cannot be used with radius; local fitting refines only the current pose.")
+            raise UserError("extra_starts cannot be used with radius_refine; local fitting refines only the current pose.")
         if partial:
-            raise UserError("partial true cannot be used with radius; local fitting must keep the current pose.")
+            raise UserError("partial true cannot be used with radius_refine; local fitting must keep the current pose.")
     structures = atoms.unique_structures
     targets = to.unique_structures
     if len(structures) != 1 or len(targets) != 1 or structures[0] is targets[0]:
@@ -2301,7 +2301,7 @@ def _shape_align_one(session, atoms, to, resolution=None, max_points=12000,
         )
     stats["seconds"] = perf_counter() - fitting_started
     if center is not None:
-        stats.update(radius=radius, center_of_rotation=center.copy())
+        stats.update(radius=radius, radius_refine=radius, center_of_rotation=center.copy())
     transform = reference_scene * local_transform * source_scene.inverse()
     scores = None
     if score_fit:
@@ -2774,6 +2774,14 @@ def _fit_shape_density_inputs(source, target, options, center):
                source.model.scene_position * translation(source.center))
     starts = [initial] if radius is not None else [*_shape_starts(
         source.landmarks, target.landmarks, options["extra_starts"]), initial]
+    search_radius = options.get("radius_search")
+    if search_radius is not None:
+        # A regional global search must explore translations even when PCA
+        # already gives a good score. Only the reference density was cropped.
+        source.model.session.logger.status("Shape alignment: global search of the reference CoFR sphere...")
+        starts.extend(_shape_map_fft_starts(
+            source.grid(levels[0]), target.grid(levels[0]), source.landmarks,
+            target.landmarks, objective, options["extra_starts"]))
 
     def refine(candidates, first=0):
         for blur in levels[first:]:
@@ -2795,7 +2803,9 @@ def _fit_shape_density_inputs(source, target, options, center):
     stats.update(objective=objective, partial=False, local=radius is not None, map_search=False,
                  moving_input_type="map" if source.is_map else "atoms",
                  reference_input_type="map" if target.is_map else "atoms", resolutions=levels)
-    if radius is None and options["fallback_correlation"] > 0 and score < options["fallback_correlation"]:
+    if search_radius is not None:
+        stats.update(map_search=True, map_search_resolution=levels[0], radius_search=search_radius)
+    elif radius is None and options["fallback_correlation"] > 0 and score < options["fallback_correlation"]:
         first = 1 if len(levels) > 2 else 0
         blur = levels[first]
         seeds = _shape_map_fft_starts(source.grid(blur), target.grid(blur), source.landmarks,
@@ -2806,7 +2816,9 @@ def _fit_shape_density_inputs(source, target, options, center):
             score, pose = proposed_score, proposed
     stats["score"] = score
     if center is not None:
-        stats.update(radius=radius, center_of_rotation=center.copy())
+        stats["center_of_rotation"] = center.copy()
+        if radius is not None:
+            stats.update(radius=radius, radius_refine=radius)
     return translation(target.center) * pose * translation(-source.center), stats
 
 
@@ -2841,9 +2853,21 @@ def _shape_align_with_map(session, source_item, target_item, options, center, ta
     from chimerax.core.undo import UndoState
 
     started = perf_counter() if started is None else started
-    source = _ShapeDensityInput(*source_item, center, options["radius"])
-    target = target_input if target_input is not None else _ShapeDensityInput(*target_item, center, options["radius"])
+    radius = options["radius"]
+    # Local refinement crops both inputs; global search keeps the moving input
+    # intact, including when it starts completely outside the reference sphere.
+    source = _ShapeDensityInput(*source_item, center if radius is not None else None, radius)
+    auto_search = options.get("radius_search") is True
+    if auto_search:
+        search_radius = _shape_search_radius(source)
+        options = dict(options, radius_search=search_radius)
+        session.logger.info(f"Automatic radius_search for #{source.model.id_string}: {search_radius:.3g} A "
+                            "(1.5 times the moving input's enclosing radius).")
+    target = target_input if target_input is not None else _ShapeDensityInput(
+        *target_item, center, radius if radius is not None else options.get("radius_search"))
     pose, stats = _fit_shape_density_inputs(source, target, options, center)
+    if options.get("radius_search") is not None:
+        stats["radius_search_automatic"] = auto_search
     stats["seconds"] = perf_counter() - started
     scores = None
     if options["correlation"] or options["color_fit"]:
@@ -2873,9 +2897,13 @@ def _shape_align_with_map(session, source_item, target_item, options, center, ta
         stats["correlation_seconds"] = perf_counter() - scoring_started
     stats.update(moving_model_id=model.id_string, reference_model_id=reference.id_string)
     metric = "gradient correlation" if options["objective"] == "gradient" else "density overlap"
+    region = (f"reference density in a {options['radius_search']:g} A CoFR search sphere."
+              if options.get("radius_search") is not None else
+              f"density in a {radius:g} A CoFR refinement sphere." if radius is not None else
+              "full map density, independent of contour.")
     message = (f"Shape alignment #{model.id_string} ({stats['moving_input_type']}) to "
                f"#{reference.id_string} ({stats['reference_input_type']}): whole {metric} "
-               f"score {stats['score']:.3f}; {stats['seconds']:.2f} s; full map density, independent of contour." +
+               f"score {stats['score']:.3f}; {stats['seconds']:.2f} s; {region}" +
                (" (not moved)" if not options["move"] else ""))
     session.logger.info(message)
     session.logger.status(message)
@@ -2888,11 +2916,33 @@ def _shape_align_with_map(session, source_item, target_item, options, center, ta
     return transform, stats
 
 
+def _shape_search_radius(source):
+    """Leave 50% padding around a rotation-independent enclosing sphere."""
+    import numpy as np
+
+    if source.is_map:
+        # Use full nonzero density bounds, never a contour or displayed surface.
+        from itertools import product
+
+        corners = np.array(list(product(*zip(source.lower, source.upper))), dtype=float)
+        points = source.data.ijk_to_xyz_transform.transform_points(corners) - source.center
+    else:
+        points = source.landmarks  # Fitting atoms relative to their centroid.
+    return 1.5 * float(np.linalg.norm(points, axis=1).max())
+
+
 def shape_align(session, moving, to, resolution=None, max_points=12000,
                 extra_starts=0, move=True, radius=None, correlation=False,
                 color_fit=False, correlation_resolution=8.0, correlation_window=12.0,
-                partial=None, fallback_correlation=None, objective="density"):
-    """Independently align selected atomic models and/or maps to one fixed input."""
+                partial=None, fallback_correlation=None, objective="density",
+                radius_search=None, radius_refine=None):
+    """Align independent inputs globally, regionally, or by local refinement.
+
+    radius_search globally searches a reference-map CoFR sphere, keeping the
+    moving selection intact. True requests 1.5 times its enclosing radius.
+    radius_refine locally refines the current pose
+    using both inputs' CoFR spheres. radius is the legacy radius_refine alias.
+    """
     from contextlib import nullcontext
     from math import isfinite
     from time import perf_counter
@@ -2902,6 +2952,15 @@ def shape_align(session, moving, to, resolution=None, max_points=12000,
     sources, targets = _shape_input_items(moving), _shape_input_items(to)
     if not sources or len(targets) != 1:
         raise UserError("Specify moving atomic models/maps and exactly one reference model or map.")
+    if sum(value is not None for value in (radius, radius_refine, radius_search)) > 1:
+        raise UserError("Use only one of radius_search (global), radius_refine (local), or its legacy alias radius.")
+    if radius_refine is not None:
+        radius = radius_refine
+    for name, value in (("radius_refine", radius), ("radius_search", radius_search)):
+        if value is not None and (not isfinite(value) or value <= 0):
+            raise UserError(f"{name} must be finite and greater than zero (Angstroms).")
+    if radius_search is not None and targets[0][1] is not None:
+        raise UserError("radius_search requires a density map as the reference; use radius_refine for local model/model fitting.")
     target = targets[0][0]
     for model, _ in sources:
         if target in model.drawing_lineage or model in target.drawing_lineage:
@@ -2915,6 +2974,8 @@ def shape_align(session, moving, to, resolution=None, max_points=12000,
     if all(atoms is not None for _, atoms in [*sources, *targets]):
         return _shape_align_atomic_models(session, moving.atoms if hasattr(moving, "atoms") else moving,
                                           to.atoms if hasattr(to, "atoms") else to, **options)
+    if radius_search is not None:
+        options["radius_search"] = radius_search
     if objective not in ("density", "gradient") or partial not in (None, False):
         raise UserError("Map fitting supports objective density or gradient, with whole densities only; partial true is not supported.")
     if resolution is not None and (not isfinite(resolution) or resolution < 2):
@@ -2932,9 +2993,10 @@ def shape_align(session, moving, to, resolution=None, max_points=12000,
         if not isfinite(value) or value <= 0:
             raise UserError("Correlation resolution and window must be finite and positive.")
     center = None
-    if radius is not None:
-        if not isfinite(radius) or radius <= 0 or extra_starts:
-            raise UserError("radius must be finite and positive; extra_starts is not supported for local fitting.")
+    if radius is not None and extra_starts:
+        raise UserError("extra_starts is not supported with radius_refine (local refinement).")
+    region_radius = radius if radius is not None else radius_search
+    if region_radius is not None:
         center = np.array(session.main_view.center_of_rotation, dtype=float, copy=True)
         if center.shape != (3,) or not np.isfinite(center).all():
             raise UserError("The current center of rotation must be a finite XYZ position.")
@@ -2951,8 +3013,10 @@ def shape_align(session, moving, to, resolution=None, max_points=12000,
                     result = _shape_align_one(session, item[1], targets[0][1], sphere_center=center, **options)
                 else:
                     started = perf_counter()
-                    if target_input is None:
-                        target_input = _ShapeDensityInput(*targets[0], center, radius)
+                    # Automatic search sizes are per moving input, not inherited
+                    # from the first member of a batch.
+                    if target_input is None and radius_search is not True:
+                        target_input = _ShapeDensityInput(*targets[0], center, region_radius)
                     result = _shape_align_with_map(session, item, targets[0], options, center, target_input, started)
                 results.append(result)
         except BaseException:
@@ -2965,18 +3029,29 @@ def shape_align(session, moving, to, resolution=None, max_points=12000,
 
 
 def _register_shape_align_command(logger):
-    from chimerax.core.commands import BoolArg, CmdDesc, EnumOf, FloatArg, IntArg, ObjectsArg, register
+    from chimerax.core.commands import BoolArg, CmdDesc, EnumOf, FloatArg, IntArg, NoArg, ObjectsArg, Or, register
+
+    class SearchRadiusArg(Or):
+        # ChimeraX rejects empty keyword values before calling parse(), except
+        # for NoArg. Opt into that flag check while retaining numeric parsing.
+        def __eq__(self, other):
+            return other is NoArg or other is self
+
+        def unparse(self, value, session=None):
+            return "" if value is True else FloatArg.unparse(value, session)
 
     register("shapealign", CmdDesc(
         required=[("moving", ObjectsArg)],
         keyword=[("to", ObjectsArg), ("resolution", FloatArg),
                  ("max_points", IntArg), ("extra_starts", IntArg), ("move", BoolArg),
-                 ("radius", FloatArg), ("correlation", BoolArg), ("color_fit", BoolArg),
+                 ("radius_search", SearchRadiusArg(FloatArg, NoArg, name="radius in Angstroms or no value (automatic)")),
+                 ("radius_refine", FloatArg), ("radius", FloatArg),
+                 ("correlation", BoolArg), ("color_fit", BoolArg),
                  ("correlation_resolution", FloatArg), ("correlation_window", FloatArg),
                  ("partial", BoolArg), ("fallback_correlation", FloatArg),
                  ("objective", EnumOf(("density", "gradient")))],
         required_arguments=["to"],
-        synopsis="Align atomic models and/or maps by shape; optionally refine at CoFR",
+        synopsis="Align models/maps by shape; radius_search searches a map region, radius_refine refines locally",
     ), shape_align, logger=logger)
 
 

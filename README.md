@@ -45,7 +45,9 @@ shapealign #2 to #1
 shapealign #2 to #1 objective gradient
 shapealign #2-5 to #1
 shapealign #2/A to #1/B
-shapealign #2 to #1 radius 30
+shapealign #2 to #1 radius_search
+shapealign #2 to #1 radius_search 60
+shapealign #2 to #1 radius_refine 30
 shapealign #2 to #1 color_fit true
 ```
 
@@ -53,14 +55,18 @@ The first input moves; `to` identifies one fixed reference. Multiple moving
 inputs align independently. Atomic selections restrict fitting atoms but the
 whole moving model is repositioned.
 
-Maps use full density, independent of contours and display regions. Map values,
+Unless a CoFR sphere is requested, maps use full density, independent of contours
+and display regions. Map values,
 grid metadata, styling, and visibility are unchanged; only the moving owner's
 rigid transform changes.
 
 The default `objective density` compares density overlap. Try the experimental
 `objective gradient` when bulk overlap gives an implausible orientation.
-`radius` locally refines an existing alignment inside a sphere around the
-current center of rotation, in Angstroms. `color_fit true` colors moving atomic
+`radius_search` globally searches a reference-map sphere around the current
+center of rotation, keeping the moving selection intact. Omit its value to use
+1.5 times the moving input's enclosing radius. `radius_refine` locally
+refines an existing alignment using both inputs' density inside that sphere.
+Both radii are in Angstroms and cannot be combined. `color_fit true` colors moving atomic
 models by local density agreement; it is not available for moving maps.
 
 The command is included in `chimerax_trimmings.py` and supports Undo/Redo.
@@ -738,4 +744,3 @@ The shortcut button panel provides quick access to the Volume Viewer, Model Pane
 
 And here is what it looks like in action:
 https://www.dropbox.com/scl/fi/cdi295s8h7vc5ijf9wr54/chimerax_example_nav.mov?rlkey=mbqn4uk4yodhj1346thyf86oo&dl=0
-
