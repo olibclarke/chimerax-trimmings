@@ -3056,11 +3056,1067 @@ def _register_shape_align_command(logger):
 
 
 
+_PFAM_API = "https://www.ebi.ac.uk/Tools/hmmer/api/v1"
+_PFAM_POLL_SECONDS = 5
+_DOMAIN_BROWSER_VERSION = 5
+
+
+def _pfam_request(path, timeout, payload=None):
+    import json
+    from urllib.error import HTTPError
+    from urllib.request import Request, urlopen
+
+    request = Request(_PFAM_API + path,
+                      data=json.dumps(payload).encode("utf-8") if payload is not None else None, headers={
+        "User-Agent": "ChimeraX-Trimmings/1.0", "Accept": "application/json",
+        "Content-Type": "application/json",
+    })
+    try:
+        with urlopen(request, timeout=timeout) as response:
+            try:
+                return json.load(response)
+            except (ValueError, UnicodeError):
+                raise ValueError("EMBL-EBI HMMER returned an invalid JSON response.") from None
+    except HTTPError as error:
+        raise ValueError(f"EMBL-EBI HMMER returned HTTP {error.code}: {error.reason}.") from None
+
+
+def _pfam_parse_hits(payload, sequence):
+    """Read hmmscan sequence coordinates, not the profile-HMM coordinates."""
+    import math
+    import re
+
+    try:
+        if payload["status"] != "SUCCESS" or not isinstance(payload["result"]["hits"], list):
+            raise ValueError()
+        results = []
+        for hit in payload["result"]["hits"]:
+            metadata = hit["metadata"]
+            accession = metadata["accession"]
+            if not isinstance(accession, str) or not re.fullmatch(r"PF\d{5,}", accession):
+                raise ValueError()
+            for domain in hit["domains"]:
+                if not domain["significant"]:
+                    continue
+                alignment = domain["alignment_display"]
+                start, end = alignment["sqfrom"], alignment["sqto"]
+                if (type(start) is not int or type(end) is not int
+                        or not 1 <= start <= end <= len(sequence) or alignment["l"] != len(sequence)):
+                    raise ValueError()
+                evalue, score = float(domain["ievalue"]), float(domain["bitscore"])
+                if not math.isfinite(evalue) or evalue < 0 or not math.isfinite(score):
+                    raise ValueError()
+                if not isinstance(metadata["identifier"], str) or not isinstance(metadata["type"], str):
+                    raise ValueError()
+                results.append({
+                    "type": metadata["type"], "start": start, "end": end,
+                    "evalue": evalue, "bitscore": score,
+                    "accession": accession, "name": metadata["identifier"],
+                    "description": metadata.get("description", ""),
+                    "outcompeted": bool(domain["outcompeted"]),
+                })
+        return results
+    except (KeyError, TypeError, ValueError, OverflowError):
+        raise ValueError("Malformed Pfam domain results or invalid sequence coordinates; no annotations were applied.") from None
+
+
+def _pfam_search(sequences, timeout, cancel, report):
+    from time import monotonic
+    from uuid import UUID
+
+    deadline = monotonic() + timeout
+    results = {}
+
+    def request(path, payload=None):
+        remaining = deadline - monotonic()
+        if remaining <= 0:
+            raise ValueError(f"Pfam lookup timed out after {timeout:g} seconds.")
+        return _pfam_request(path, min(60, remaining), payload)
+
+    for index, sequence in enumerate(sequences, 1):
+        if cancel.is_set():
+            return None
+        report(f"Searching Pfam sequence {index}/{len(sequences)} at EMBL-EBI HMMER.")
+        submitted = request("/search/hmmscan", {
+            "input": ">domain_query\n" + sequence, "database": "pfam", "threshold": "cut_ga",
+        })
+        try:
+            rid = str(UUID(submitted["id"]))
+        except (KeyError, TypeError, ValueError, AttributeError):
+            raise ValueError("EMBL-EBI HMMER did not return a valid search ID.") from None
+        page, page_count, hits = 1, 1, []
+        while page <= page_count:
+            if cancel.is_set():
+                return None
+            response = request(f"/result/{rid}?with_domains=true&page_size=100&page={page}")
+            if not isinstance(response, dict):
+                raise ValueError("EMBL-EBI HMMER returned an unrecognized search response.")
+            status = response.get("status")
+            if status in ("PENDING", "STARTED", "RUNNING", "RETRY", "RECEIVED"):
+                report(f"Pfam search {index}/{len(sequences)} queued/running ({rid}).")
+                cancel.wait(min(_PFAM_POLL_SECONDS, max(0, deadline - monotonic())))
+                continue
+            if status != "SUCCESS":
+                raise ValueError(f"EMBL-EBI HMMER search {rid} failed (status {status!r}).")
+            hits.extend(_pfam_parse_hits(response, sequence))
+            page_count = response.get("page_count")
+            if (type(page_count) is not int or page_count < 0
+                    or (page_count == 0 and (page != 1 or response["result"]["hits"]))):
+                raise ValueError("EMBL-EBI HMMER returned an invalid result page count.")
+            page += 1
+        results[sequence] = hits
+    return results
+
+
+_INTERPRO_DATABASES = {
+    "pfam": "pfam", "cath-gene3d": "cathgene3d", "superfamily": "ssf", "cdd": "cdd",
+    "smart": "smart", "prositepatterns": "prosite", "prositeprofiles": "profile",
+    "panther": "panther", "pirsf": "pirsf", "hamap": "hamap", "prints": "prints",
+    "sfld": "sfld", "ncbifam": "ncbifam", "ncbifams": "ncbifam", "interpro": "interpro",
+}
+
+
+def _interpro_matches_request(md5s, timeout):
+    import json
+    from urllib.error import HTTPError
+    from urllib.request import Request, urlopen
+
+    request = Request("https://www.ebi.ac.uk/interpro/matches/api/matches",
+                      data=json.dumps({"md5": md5s}).encode("ascii"), headers={
+                          "Accept": "application/json", "Content-Type": "application/json",
+                          "User-Agent": "ChimeraX-Trimmings/1.0",
+                      })
+    try:
+        with urlopen(request, timeout=timeout) as response:
+            return json.load(response)
+    except HTTPError as error:
+        raise ValueError(f"InterPro Matches API HTTP {error.code}: {error.reason}.") from None
+
+
+def _interpro_parse_matches(matches, sequence):
+    """Retain independent member-database locations, including discontinuous domains."""
+    from math import isfinite
+    import re
+    from urllib.parse import quote
+
+    accepted_types = {"domain", "repeat", "homologous_superfamily", "family"}
+    results = []
+    try:
+        if not isinstance(matches, list):
+            raise ValueError()
+        for match in matches:
+            signature = match["signature"]
+            provider = match.get("source") or signature["signatureLibraryRelease"]["library"]
+            # Keep member-database evidence separate from InterPro-N predictions.
+            if provider == "InterPro-N":
+                continue
+            entry = signature.get("entry") or {}
+            entry_type = entry.get("type") or signature.get("type") or ""
+            if entry_type.lower() not in accepted_types:
+                continue
+            accession = signature["accession"]
+            if not isinstance(accession, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,100}", accession):
+                raise ValueError()
+            library = signature["signatureLibraryRelease"]["library"]
+            database = _INTERPRO_DATABASES.get(library.lower())
+            if database is None:
+                continue
+            integrated = entry.get("accession")
+            if integrated is not None and not re.fullmatch(r"IPR\d+", integrated):
+                raise ValueError()
+            name = signature.get("name") or entry.get("name") or signature.get("description") or accession
+            if not isinstance(name, str) or not isinstance(provider, str):
+                raise ValueError()
+            for location in match["locations"]:
+                start, end = location["start"], location["end"]
+                fragments = location.get("location-fragments") or [{"start": start, "end": end}]
+                segments = [(f["start"], f["end"]) for f in fragments]
+                if (type(start) is not int or type(end) is not int or not 1 <= start <= end <= len(sequence)
+                        or any(type(a) is not int or type(b) is not int or not start <= a <= b <= end for a, b in segments)):
+                    raise ValueError()
+                evalue, score = location.get("evalue", match.get("evalue")), location.get("score", match.get("score"))
+                for value in (evalue, score):
+                    if value is not None and not isfinite(float(value)):
+                        raise ValueError()
+                if evalue is not None and float(evalue) < 0:
+                    raise ValueError()
+                results.append({
+                    "origin": "interpro", "source": provider, "database": database,
+                    "accession": accession, "name": name, "type": entry_type,
+                    "description": signature.get("description") or entry.get("description") or "",
+                    "start": start, "end": end, "segments": segments,
+                    "evalue": float(evalue) if evalue is not None else None,
+                    "score": float(score) if score is not None else None, "bitscore": None,
+                    "integrated": integrated, "color_accession": integrated or accession,
+                    "entry_url": f"https://www.ebi.ac.uk/interpro/entry/{database}/{quote(accession, safe='')}/",
+                    "outcompeted": False,
+                })
+        return results
+    except (KeyError, TypeError, ValueError, AttributeError):
+        raise ValueError("Malformed InterPro matches or invalid sequence coordinates; no annotations were applied.") from None
+
+
+def _interpro_search(sequences, timeout, cancel, report):
+    from hashlib import md5
+    from time import monotonic
+
+    deadline, results = monotonic() + timeout, {}
+    for offset in range(0, len(sequences), 100):
+        if cancel.is_set():
+            return None
+        batch = sequences[offset:offset + 100]
+        by_hash = {md5(seq.encode("ascii")).hexdigest().upper(): seq for seq in batch}
+        report(f"Looking up {len(batch)} exact sequence(s) in InterPro Matches.")
+        remaining = deadline - monotonic()
+        if remaining <= 0:
+            raise ValueError(f"InterPro lookup timed out after {timeout:g} seconds.")
+        response = _interpro_matches_request(list(by_hash), min(60, remaining))
+        try:
+            items = response["results"]
+            if not isinstance(items, list) or len(items) != len(by_hash):
+                raise ValueError()
+            seen = set()
+            for item in items:
+                checksum = item["md5"].upper()
+                if checksum not in by_hash or checksum in seen or type(item["found"]) is not bool:
+                    raise ValueError()
+                seen.add(checksum)
+                if not item["found"]:
+                    raise LookupError("InterPro has no precomputed matches for one or more exact chain sequences. "
+                                      "Use 'domains <atom-spec> source pfam' for a new sequence search.")
+                sequence = by_hash[checksum]
+                results[sequence] = _interpro_parse_matches(item["matches"], sequence)
+        except (KeyError, TypeError, ValueError, AttributeError) as error:
+            raise ValueError(f"Invalid InterPro lookup response: {error}") from None
+    return results
+
+
+def _domain_hit_sort_key(hit):
+    if hit.get("origin") == "interpro":
+        # Scores from different member databases cannot be compared numerically.
+        # Prefer structural superfamily coverage, then domain/repeat matches, then families.
+        rank = {"ssf": 0, "cathgene3d": 1}.get(hit["database"], 2)
+        if hit["type"].lower() == "family":
+            rank = 3
+        return (False, rank, -sum(b - a + 1 for a, b in hit["segments"]), hit["accession"], hit["start"], hit["end"])
+    return (hit["outcompeted"], 0, -hit["bitscore"], hit["accession"], hit["start"], hit["end"])
+
+
+def _domain_number(value):
+    return "not reported" if value is None else f"{value:.3g}"
+
+
+def _domain_entry_url(record):
+    return record.get("entry_url", f'https://www.ebi.ac.uk/interpro/entry/pfam/{record["accession"]}/')
+
+
+def _domain_chain_inputs(atoms):
+    from chimerax.atomic import Residue
+    from chimerax.core.errors import UserError
+
+    targets = set(atoms.unique_residues)
+    entries = []
+    for structure in atoms.unique_structures:
+        for chain in structure.chains:
+            if chain.polymer_type != Residue.PT_PROTEIN:
+                continue
+            residues = tuple(chain.residues)
+            selected = {r for r in residues if r is not None and r in targets}
+            if not selected:
+                continue
+            sequence = chain.characters.upper()
+            if len(sequence) != len(residues) or not sequence or not sequence.isascii() or not sequence.isalpha():
+                raise UserError(f"Cannot map the sequence of {chain.atomspec} to its residues safely.")
+            spec = chain.atomspec
+            if not spec.startswith("#"):
+                spec = f"#{structure.id_string}" + spec
+            entries.append({"chain": chain, "sequence": sequence, "residues": residues,
+                            "targets": selected, "spec": spec})
+    if not entries:
+        raise UserError("The atom specification must match at least one protein chain.")
+    return entries
+
+
+def _domain_color(accession):
+    from colorsys import hsv_to_rgb
+    from hashlib import sha256
+
+    if not accession:
+        return (0.65, 0.65, 0.65, 1)
+    hue = int.from_bytes(sha256(accession.encode()).digest()[:4], "big") / 2**32
+    return (*hsv_to_rgb(hue, 0.65, 0.95), 1)
+
+
+def _domain_model_snapshots(session):
+    snapshots = getattr(session, "_trimmings_domain_models", None)
+    if snapshots is None:
+        # Upgrade results produced before per-model browsing was available.
+        snapshots = {}
+        for record in getattr(session, "_trimmings_domains", []):
+            snapshots.setdefault(record["structure"], {})[record["chain"]] = (
+                record["sequence"], record["sequence_residues"],
+            )
+    return snapshots
+
+
+def _set_domain_records(session, records, snapshots=None):
+    session._trimmings_domains = records
+    if snapshots is None:
+        session._trimmings_domain_models = None
+        snapshots = _domain_model_snapshots(session)
+    session._trimmings_domain_models = snapshots
+    tool = getattr(session, "_trimmings_domain_browser", None)
+    if tool is not None and not tool._closed and getattr(tool, "_domain_browser_version", 0) != _DOMAIN_BROWSER_VERSION:
+        tool.delete()
+        tool = None
+    if tool is not None and not tool._closed:
+        tool.refresh()
+
+
+def _domain_chain_is_current(chain, sequence, residues):
+    return (not chain.deleted and chain.structure is not None and not chain.structure.deleted
+            and chain.structure.id is not None and chain.characters.upper() == sequence
+            and tuple(chain.residues) == residues)
+
+
+def _domain_analyzed_models(session):
+    return sorted((model for model, chains in _domain_model_snapshots(session).items()
+                   if not model.deleted and model.id is not None
+                   and any(_domain_chain_is_current(chain, *snapshot) for chain, snapshot in chains.items())),
+                  key=lambda model: model.id)
+
+
+def _live_domain_records(session):
+    return [record for record in getattr(session, "_trimmings_domains", [])
+            if len(record["residues"]) and _domain_chain_is_current(
+                record["chain"], record["sequence"], record["sequence_residues"])]
+
+
+def _apply_domain_results(session, entries, results, color, include_overlaps, gui=True, source="pfam"):
+    from html import escape
+    from types import SimpleNamespace
+    from urllib.parse import quote
+    from chimerax.atomic import Residue, Residues, concise_residue_spec
+    from chimerax.core.colors import Color
+    from chimerax.core.objects import Objects
+    from chimerax.core.undo import UndoState
+    from chimerax.std_commands.color import color as color_objects
+
+    # One primary assignment controls display; retain all overlapping hits as text.
+    attributes = ("domain_name", "domain_accession", "domain_names", "domain_accessions")
+    for name in attributes:
+        Residue.register_attr(session, name, "Trimmings domains", attr_type=str)
+    rows, records, count, updated_chains = [], [], 0, set()
+    previous_records = getattr(session, "_trimmings_domains", [])
+    previous_models = _domain_model_snapshots(session)
+    snapshots = {model: dict(chains) for model, chains in previous_models.items()}
+    with session.undo.aggregate("annotate domains"):
+        undo = UndoState("Domain attributes")
+        for entry in entries:
+            chain = entry["chain"]
+            if (chain.deleted or chain.structure is None or chain.structure.deleted
+                    or any(r.deleted for r in entry["targets"])
+                    or chain.characters.upper() != entry["sequence"]
+                    or tuple(chain.residues) != entry["residues"]):
+                session.logger.warning(f"Skipped {entry['spec']}: chain changed during the domain lookup.")
+                continue
+            updated_chains.add(chain)
+            snapshots.setdefault(chain.structure, {})[chain] = (entry["sequence"], entry["residues"])
+            hits = [h for h in results[entry["sequence"]]
+                    if include_overlaps or not h["outcompeted"]]
+            hits.sort(key=_domain_hit_sort_key)
+            membership = {r: [] for r in entry["targets"]}
+            for hit in hits:
+                members = list(dict.fromkeys(
+                    r for a, b in hit.get("segments", [(hit["start"], hit["end"])])
+                    for r in entry["residues"][a - 1:b] if r in membership))
+                for residue in members:
+                    membership[residue].append(hit)
+                if members:
+                    records.append({**hit, "structure": chain.structure, "chain": chain,
+                                    "chain_spec": entry["spec"], "sequence": entry["sequence"],
+                                    "sequence_residues": entry["residues"], "residues": Residues(members)})
+                    spec = concise_residue_spec(session, Residues(members))
+                    # Always retain a model ID in links, even in a one-model session.
+                    if not spec.startswith("#"):
+                        spec = f"#{chain.structure.id_string}" + spec
+                    rows.append(
+                        f'<tr><td>{escape(entry["spec"])}</td>'
+                        f'<td><a href="cxcmd:{quote("select " + spec, safe="")}">{escape(hit["name"])}</a></td>'
+                        f'<td><a href="{_domain_entry_url(hit)}">'
+                        f'{hit["accession"]}</a></td><td>{escape(hit["type"])}</td>'
+                        f'<td>{hit["start"]}&ndash;{hit["end"]}</td><td>{escape(spec)}</td>'
+                        f'<td>{_domain_number(hit["evalue"])}</td><td>{escape(hit.get("source", "Pfam"))}</td></tr>'
+                    )
+            groups = {}
+            for residue, matches in membership.items():
+                primary = matches[0] if matches else None
+                values = (
+                    primary["name"] if primary else "", primary["accession"] if primary else "",
+                    " | ".join(dict.fromkeys(h["name"] for h in matches)),
+                    " | ".join(dict.fromkeys(h["accession"] for h in matches)),
+                )
+                for name, value in zip(attributes, values):
+                    # None is ChimeraX's unset attribute value and is undoable.
+                    undo.add(residue, name, getattr(residue, name, None), value)
+                    setattr(residue, name, value)
+                groups.setdefault(primary.get("color_accession", values[1]) if primary else "", []).append(residue)
+                count += bool(primary)
+            if color:
+                for accession, members in groups.items():
+                    color_objects(session, Objects(atoms=Residues(members).atoms), Color(_domain_color(accession)), target="ac")
+        records.sort(key=lambda r: (r["structure"].id, r["chain"].chain_id, r["start"], r["end"], r["accession"]))
+        combined = [record for record in _live_domain_records(session) if record["chain"] not in updated_chains] + records
+        combined.sort(key=lambda r: (r["structure"].id, r["chain"].chain_id, r["start"], r["end"], r["accession"]))
+        # Keep the browser's results in step with annotation Undo/Redo.
+        state = SimpleNamespace(set_records=lambda value: _set_domain_records(session, *value))
+        undo.add(state, "set_records", (previous_records, previous_models), (combined, snapshots), option="M")
+        state.set_records((combined, snapshots))
+        session.undo.register(undo)
+    if rows:
+        session.logger.info(
+            f'<b>{"InterPro" if source == "interpro" else "Pfam"} domain annotations</b> (click a name to select its footprint)'
+            '<table border="1" cellpadding="3"><tr><th>Chain</th><th>Domain</th><th>Accession</th>'
+            '<th>Hit type</th><th>Query positions</th><th>Structure residues</th><th>E-value</th><th>Source</th></tr>'
+            + "".join(rows) + "</table>", is_html=True,
+        )
+    session.logger.info(f"{'InterPro' if source == 'interpro' else 'Pfam'}: {len(records)} annotation matches; "
+                        f"annotated {count} target residues. Unassigned residues have empty domain_name/domain_accession.")
+    if gui and session.ui.is_gui:
+        domain_browser(session)
+    return records
+
+
+def _interpro_request(path):
+    import json
+    from urllib.error import HTTPError
+    from urllib.request import Request, urlopen
+
+    request = Request("https://www.ebi.ac.uk/interpro/api" + path,
+                      headers={"Accept": "application/json", "User-Agent": "ChimeraX-Trimmings/1.0"})
+    try:
+        with urlopen(request, timeout=20) as response:
+            if response.status == 204:
+                return None
+            return json.load(response)
+    except HTTPError as error:
+        if error.code in (204, 404):
+            return None
+        raise ValueError(f"InterPro HTTP {error.code}: {error.reason}") from None
+
+
+def _domain_plain_text(markup):
+    from html.parser import HTMLParser
+    import re
+
+    class Text(HTMLParser):
+        def __init__(self):
+            super().__init__()
+            self.parts, self.hidden = [], 0
+
+        def handle_starttag(self, tag, attrs):
+            if tag in ("script", "style"):
+                self.hidden += 1
+            elif tag in ("p", "br", "li", "div"):
+                self.parts.append(" ")
+
+        def handle_endtag(self, tag):
+            if tag in ("script", "style"):
+                self.hidden = max(0, self.hidden - 1)
+            elif tag in ("p", "li", "div"):
+                self.parts.append(" ")
+
+        def handle_data(self, text):
+            if not self.hidden:
+                self.parts.append(text)
+
+    parser = Text()
+    parser.feed(markup if isinstance(markup, str) else "")
+    text = " ".join("".join(parser.parts).split())
+    return re.sub(r"\[+cite:[^\]]+\]+", "", text).strip()
+
+
+def _domain_descriptions(metadata):
+    descriptions = metadata.get("description") or []
+    if isinstance(descriptions, str):
+        descriptions = [{"text": descriptions}]
+    return [{"text": _domain_plain_text(d.get("text", "")), "generated": bool(d.get("llm"))}
+            for d in descriptions if isinstance(d, dict) and d.get("text")]
+
+
+def _fetch_domain_info(accession, database="pfam", integrated_hint=None):
+    """Fetch entry-level descriptions and a database representative, without sequence submission."""
+    import re
+    from urllib.parse import quote
+
+    if database not in set(_INTERPRO_DATABASES.values()) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,100}", accession):
+        raise ValueError("Invalid domain database or accession.")
+    encoded_accession = quote(accession, safe="")
+    info = {"descriptions": [], "structures": [], "go_terms": [], "errors": [], "integrated": None}
+
+    def fetch(path, label):
+        try:
+            return _interpro_request(path)
+        except Exception as error:
+            info["errors"].append(f"{label}: {error}")
+            return None
+
+    source_entry = fetch(f"/entry/{database}/{encoded_accession}/", "Member database description")
+    metadata = source_entry.get("metadata", {}) if isinstance(source_entry, dict) else {}
+    info["descriptions"] = [{**d, "source": accession, "database": database} for d in _domain_descriptions(metadata)]
+    name = metadata.get("name") or {}
+    info["name"] = name.get("name", "") if isinstance(name, dict) else str(name)
+    integrated = metadata.get("integrated") or integrated_hint
+    if isinstance(integrated, str) and re.fullmatch(r"IPR\d+", integrated):
+        info["integrated"] = integrated
+        entry = fetch(f"/entry/interpro/{integrated}/", "InterPro description")
+        ipr = entry.get("metadata", {}) if isinstance(entry, dict) else {}
+        info["descriptions"].extend({**d, "source": integrated} for d in _domain_descriptions(ipr))
+        info["go_terms"] = [term for term in ipr.get("go_terms") or []
+                            if isinstance(term, dict) and re.fullmatch(r"GO:\d+", term.get("identifier", ""))]
+
+    representative = metadata.get("representative_structure") or {}
+    pdb = representative.get("accession", "") if isinstance(representative, dict) else ""
+    if re.fullmatch(r"[A-Za-z0-9]{4}|pdb_[A-Za-z0-9]+", pdb):
+        structure = {"accession": pdb, "name": representative.get("name", ""), "representative": True}
+        details = fetch(f"/structure/pdb/{pdb}/entry/{database}/{encoded_accession}/", "Representative structure details")
+        if isinstance(details, dict):
+            data = details.get("metadata", {})
+            structure.update({"resolution": data.get("resolution"), "method": data.get("experiment_type"),
+                              "chains": sorted({e["chain"] for e in details.get("entries", []) if e.get("chain")})})
+        info["structures"].append(structure)
+    else:
+        examples = fetch(f"/structure/pdb/entry/{database}/{encoded_accession}/?page_size=3", "Example structures")
+        if isinstance(examples, dict):
+            for item in examples.get("results", [])[:3]:
+                data = item.get("metadata", {})
+                pdb = data.get("accession", "")
+                if re.fullmatch(r"[A-Za-z0-9]{4}|pdb_[A-Za-z0-9]+", pdb):
+                    info["structures"].append({
+                        "accession": pdb, "name": data.get("name", ""), "representative": False,
+                        "resolution": data.get("resolution"), "method": data.get("experiment_type"),
+                        "chains": sorted({e["chain"] for e in item.get("entries", []) if e.get("chain")}),
+                    })
+    return info
+
+
+def _domain_details_html(session, record, info=None, loading=False):
+    from html import escape
+    from chimerax.atomic import concise_residue_spec
+
+    accession = record["accession"]
+    database = record.get("database", "pfam")
+    score_text = (f'{escape(record["source"])} score {_domain_number(record.get("score"))}'
+                  if record.get("origin") == "interpro" else f'bit score {_domain_number(record.get("bitscore"))}')
+    parts = [f'<h3>{escape(record["name"])} ({escape(accession)})</h3>',
+             f'<p>{escape(concise_residue_spec(session, record["residues"]))}<br>'
+             f'Query positions {record["start"]}&ndash;{record["end"]}; {len(record["residues"])} modeled residues<br>'
+             f'{escape(record["type"])}; E-value {_domain_number(record.get("evalue"))}; {score_text}</p>',
+             f'<p><a href="{_domain_entry_url(record)}">{escape(record.get("source", "Pfam"))} entry</a> | '
+             f'<a href="https://www.ebi.ac.uk/interpro/structure/pdb/entry/{database}/{accession}/">All matching structures</a></p>']
+    if len(record.get("segments", [])) > 1:
+        parts.append('<p>Segments: ' + ', '.join(f'{a}–{b}' for a, b in record["segments"]) + '</p>')
+    if record.get("description"):
+        parts.append(f'<p>{escape(_domain_plain_text(record["description"]))}</p>')
+    if info is None:
+        parts.append("<p>Loading descriptions and structure links&hellip;</p>" if loading
+                     else "<p>Details have not been fetched yet.</p>")
+        return "".join(parts)
+    if info.get("integrated"):
+        ipr = info["integrated"]
+        parts.append(f'<p>Integrated InterPro entry: '
+                     f'<a href="https://www.ebi.ac.uk/interpro/entry/interpro/{ipr}/">{escape(ipr)}</a></p>')
+    for description in info.get("descriptions", []):
+        source = description["source"]
+        description_database = description.get("database", "pfam" if source.startswith("PF") else "interpro")
+        label = " (AI-generated database text)" if description.get("generated") else ""
+        text = description["text"]
+        if len(text) > 1400:
+            text = text[:1400].rsplit(" ", 1)[0] + "…"
+        parts.append(f'<p><b>{escape(source)} description{label}</b><br>{escape(text)} '
+                     f'<a href="https://www.ebi.ac.uk/interpro/entry/{description_database}/{source}/">Full entry</a></p>')
+    terms = info.get("go_terms", [])
+    if terms:
+        parts.append("<p><b>Associated GO annotations</b><br>" + "<br>".join(
+            f'<a href="https://www.ebi.ac.uk/QuickGO/term/{term["identifier"]}">{term["identifier"]}</a>: '
+            f'{escape(term.get("name", ""))}' for term in terms) + "</p>")
+    structures = info.get("structures", [])
+    if structures:
+        parts.append("<p><b>Structures</b></p><ul>")
+        for structure in structures:
+            pdb = structure["accession"]
+            label = "Database representative" if structure["representative"] else "Example match"
+            details = [str(structure["method"])] if structure.get("method") else []
+            if structure.get("resolution") is not None:
+                details.append(f'{structure["resolution"]} Å')
+            if structure.get("chains"):
+                details.append("chains " + ", ".join(structure["chains"]))
+            name = structure.get("name", "")
+            if isinstance(name, dict):
+                name = name.get("name", "")
+            parts.append(f'<li>{label}: <a href="https://www.rcsb.org/structure/{pdb}">{pdb.upper()}</a> '
+                         f'(<a href="https://www.ebi.ac.uk/pdbe/entry/pdb/{pdb}">PDBe</a>)<br>'
+                         f'{escape(name)}<br>{escape("; ".join(details))}</li>')
+        parts.append("</ul>")
+    elif not info.get("errors"):
+        parts.append("<p>No experimental structure links are available for this entry.</p>")
+    if not info.get("descriptions"):
+        parts.append("<p>No additional functional description is available.</p>")
+    if info.get("errors"):
+        parts.append("<p>Some details could not be retrieved: " + escape("; ".join(info["errors"])) +
+                     ". Use Reload details to retry.</p>")
+    parts.append("<p><i>Annotations describe the domain family; exact function can differ between members.</i></p>")
+    return "".join(parts)
+
+
+def _ensure_domain_info(session, accession, database="pfam", integrated=None):
+    from threading import Thread
+
+    cache = getattr(session, "_trimmings_domain_info", {})
+    if accession in cache or getattr(session, "_trimmings_domain_info_pending", None) is not None:
+        return
+    token = object()
+    session._trimmings_domain_info_pending = token
+
+    def finish(info):
+        if getattr(session, "_trimmings_domain_info_pending", None) is not token:
+            return
+        session._trimmings_domain_info_pending = None
+        cache = getattr(session, "_trimmings_domain_info", {})
+        cache[accession] = info
+        session._trimmings_domain_info = cache
+        tool = getattr(session, "_trimmings_domain_browser", None)
+        if tool is not None and not tool._closed:
+            current = tool.current()
+            if current is not None and (current["accession"] == accession or current["accession"] not in cache):
+                tool.show_current()
+
+    def lookup():
+        try:
+            info = _fetch_domain_info(accession, database, integrated)
+        except Exception as error:
+            info = {"errors": [str(error)]}
+        session.ui.thread_safe(finish, info)
+
+    Thread(target=lookup, name="ChimeraX domain details", daemon=True).start()
+
+
+def _create_domain_browser(session):
+    from Qt.QtGui import QColor, QIcon, QPixmap
+    from Qt.QtWidgets import QCheckBox, QComboBox, QHBoxLayout, QLabel, QListWidget, QListWidgetItem, QPushButton, QTextBrowser, QVBoxLayout
+    from chimerax.core.models import REMOVE_MODELS
+    from chimerax.core.tools import ToolInstance
+    from chimerax.std_commands.view import NamedView
+    from chimerax.ui import MainToolWindow
+
+    class DomainBrowser(ToolInstance):
+        SESSION_SAVE = False
+        SESSION_ENDURING = False
+        _domain_browser_version = _DOMAIN_BROWSER_VERSION
+
+        def __init__(self):
+            super().__init__(session, "Protein Domains")
+            self._closed, self._rows = False, []
+            self._model_filter, self._remembered_domains = None, {}
+            view = session.main_view
+            self._starting_view = NamedView(view, view.center_of_rotation.copy(), [])
+            self._starting_cofr = view.center_of_rotation.copy()
+            self._starting_cofr_method = view.center_of_rotation_method
+            self.tool_window = MainToolWindow(self)
+            root = QVBoxLayout(self.tool_window.ui_area)
+            model_row = QHBoxLayout()
+            model_row.addWidget(QLabel("Model:"))
+            self.previous_model_button, self.next_model_button = QPushButton("<"), QPushButton(">")
+            for button, label in ((self.previous_model_button, "Previous model"), (self.next_model_button, "Next model")):
+                button.setFixedWidth(30)
+                button.setToolTip(label)
+                button.setAccessibleName(label)
+            self.previous_model_button.clicked.connect(lambda _checked=False: self.step_model(-1))
+            self.next_model_button.clicked.connect(lambda _checked=False: self.step_model(1))
+            model_row.addWidget(self.previous_model_button)
+            self.model_menu = QComboBox()
+            self.model_menu.currentIndexChanged.connect(self._model_changed)
+            model_row.addWidget(self.model_menu, 1)
+            model_row.addWidget(self.next_model_button)
+            root.addLayout(model_row)
+            self.show_only_model_button = QPushButton("Show only selected model")
+            self.show_only_model_button.setToolTip(
+                "Show this structure and hide other atomic models. In All analyzed models, use the current domain's model."
+            )
+            self.show_only_model_button.clicked.connect(lambda _checked=False: self.show_only_model())
+            root.addWidget(self.show_only_model_button)
+            self.summary = QLabel()
+            root.addWidget(self.summary)
+            self.domain_list = QListWidget()
+            self.domain_list.setAlternatingRowColors(True)
+            self.domain_list.setMinimumWidth(360)
+            self.domain_list.currentRowChanged.connect(self._activate_current)
+            self.domain_list.itemClicked.connect(self._activate_current)
+            root.addWidget(self.domain_list, 1)
+            navigation = QHBoxLayout()
+            self.previous_button, self.next_button = QPushButton("< Previous"), QPushButton("Next >")
+            self.previous_button.clicked.connect(lambda _checked=False: self.step(-1))
+            self.next_button.clicked.connect(lambda _checked=False: self.step(1))
+            navigation.addWidget(self.previous_button)
+            navigation.addWidget(self.next_button)
+            root.addLayout(navigation)
+            self.auto_center = QCheckBox("Auto-center on domain")
+            self.auto_center.setChecked(True)
+            root.addWidget(self.auto_center)
+            self.details = QTextBrowser()
+            self.details.setOpenExternalLinks(True)
+            self.details.setMinimumHeight(220)
+            root.addWidget(self.details, 2)
+            actions = QHBoxLayout()
+            self.focus_button = QPushButton("Focus domain")
+            self.focus_button.clicked.connect(lambda _checked=False: self.focus_current())
+            restore = QPushButton("Restore view")
+            restore.clicked.connect(lambda _checked=False: self.restore_view())
+            self.reload_button = QPushButton("Reload details")
+            self.reload_button.clicked.connect(lambda _checked=False: self.reload_details())
+            for button in (self.focus_button, restore, self.reload_button):
+                actions.addWidget(button)
+            root.addLayout(actions)
+            self.status = QLabel("Click a domain to select it. Details load from InterPro/Pfam.")
+            self.status.setWordWrap(True)
+            root.addWidget(self.status)
+            self._removed_handler = session.triggers.add_handler(REMOVE_MODELS, self._models_removed)
+            self.tool_window.manage("side")
+            self.refresh()
+
+        def current(self):
+            row = self.domain_list.currentRow()
+            return self._rows[row] if 0 <= row < len(self._rows) else None
+
+        def browser_model(self):
+            record = self.current()
+            model = self._model_filter if self._model_filter is not None else record["structure"] if record else None
+            return model if model is not None and not model.deleted and model.id is not None else None
+
+        def show_only_model(self):
+            from chimerax.atomic import AtomicStructure
+            from chimerax.core.undo import UndoState
+
+            model = self.browser_model()
+            if model is None:
+                self.refresh()
+                return
+            displays = {other: other is model for other in session.models.list(type=AtomicStructure)}
+            # A selected structure may be hidden by one or more parent groups.
+            parent = model.parent
+            while parent is not None and parent.id:
+                displays[parent] = True
+                parent = parent.parent
+            undo = UndoState("show only browser model")
+            for other, shown in displays.items():
+                if other.display != shown:
+                    undo.add(other, "display", other.display, shown)
+                    other.display = shown
+            if undo.state:
+                session.undo.register(undo)
+            self.status.setText(f"Showing only #{model.id_string} {model.name}. Undo restores prior model visibility.")
+
+        def _record_key(self, record):
+            return (record["chain"], record["accession"], record["start"], record["end"])
+
+        def _remember_current(self):
+            current = self.current()
+            if current is not None:
+                self._remembered_domains[self._model_filter] = self._record_key(current)
+
+        def _model_changed(self, *_args):
+            self._remember_current()
+            self._model_filter = self.model_menu.currentData()
+            self.refresh(remember=False)
+
+        def select_model(self, model):
+            for index in range(self.model_menu.count()):
+                if self.model_menu.itemData(index) is model:
+                    self.model_menu.setCurrentIndex(index)
+                    return
+
+        def step_model(self, direction):
+            self.refresh()
+            count = self.model_menu.count() - 1  # Skip the combined-list entry.
+            if not count:
+                return
+            current = self.model_menu.currentIndex()
+            if current == 0:
+                index = 1 if direction > 0 else count
+            else:
+                index = 1 + (current - 1 + direction) % count
+            self.model_menu.setCurrentIndex(index)
+
+        def refresh(self, remember=True):
+            if remember:
+                self._remember_current()
+            models = _domain_analyzed_models(session)
+            if self._model_filter is not None and self._model_filter not in models:
+                self._model_filter = None
+            self.model_menu.blockSignals(True)
+            self.model_menu.clear()
+            self.model_menu.addItem("All analyzed models", None)
+            model_index = 0
+            for index, model in enumerate(models, 1):
+                self.model_menu.addItem(f"#{model.id_string} {model.name}", model)
+                if model is self._model_filter:
+                    model_index = index
+            self.model_menu.setCurrentIndex(model_index)
+            self.model_menu.blockSignals(False)
+            self.previous_model_button.setEnabled(bool(models))
+            self.next_model_button.setEnabled(bool(models))
+            self._rows = [record for record in _live_domain_records(session)
+                          if self._model_filter is None or record["structure"] is self._model_filter]
+            self.domain_list.blockSignals(True)
+            self.domain_list.clear()
+            selected = 0 if self._rows else -1
+            remembered = self._remembered_domains.get(self._model_filter)
+            for index, record in enumerate(self._rows):
+                if self._record_key(record) == remembered:
+                    selected = index
+                chain_spec = record["chain"].atomspec
+                if not chain_spec.startswith("#"):
+                    chain_spec = f'#{record["structure"].id_string}' + chain_spec
+                text = (f'{chain_spec} | {record["name"]} ({record["accession"]}) | '
+                        f'{record["start"]}–{record["end"]}')
+                if record.get("origin") == "interpro":
+                    text += f' | {record["source"]}'
+                swatch = QPixmap(12, 12)
+                swatch.fill(QColor.fromRgbF(*_domain_color(record.get("color_accession", record["accession"]))))
+                item = QListWidgetItem(QIcon(swatch), text)
+                self.domain_list.addItem(item)
+            self.domain_list.setCurrentRow(selected)
+            self.domain_list.blockSignals(False)
+            scope = (f"{len(models)} analyzed model(s)" if self._model_filter is None
+                     else f"#{self._model_filter.id_string} {self._model_filter.name}")
+            self.summary.setText(f"{len(self._rows)} annotation matches in {scope}")
+            for button in (self.previous_button, self.next_button, self.focus_button, self.reload_button):
+                button.setEnabled(bool(self._rows))
+            self.status.setText("Click a domain to select it. Details load from InterPro/Pfam.")
+            self.show_current()
+
+        def step(self, direction):
+            if self._rows:
+                index = (self.domain_list.currentRow() + direction) % len(self._rows)
+                if index == self.domain_list.currentRow():
+                    self._activate_current()
+                else:
+                    self.domain_list.setCurrentRow(index)
+                    self.domain_list.scrollToItem(self.domain_list.currentItem())
+
+        def show_current(self):
+            self.show_only_model_button.setEnabled(self.browser_model() is not None)
+            record = self.current()
+            if record is not None and not any(record is r for r in _live_domain_records(session)):
+                self.refresh()
+                return
+            if record is None:
+                self.details.setHtml("<p>No domain matches were found in the analyzed chains of this model.</p>"
+                                     if self._model_filter is not None else
+                                     "<p>No live domain matches. Run <b>domains #1</b> to annotate a structure.</p>")
+                return
+            cache = getattr(session, "_trimmings_domain_info", {})
+            info = cache.get(record["accession"])
+            self.details.setHtml(_domain_details_html(session, record, info, loading=info is None))
+            self.details.verticalScrollBar().setValue(0)
+            if info is None:
+                _ensure_domain_info(session, record["accession"], record.get("database", "pfam"), record.get("integrated"))
+
+        def _activate_current(self, *_args):
+            from chimerax.atomic import selected_atoms
+            from chimerax.core.objects import Objects
+            from chimerax.std_commands.select import select
+
+            record = self.current()
+            if record is None:
+                return
+            if not any(record is r for r in _live_domain_records(session)):
+                self.refresh()
+                return
+            atoms = record["residues"].atoms
+            if set(selected_atoms(session)) != set(atoms):
+                select(session, Objects(atoms=atoms, bonds=atoms.intra_bonds))
+            self.show_current()
+            if self.auto_center.isChecked():
+                self.focus_current()
+
+        def focus_current(self):
+            record = self.current()
+            if record is None:
+                return
+            if not any(record is r for r in _live_domain_records(session)):
+                self.refresh()
+                return
+            model = record["structure"]
+            if not model.visible:
+                self.status.setText(f"Model #{model.id_string} is hidden; show it to inspect this domain.")
+                return
+            bounds = record["residues"].atoms.scene_bounds
+            if bounds is None:
+                return
+            view, center = session.main_view, bounds.center()
+            view.view_all(bounds, pad=0.15)
+            normal, depth = view.camera.view_direction(), max(bounds.radius(), 1.0)
+            view.clip_planes.set_clip_position("near", center - depth * normal, view)
+            view.clip_planes.set_clip_position("far", center + depth * normal, view)
+            view.center_of_rotation = center
+            self.status.setText("Centered on domain. Restore view returns to the starting camera and clipping.")
+
+        def restore_view(self):
+            view = session.main_view
+            self._starting_view.set_view(view, [])
+            view.center_of_rotation = self._starting_cofr.copy()
+            view.center_of_rotation_method = self._starting_cofr_method
+
+        def reload_details(self):
+            record = self.current()
+            if record is not None:
+                getattr(session, "_trimmings_domain_info", {}).pop(record["accession"], None)
+                self.show_current()
+
+        def _models_removed(self, *_args):
+            self.refresh()
+
+        def delete(self):
+            if self._closed:
+                return
+            self._closed = True
+            self._removed_handler.remove()
+            if getattr(session, "_trimmings_domain_browser", None) is self:
+                session._trimmings_domain_browser = None
+            super().delete()
+
+    return DomainBrowser()
+
+
+def domain_browser(session, models=None):
+    """Open or refresh domain results, optionally choosing one analyzed model."""
+    from chimerax.core.errors import UserError
+
+    if not session.ui.is_gui:
+        raise UserError("The domain browser requires the ChimeraX GUI.")
+    if models is not None:
+        models = list(models)
+    if models is not None and (len(models) != 1 or models[0] not in _domain_analyzed_models(session)):
+        raise UserError("Specify one analyzed atomic model, or omit the model to reopen the browser.")
+    tool = getattr(session, "_trimmings_domain_browser", None)
+    if tool is not None and not tool._closed and getattr(tool, "_domain_browser_version", 0) != _DOMAIN_BROWSER_VERSION:
+        # A script reload can leave an older browser instance alive.
+        tool.delete()
+        tool = None
+    if tool is None or tool._closed:
+        tool = _create_domain_browser(session)
+        session._trimmings_domain_browser = tool
+    else:
+        tool.tool_window.shown = True
+        tool.refresh()
+    if models is not None:
+        tool.select_model(models[0])
+    return tool
+
+
+def domains_cancel(session):
+    job = getattr(session, "_trimmings_domain_job", None)
+    if job is not None:
+        job.set()
+        session._trimmings_domain_job = None
+        session.logger.info("Cancelled the Pfam lookup locally; EMBL-EBI may finish its submitted search.")
+    else:
+        session.logger.info("No Pfam lookup is running.")
+
+
+def annotate_domains(session, atoms, color=True, include_overlaps=False,
+                     refresh=False, timeout=600, wait=False, gui=True, source="pfam"):
+    """Look up InterPro matches or search Pfam, and annotate only requested residues."""
+    from math import isfinite
+    from threading import Event, Thread
+    from chimerax.core.errors import UserError
+
+    if not isfinite(timeout) or timeout <= 0:
+        raise UserError("timeout must be finite and greater than zero (seconds).")
+    if source not in ("pfam", "interpro"):
+        raise UserError("source must be pfam or interpro.")
+    if getattr(session, "_trimmings_domain_job", None) is not None:
+        raise UserError("A domain lookup is already running; use 'domains cancel' before starting another.")
+    entries = _domain_chain_inputs(atoms)
+    sequences = list(dict.fromkeys(entry["sequence"] for entry in entries))
+    cache_name = "_trimmings_interpro_cache" if source == "interpro" else "_trimmings_pfam_cache"
+    cache = getattr(session, cache_name, {})
+    cached = {seq: cache[seq] for seq in sequences if not refresh and seq in cache}
+    missing = [seq for seq in sequences if seq not in cached]
+    if not missing:
+        _apply_domain_results(session, entries, cached, color, include_overlaps, gui=gui, source=source)
+        return
+    cancel = Event()
+    session._trimmings_domain_job = cancel
+    description = ("Looking up exact sequence hashes in InterPro Matches" if source == "interpro"
+                   else "Searching Pfam at EMBL-EBI HMMER (curated gathering thresholds)")
+    session.logger.info(f"{description}: {len(missing)} distinct sequence(s). Use 'domains cancel' to stop waiting.")
+    for entry in entries:
+        if not entry["chain"].full_sequence_known:
+            session.logger.warning(
+                f"{entry['spec']}: full polymer sequence is unavailable; using ChimeraX's inferred chain sequence. "
+                "Missing regions may prevent an exact InterPro lookup or reduce Pfam detection."
+            )
+
+    def finish(results, error):
+        # Cancellation/new requests invalidate queued callbacks as well as polling.
+        if getattr(session, "_trimmings_domain_job", None) is not cancel:
+            return
+        session._trimmings_domain_job = None
+        if cancel.is_set():
+            return
+        if error is not None:
+            if wait or not session.ui.is_gui:
+                raise UserError(f"Domain lookup failed: {error}")
+            session.logger.error(f"Domain lookup failed: {error}")
+            return
+        cache = getattr(session, cache_name, {})
+        cache.update(results)
+        setattr(session, cache_name, cache)
+        _apply_domain_results(session, entries, {**cached, **results}, color, include_overlaps, gui=gui, source=source)
+
+    def lookup():
+        try:
+            search = _interpro_search if source == "interpro" else _pfam_search
+            results = search(missing, timeout, cancel,
+                             lambda msg: session.ui.thread_safe(session.logger.status, msg))
+            error = None
+        except Exception as err:
+            results, error = None, err
+        if wait or not session.ui.is_gui:
+            finish(results, error)
+        else:
+            session.ui.thread_safe(finish, results, error)
+
+    if wait or not session.ui.is_gui:
+        lookup()
+    else:
+        Thread(target=lookup, name="ChimeraX domains", daemon=True).start()
+
+
 def register_command(logger):
     from chimerax.atomic import AtomsArg
-    from chimerax.core.commands import BoolArg, CmdDesc, FloatArg, IntArg, ModelsArg, StringArg, register
+    from chimerax.core.commands import BoolArg, CmdDesc, EnumOf, FloatArg, IntArg, ModelsArg, StringArg, register
 
     _register_shape_align_command(logger)
+
+    register(
+        "domains",
+        CmdDesc(required=[("atoms", AtomsArg)], keyword=[
+            ("color", BoolArg), ("include_overlaps", BoolArg),
+            ("refresh", BoolArg), ("timeout", FloatArg), ("wait", BoolArg),
+            ("gui", BoolArg),
+            ("source", EnumOf(("pfam", "interpro"))),
+        ], synopsis="Color and annotate domains using InterPro matches or a Pfam search"),
+        annotate_domains, logger=logger,
+    )
+    register("domains cancel", CmdDesc(synopsis="Cancel the current Pfam domain lookup"),
+             domains_cancel, logger=logger)
+    register("domainbrowser", CmdDesc(optional=[("models", ModelsArg)],
+                                      synopsis="Browse domains for all analyzed models or one specified model"),
+             domain_browser, logger=logger)
+
 
     register(
         "hydrophobicpatches",

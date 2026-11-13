@@ -31,6 +31,9 @@ The Python script registers:
 - `hydrophobicpatches`
 - `patchbrowser`
 - `shapealign`
+- `domains`
+- `domains cancel`
+- `domainbrowser`
 
 `togglemaps` and `togglemodels` toggle the currently displayed maps/models on/off. `reorient` attempts to orient the view in a sensible direction - aligning the view to the shortest axis of an ellipsoid defined by the visible components - and repeated invocations of the command cycle through alignment to other axes of the ellipsoid. `modelmotion` activates & freezes selected models for motion, in order to mimick the behavior of legacy Chimera, described in more detail below.
 
@@ -72,6 +75,68 @@ models by local density agreement; it is not available for moving maps.
 The command is included in `chimerax_trimmings.py` and supports Undo/Redo.
 See [Shape Alignment](SHAPE_ALIGN.md) for installation, all options, examples,
 and practical limitations.
+
+## Domain Coloring and Annotation
+
+`domains` colors protein residues by domain/family and opens a dockable
+**Protein Domains** browser. It is included in `chimerax_trimmings.py`.
+
+```chimerax
+domains #1
+domains #1 source interpro
+domains #1-3
+domains #1/A color false
+domainbrowser #2
+domains cancel
+```
+
+**Sources.** Pfam sends each full chain sequence to the
+[EMBL-EBI HMMER API](https://hmmer-web-docs.readthedocs.io/en/latest/api.html)
+for a new search using fixed, curated family cutoffs. InterPro sends sequence
+checksums to the [InterPro Matches API](https://github.com/ProteinsWebTeam/interpro-matches-api)
+and retrieves existing matches from databases including SUPERFAMILY, CATH-Gene3D,
+Pfam, SMART, and CDD. It can provide broader coverage, but requires the exact
+sequence to be indexed; use Pfam for novel or modified sequences.
+
+Matches describe domains, repeats, families, and superfamilies; they may overlap
+or leave regions unannotated. Boundaries follow database alignments, including
+missing residues and insertion codes, rather than partitioning the structure
+geometrically. There is no adjustable confidence threshold. Matching annotations
+share colors across models; unassigned target residues are gray. Only residues
+in the requested selection receive colors and attributes.
+
+**Browser.** Results persist across searches. Choose a model from the **Model**
+dropdown or use **< / >** to cycle through analyzed models. Each model remembers
+its current domain. **Show only selected model** hides other atomic structures;
+Undo restores visibility. Click a domain or use **Previous / Next** to select
+its residues. **Auto-center on domain**, **Focus domain**, and **Restore view**
+control the camera. Switching models alone keeps the current view and selection.
+
+Details load automatically: available function descriptions, InterPro/GO
+annotations, database links, and representative or example PDB structures.
+These describe the family; functions and specificity can differ between members.
+**Reload details** retries metadata retrieval without repeating the search.
+
+| Option | Purpose | Default |
+| --- | --- | --- |
+| `source` | `pfam` search or `interpro` lookup | `pfam` |
+| `color` | Color atoms and cartoons; attributes are always assigned | `true` |
+| `include_overlaps` | Include competing Pfam assignments | `false` |
+| `refresh` | Repeat the search instead of using session-cached results | `false` |
+| `gui` | Open or refresh the browser | `true` |
+| `wait` | Wait for completion before subsequent script commands | `false` |
+| `timeout` | Maximum lookup time in seconds | `600` |
+
+Searches run in the background in graphical sessions; use `wait true` in scripts
+that depend on the result. Colors, attributes, and browser results support
+Undo/Redo. Reanalyzing a chain replaces its results while retaining other models.
+Results are cached per source for the current session; rerun `domains` after
+loading a saved session to rebuild the browser.
+
+Residue attributes `domain_name` and `domain_accession` hold the primary match;
+`domain_names` and `domain_accessions` retain overlapping matches separated by
+` | `. For example: `select #1 & ::domain_accession=PF00071`.
+
 
 ## Exposed Hydrophobic Residues
 
