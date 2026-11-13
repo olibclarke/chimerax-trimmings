@@ -2380,7 +2380,7 @@ def _shape_align_one(session, atoms, to, resolution=None, max_points=12000,
     return transform, stats
 
 
-def shape_align(session, atoms, to, resolution=None, max_points=12000,
+def _shape_align_atomic_models(session, atoms, to, resolution=None, max_points=12000,
                 extra_starts=0, move=True, radius=None, correlation=False,
                 color_fit=False, correlation_resolution=8.0, correlation_window=12.0,
                 partial=None, fallback_correlation=None, objective="density"):
@@ -2434,20 +2434,549 @@ def shape_align(session, atoms, to, resolution=None, max_points=12000,
     return results
 
 
+def _shape_input_items(selection):
+    """Retain atom subsets and map owners from a mixed command specification."""
+    from chimerax.atomic import Atoms, Structure
+    from chimerax.core.errors import UserError
+    from chimerax.map import Volume
+
+    if isinstance(selection, Volume):
+        return [(selection, None)]
+    if isinstance(selection, Structure):
+        return [(selection, selection.atoms)]
+    if isinstance(selection, Atoms):
+        return list(selection.by_structure)
+    atoms = selection.atoms
+    items = dict(atoms.by_structure)
+    models = selection.models
+    for model in models:
+        if isinstance(model, Volume):
+            items[model] = None
+    for model in models:
+        if not isinstance(model, (Structure, Volume)):
+            # A selected group or a map's surface is not an independent input.
+            if not any(model in owner.drawing_lineage or owner in model.drawing_lineage
+                       for owner in items):
+                raise UserError("shapealign accepts atomic models and density maps, not other drawings.")
+    return sorted(items.items(), key=lambda item: item[0].id)
+
+
+def _shape_grid_corners(grid):
+    from itertools import product
+    import numpy as np
+
+    return grid.ijk_to_xyz_transform.transform_points(np.array(list(product(
+        *[(0, size - 1) for size in grid.size])), dtype=np.float64))
+
+
+def _resample_shape_density(grid, origin, size, step, pose=None):
+    """Interpolate in bounded chunks; pose maps source XYZ to destination XYZ."""
+    import numpy as np
+    from chimerax.map_fit.fitmap import volume_values
+
+    matrix = np.empty(tuple(reversed(size)), dtype=np.float32)
+    transform = grid.xyz_to_ijk_transform
+    if pose is not None:
+        transform = transform * pose.inverse()
+    nx, ny, _ = size
+    for start in range(0, matrix.size, 65536):
+        indices = np.arange(start, min(start + 65536, matrix.size))
+        k, rem = np.divmod(indices, nx * ny)
+        j, i = np.divmod(rem, nx)
+        points = np.column_stack((i, j, k)).astype(np.float32)
+        points *= step
+        points += origin
+        matrix.ravel()[start:start + len(indices)] = volume_values(points, transform, grid.matrix())
+    return matrix
+
+
+class _ShapeDensityInput:
+    """A selected atomic density or native full map, in the owner's local frame."""
+
+    def __init__(self, model, atoms, center=None, radius=None):
+        from itertools import product
+        import numpy as np
+        from chimerax.atomic import Residue
+        from chimerax.core.errors import UserError
+        from chimerax.map_data import ArrayGridData
+
+        self.model, self.atoms = model, atoms
+        self.is_map = atoms is None
+        self._cache = {}
+        if atoms is not None:
+            keep = (atoms.element_numbers > 1) & ~np.isin(atoms.residues.names, list(Residue.water_res_names))
+            self.atoms = atoms.filter(keep)
+            xyz = self.atoms.coords
+            if not np.isfinite(xyz).all():
+                raise UserError("Each fitting region needs finite atom coordinates.")
+            if center is not None:
+                inside = np.linalg.norm(model.scene_position.transform_points(xyz) - center, axis=1) <= radius
+                xyz, self.atoms = xyz[inside], self.atoms.filter(inside)
+            if len(xyz) < 4 or np.linalg.matrix_rank(xyz - xyz.mean(axis=0)) < 2:
+                raise UserError("Each atomic fitting region needs four non-collinear non-water heavy atoms.")
+            self.xyz = xyz
+            self.center = xyz.mean(axis=0)
+            self.landmarks = xyz - self.center
+            return
+
+        data = model.data
+        if len(data.size) != 3 or min(data.size) < 2:
+            raise UserError("Each map must contain a three-dimensional density grid.")
+        if center is not None:
+            local_center = model.scene_position.inverse() * center
+            box = np.array(list(product(*[(v - radius, v + radius) for v in local_center])))
+            ijk = data.xyz_to_ijk_transform.transform_points(box)
+            lower = np.maximum(np.floor(ijk.min(axis=0)).astype(int), 0)
+            upper = np.minimum(np.ceil(ijk.max(axis=0)).astype(int) + 1, data.size)
+            if np.any(upper <= lower) or np.prod(upper - lower) > _MAX_GRID_VOXELS:
+                raise UserError("The map CoFR region is empty or exceeds the working-grid limit.")
+            matrix = data.matrix(tuple(lower), tuple(upper - lower)).copy()
+            if matrix.ndim != 3:
+                raise UserError("shapealign requires scalar three-dimensional density, not color/vector maps.")
+            origin = data.ijk_to_xyz_transform * lower
+            data = ArrayGridData(matrix, origin, data.step, data.cell_angles, data.rotation)
+            for k, plane in enumerate(matrix):
+                j, i = np.indices(plane.shape)
+                points = np.column_stack((i.ravel(), j.ravel(), np.full(plane.size, k))).astype(float)
+                points = data.ijk_to_xyz_transform.transform_points(points)
+                plane[np.linalg.norm(points - local_center, axis=1).reshape(plane.shape) > radius] = 0
+        else:
+            matrix = data.full_matrix()
+        if matrix.ndim != 3:
+            raise UserError("shapealign requires scalar three-dimensional density, not color/vector maps.")
+        self.data = data
+        self.matrix = matrix
+
+        # All voxel values, including negative density, contribute through rho^2
+        # to geometry. No displayed contour, surface mask, or display region is read.
+        peak = 0.0
+        for plane in matrix:
+            values = plane.astype(np.float64)
+            if not np.isfinite(values).all():
+                raise UserError("Fitting maps must contain only finite density values.")
+            peak = max(peak, float(np.max(np.abs(values))))
+        if peak == 0:
+            raise UserError("The map fitting region has no nonzero density.")
+        self.peak = peak
+        mass, first, second = 0.0, np.zeros(3), np.zeros((3, 3))
+        lower, upper = np.array(matrix.shape[::-1]), np.zeros(3, dtype=int)
+        i, j = np.arange(matrix.shape[2], dtype=float), np.arange(matrix.shape[1], dtype=float)
+        for k, plane in enumerate(matrix):
+            weights = (plane.astype(np.float64) / peak) ** 2
+            total = weights.sum()
+            if total == 0:
+                continue
+            wi, wj = weights.sum(axis=0), weights.sum(axis=1)
+            si, sj = np.dot(wi, i), np.dot(wj, j)
+            mass += total
+            first += (si, sj, k * total)
+            second[0, 0] += np.dot(wi, i * i)
+            second[1, 1] += np.dot(wj, j * j)
+            second[2, 2] += k * k * total
+            second[0, 1] += np.dot(j, weights @ i)
+            second[0, 2] += k * si
+            second[1, 2] += k * sj
+            ii, jj = np.flatnonzero(wi), np.flatnonzero(wj)
+            lower = np.minimum(lower, (ii[0], jj[0], k))
+            upper = np.maximum(upper, (ii[-1], jj[-1], k))
+        second += np.triu(second, 1).T
+        mean = first / mass
+        affine = data.ijk_to_xyz_transform.matrix[:, :3]
+        covariance = affine @ (second / mass - np.outer(mean, mean)) @ affine.T
+        values, axes = np.linalg.eigh(covariance)
+        if values[-2] <= max(values[-1], 1) * 1e-12:
+            raise UserError("The map density is collinear and cannot define a rigid orientation.")
+        self.center = data.ijk_to_xyz_transform * mean
+        offsets = axes * np.sqrt(3 * np.maximum(values, 0))
+        self.landmarks = np.concatenate((offsets.T, -offsets.T))
+        self.lower, self.upper = lower, upper
+
+    def grid(self, resolution):
+        import numpy as np
+        from chimerax.core.errors import UserError
+        from chimerax.map_data import ArrayGridData
+
+        if resolution in self._cache:
+            return self._cache[resolution]
+        if not self.is_map:
+            grid = _shape_grid(*_shape_points(self.landmarks, resolution / 6), resolution)
+        else:
+            # Cell-average before decimation, retaining boundary bins through
+            # zero extension. This avoids point-sampling a fine map at coarse steps.
+            affine = self.data.ijk_to_xyz_transform.matrix[:, :3]
+            factors = np.maximum(1, np.floor((resolution / 3) / np.linalg.norm(affine, axis=0))).astype(int)
+            shape = np.ceil((self.upper - self.lower + 1) / factors).astype(int)
+            sigma = resolution / (pi * sqrt(2))
+            base_affine = affine @ np.diag(factors)
+            inverse = np.linalg.inv(base_affine)
+            halo = np.ceil(4 * sigma * np.linalg.norm(inverse, axis=1)).astype(int) + 1
+            padded_size = shape + 2 * halo
+            if np.prod(padded_size) > _MAX_GRID_VOXELS:
+                raise UserError("The map fitting grid is too large; use a coarser resolution or smaller CoFR region.")
+            bounds = self.data.ijk_to_xyz_transform.transform_points(np.array([
+                (i, j, k) for i in (self.lower[0], self.upper[0])
+                for j in (self.lower[1], self.upper[1]) for k in (self.lower[2], self.upper[2])], dtype=float))
+            step = resolution / 3
+            origin = bounds.min(axis=0) - self.center - 4 * sigma
+            size = np.ceil((bounds.max(axis=0) - self.center + 4 * sigma - origin) / step).astype(int) + 1
+            if np.prod(size) > _MAX_GRID_VOXELS:
+                raise UserError("The Cartesian map fitting grid is too large; use a coarser resolution.")
+            work = self.matrix[tuple(slice(a, b + 1) for a, b in zip(self.lower[::-1], self.upper[::-1]))]
+            for axis in np.argsort(factors[::-1])[::-1]:
+                factor = int(factors[2 - axis])
+                work = np.add.reduceat(work, np.arange(0, work.shape[axis], factor), axis=axis, dtype=np.float64)
+                work /= factor
+            work /= self.peak
+            work = np.pad(work.astype(np.float32), tuple((int(v), int(v)) for v in halo[::-1]))
+            # Physical isotropic Gaussian filtering also handles non-orthogonal
+            # cells. Padding prevents periodic wraparound in this temporary FFT.
+            from scipy.fft import rfftn, irfftn, fftfreq, rfftfreq
+            fz = fftfreq(work.shape[0])[:, None, None]
+            fy = fftfreq(work.shape[1])[None, :, None]
+            fx = rfftfreq(work.shape[2])[None, None, :]
+            covariance = sigma * sigma * inverse @ inverse.T
+            q = (covariance[0, 0] * fx * fx + covariance[1, 1] * fy * fy + covariance[2, 2] * fz * fz +
+                 2 * covariance[0, 1] * fx * fy + 2 * covariance[0, 2] * fx * fz + 2 * covariance[1, 2] * fy * fz)
+            spectrum = rfftn(work)
+            spectrum *= np.exp(-2 * pi * pi * q)
+            work = irfftn(spectrum, s=work.shape).astype(np.float32)
+            base_origin = self.data.ijk_to_xyz_transform * (self.lower + (factors - 1) / 2 - factors * halo)
+            filtered = ArrayGridData(work, base_origin - self.center,
+                                     np.asarray(self.data.step) * factors,
+                                     self.data.cell_angles, self.data.rotation)
+            matrix = _resample_shape_density(filtered, origin, size, step)
+            grid = ArrayGridData(matrix, origin, (step,) * 3)
+        # Positive scaling does not change either objective and stabilizes fits
+        # between experimental map units and simulated atomic densities.
+        peak = np.max(np.abs(grid.matrix()))
+        if not np.isfinite(peak) or peak == 0:
+            raise UserError("No finite nonzero density remains at this fitting scale.")
+        grid.matrix()[:] /= peak
+        self._cache.clear()  # One level per input, not a retained pyramid of large arrays.
+        self._cache[resolution] = grid
+        return grid
+
+
+def _shape_density_samples(grid, maximum):
+    """Signed, importance-weighted samples of the complete density integral."""
+    import numpy as np
+
+    matrix = grid.matrix()
+    if matrix.size <= maximum:
+        indices = np.flatnonzero(matrix.ravel())
+        weights = matrix.ravel()[indices].copy()
+    else:
+        masses = np.array([np.abs(plane).sum(dtype=np.float64) for plane in matrix])
+        cumulative = np.cumsum(masses)
+        total = cumulative[-1]
+        levels = (np.arange(maximum) + np.random.default_rng(0).random()) * total / maximum
+        planes = np.searchsorted(cumulative, levels, side="right")
+        indices = np.empty(maximum, dtype=np.int64)
+        for k in np.unique(planes):
+            chosen = np.flatnonzero(planes == k)
+            local = levels[chosen] - (cumulative[k - 1] if k else 0)
+            cdf = np.cumsum(np.abs(matrix[k]).ravel(), dtype=np.float64)
+            indices[chosen] = int(k) * matrix.shape[1] * matrix.shape[2] + np.searchsorted(cdf, local, side="right")
+        weights = np.sign(matrix.ravel()[indices]) * (total / maximum)
+    k, j, i = np.unravel_index(indices, matrix.shape)
+    points = np.column_stack((i, j, k)).astype(np.float32)
+    grid.ijk_to_xyz_transform.transform_points(points, in_place=True)
+    return points, weights.astype(np.float32)
+
+
+def _refine_density_grids(source, target, candidates, maximum, objective):
+    import numpy as np
+    from chimerax.map_fit.fitmap import locate_maximum, volume_values
+
+    points, weights = _shape_density_samples(source, maximum)
+    field = target.matrix()
+    if objective == "gradient":
+        _, first = _gradient_density_field(source)
+        field, second = _gradient_density_field(target)
+    else:
+        first = np.einsum("ijk,ijk->", source.matrix(), source.matrix(), dtype=np.float64)
+        second = np.einsum("ijk,ijk->", field, field, dtype=np.float64)
+    denominator = sqrt(first * second)
+    results = []
+    for index, initial in enumerate(candidates):
+        delta, _ = locate_maximum(initial.transform_points(points), weights, field, target.xyz_to_ijk_transform,
+                                  max_steps=240, ijk_step_size_min=.01, ijk_step_size_max=.5, metric="sum product")
+        pose = delta * initial
+        values = volume_values(points, target.xyz_to_ijk_transform * pose, field)
+        score = float(np.dot(weights.astype(np.float64), values)) / denominator
+        results.append((score, pose, index))
+    return sorted(results, key=lambda item: item[0], reverse=True), points
+
+
+def _shape_map_fft_starts(source, target, source_landmarks, target_landmarks, objective, extra_starts):
+    import numpy as np
+    from scipy.fft import rfftn, irfftn, next_fast_len
+    from chimerax.core.errors import UserError
+    from chimerax.geometry import Place
+
+    step = source.step[0]
+    radius = np.linalg.norm(_shape_grid_corners(source), axis=1).max()
+    target_radius = np.linalg.norm(_shape_grid_corners(target), axis=1).max()
+    if target_radius < radius:
+        # This only chooses the cheaper numerical template. Full-density norms
+        # stay global, and inversion preserves which owner the user asked to move.
+        return [pose.inverse() for pose in _shape_map_fft_starts(
+            target, source, target_landmarks, source_landmarks, objective, extra_starts)]
+    side = int(np.ceil(2 * radius / step)) + 1
+    side += 1 - side % 2
+    fft_shape = tuple(next_fast_len(n + side - 1) for n in target.matrix().shape)
+    if np.prod(fft_shape) > _MAX_PARTIAL_FFT_VOXELS:
+        raise UserError("The map FFT search exceeds its memory limit; use a coarser resolution or smaller region.")
+    half = side // 2
+    origin = np.full(3, -half * step)
+    field = target.matrix()
+    if objective == "gradient":
+        _, first = _gradient_density_field(source)
+        field, second = _gradient_density_field(target)
+    else:
+        first = np.sum(source.matrix().astype(float) ** 2)
+        second = np.sum(field.astype(float) ** 2)
+    target_fft = rfftn(field, fft_shape)
+    peaks = []
+    for initial in _shape_starts(source_landmarks, target_landmarks, 96 + extra_starts):
+        rotation = Place(matrix=np.column_stack((initial.matrix[:, :3], np.zeros(3))))
+        density = _resample_shape_density(source, origin, (side,) * 3, step, rotation)
+        cross = irfftn(target_fft * rfftn(density[::-1, ::-1, ::-1], fft_shape), fft_shape) / sqrt(first * second)
+        view = cross[half:half + field.shape[0], half:half + field.shape[1], half:half + field.shape[2]]
+        for _ in range(2):
+            k, j, i = np.unravel_index(np.argmax(view), view.shape)
+            center = target.ijk_to_xyz_transform * np.array((i, j, k), dtype=float)
+            peaks.append((float(view[k, j, i]), Place(matrix=np.column_stack((rotation.matrix[:, :3], center)))))
+            distance = max(2, int(radius / (3 * step)))
+            view[max(0, k-distance):k+distance+1, max(0, j-distance):j+distance+1,
+                 max(0, i-distance):i+distance+1] = -np.inf
+    peaks.sort(key=lambda item: item[0], reverse=True)
+    kept = []
+    probes = _shape_grid_corners(source)
+    for _, pose in peaks:
+        if any(np.sqrt(np.mean(np.sum((pose.transform_points(probes) - old.transform_points(probes)) ** 2, axis=1)))
+               < step for old in kept):
+            continue
+        kept.append(pose)
+        if len(kept) == 48:
+            break
+    return kept
+
+
+def _fit_shape_density_inputs(source, target, options, center):
+    import numpy as np
+    from chimerax.geometry import translation
+
+    objective, radius = options["objective"], options["radius"]
+    levels, stats = _shape_resolution_schedule(source.landmarks, target.landmarks,
+                                              options["resolution"], radius is not None)
+    initial = (translation(-target.center) * target.model.scene_position.inverse() *
+               source.model.scene_position * translation(source.center))
+    starts = [initial] if radius is not None else [*_shape_starts(
+        source.landmarks, target.landmarks, options["extra_starts"]), initial]
+
+    def refine(candidates, first=0):
+        for blur in levels[first:]:
+            source.model.session.logger.status(f"Shape alignment: map density at {blur:.3g} A ({len(candidates)} starts)...")
+            results, points = _refine_density_grids(source.grid(blur), target.grid(blur), candidates,
+                                                   options["max_points"], objective)
+            candidates = []
+            probes = points[np.linspace(0, len(points) - 1, min(64, len(points)), dtype=int)]
+            for _, pose, _ in results:
+                if any(np.sqrt(np.mean(np.sum((pose.transform_points(probes) - old.transform_points(probes)) ** 2, axis=1)))
+                       < blur / 3 for old in candidates):
+                    continue
+                candidates.append(pose)
+                if len(candidates) == 48:
+                    break
+        return results[0][:2]
+
+    score, pose = refine(starts)
+    stats.update(objective=objective, partial=False, local=radius is not None, map_search=False,
+                 moving_input_type="map" if source.is_map else "atoms",
+                 reference_input_type="map" if target.is_map else "atoms", resolutions=levels)
+    if radius is None and options["fallback_correlation"] > 0 and score < options["fallback_correlation"]:
+        first = 1 if len(levels) > 2 else 0
+        blur = levels[first]
+        seeds = _shape_map_fft_starts(source.grid(blur), target.grid(blur), source.landmarks,
+                                      target.landmarks, objective, options["extra_starts"])
+        proposed_score, proposed = refine([pose, *seeds], first)
+        stats.update(map_search=True, map_search_resolution=blur, map_initial_score=score)
+        if proposed_score > score:
+            score, pose = proposed_score, proposed
+    stats["score"] = score
+    if center is not None:
+        stats.update(radius=radius, center_of_rotation=center.copy())
+    return translation(target.center) * pose * translation(-source.center), stats
+
+
+def _shape_map_correlations(source, target, pose, resolution, window):
+    import numpy as np
+    from chimerax.core.errors import UserError
+    from chimerax.geometry import translation
+    from chimerax.map_data import ArrayGridData
+    from chimerax.map_fit.fitmap import volume_values
+
+    placed = pose.transform_points(source.xyz) - target.center
+    step = resolution / 3
+    pad = 4 * resolution / (pi * sqrt(2)) + 3 * window / sqrt(8 * np.log(2)) + step
+    origin = placed.min(axis=0) - pad
+    size = np.ceil((placed.max(axis=0) + pad - origin) / step).astype(int) + 1
+    if np.prod(size) > _MAX_CORRELATION_VOXELS:
+        raise UserError("The local correlation grid is too large; use a coarser correlation resolution.")
+    centered_pose = translation(-target.center) * pose * translation(source.center)
+    first = _resample_shape_density(source.grid(resolution), origin, size, step, centered_pose)
+    second = _resample_shape_density(target.grid(resolution), origin, size, step)
+    field, valid = _local_correlation_field(first, second, window / sqrt(8 * np.log(2)) / step)
+    grid = ArrayGridData(field, origin, (step,) * 3)
+    scores = volume_values(placed, grid.xyz_to_ijk_transform, field).copy()
+    scores[volume_values(placed, grid.xyz_to_ijk_transform, valid) < .999] = np.nan
+    return scores, {"correlation_resolution": resolution, "correlation_window": window,
+                    "correlation_grid_voxels": int(field.size),
+                    "correlation_defined_atoms": int(np.isfinite(scores).sum())}
+
+
+def _shape_align_with_map(session, source_item, target_item, options, center, target_input=None, started=None):
+    from time import perf_counter
+    from chimerax.core.undo import UndoState
+
+    started = perf_counter() if started is None else started
+    source = _ShapeDensityInput(*source_item, center, options["radius"])
+    target = target_input if target_input is not None else _ShapeDensityInput(*target_item, center, options["radius"])
+    pose, stats = _fit_shape_density_inputs(source, target, options, center)
+    stats["seconds"] = perf_counter() - started
+    scores = None
+    if options["correlation"] or options["color_fit"]:
+        scoring_started = perf_counter()
+        scores, extra = _shape_map_correlations(source, target, pose, options["correlation_resolution"],
+                                               options["correlation_window"])
+        stats.update(extra, correlation_seconds=perf_counter() - scoring_started)
+    model, reference = source.model, target.model
+    transform = reference.scene_position * pose * model.scene_position.inverse()
+    undo = UndoState("shape align")
+    try:
+        if options["move"]:
+            parent = model.parent.scene_position
+            old = model.position
+            new = parent.inverse() * transform * parent * old
+            undo.add(model, "position", old, new)
+            model.position = new
+        if scores is not None:
+            _assign_shape_correlations(session, model, source.atoms, scores, undo, options["color_fit"])
+    except BaseException:
+        undo.undo()
+        raise
+    if undo.state:
+        session.undo.register(undo)
+    if scores is not None:
+        stats["correlation_grid_seconds"] = stats["correlation_seconds"]
+        stats["correlation_seconds"] = perf_counter() - scoring_started
+    stats.update(moving_model_id=model.id_string, reference_model_id=reference.id_string)
+    metric = "gradient correlation" if options["objective"] == "gradient" else "density overlap"
+    message = (f"Shape alignment #{model.id_string} ({stats['moving_input_type']}) to "
+               f"#{reference.id_string} ({stats['reference_input_type']}): whole {metric} "
+               f"score {stats['score']:.3f}; {stats['seconds']:.2f} s; full map density, independent of contour." +
+               (" (not moved)" if not options["move"] else ""))
+    session.logger.info(message)
+    session.logger.status(message)
+    session.logger.info("Fitting scales: " + " -> ".join(f"{v:.3g}" for v in stats["resolutions"]) +
+                        " A; Gaussian blur is additional to the map's existing resolution.")
+    if scores is not None:
+        session.logger.info(f"Local density CC: {stats['correlation_defined_atoms']}/{len(source.atoms)} atoms defined; "
+                            f"{stats['correlation_seconds']:.2f} s extra; saved shape_correlation" +
+                            (" and colored fitted atoms/cartoons." if options["color_fit"] else "; colors unchanged."))
+    return transform, stats
+
+
+def shape_align(session, moving, to, resolution=None, max_points=12000,
+                extra_starts=0, move=True, radius=None, correlation=False,
+                color_fit=False, correlation_resolution=8.0, correlation_window=12.0,
+                partial=None, fallback_correlation=None, objective="density"):
+    """Independently align selected atomic models and/or maps to one fixed input."""
+    from contextlib import nullcontext
+    from math import isfinite
+    from time import perf_counter
+    import numpy as np
+    from chimerax.core.errors import UserError
+
+    sources, targets = _shape_input_items(moving), _shape_input_items(to)
+    if not sources or len(targets) != 1:
+        raise UserError("Specify moving atomic models/maps and exactly one reference model or map.")
+    target = targets[0][0]
+    for model, _ in sources:
+        if target in model.drawing_lineage or model in target.drawing_lineage:
+            raise UserError("The reference must be distinct from, and not contain, any moving model.")
+        if any(other in model.drawing_lineage[:-1] for other, _ in sources):
+            raise UserError("Moving inputs must be independent models, not ancestor/descendant pairs.")
+    options = dict(resolution=resolution, max_points=max_points, extra_starts=extra_starts, move=move,
+                   radius=radius, correlation=correlation, color_fit=color_fit,
+                   correlation_resolution=correlation_resolution, correlation_window=correlation_window,
+                   partial=partial, fallback_correlation=fallback_correlation, objective=objective)
+    if all(atoms is not None for _, atoms in [*sources, *targets]):
+        return _shape_align_atomic_models(session, moving.atoms if hasattr(moving, "atoms") else moving,
+                                          to.atoms if hasattr(to, "atoms") else to, **options)
+    if objective not in ("density", "gradient") or partial not in (None, False):
+        raise UserError("Map fitting supports objective density or gradient, with whole densities only; partial true is not supported.")
+    if resolution is not None and (not isfinite(resolution) or resolution < 2):
+        raise UserError("resolution must be finite and at least 2 Angstroms.")
+    if max_points < 1000 or extra_starts < 0:
+        raise UserError("max_points must be at least 1000 and extra_starts must be nonnegative.")
+    cutoff = (.5 if objective == "gradient" else .7) if fallback_correlation is None else fallback_correlation
+    if not isfinite(cutoff) or not 0 <= cutoff <= 1:
+        raise UserError("fallback_correlation must be between 0 and 1.")
+    options["fallback_correlation"] = cutoff
+    if correlation or color_fit:
+        if not move or any(atoms is None for _, atoms in sources):
+            raise UserError("correlation/color_fit require moving atomic models and move true, not moving maps.")
+    for value in (correlation_resolution, correlation_window):
+        if not isfinite(value) or value <= 0:
+            raise UserError("Correlation resolution and window must be finite and positive.")
+    center = None
+    if radius is not None:
+        if not isfinite(radius) or radius <= 0 or extra_starts:
+            raise UserError("radius must be finite and positive; extra_starts is not supported for local fitting.")
+        center = np.array(session.main_view.center_of_rotation, dtype=float, copy=True)
+        if center.shape != (3,) or not np.isfinite(center).all():
+            raise UserError("The current center of rotation must be a finite XYZ position.")
+    for model, _ in [*sources, *targets]:
+        for owner in model.drawing_lineage:
+            if len(owner.positions) != 1:
+                raise UserError("Instanced models are not supported; use a single model copy.")
+    results = []
+    target_input = None
+    with session.undo.aggregate("shape align models") if move and len(sources) > 1 else nullcontext() as batch:
+        try:
+            for item in sources:
+                if item[1] is not None and targets[0][1] is not None:
+                    result = _shape_align_one(session, item[1], targets[0][1], sphere_center=center, **options)
+                else:
+                    started = perf_counter()
+                    if target_input is None:
+                        target_input = _ShapeDensityInput(*targets[0], center, radius)
+                    result = _shape_align_with_map(session, item, targets[0], options, center, target_input, started)
+                results.append(result)
+        except BaseException:
+            if batch is not None:
+                for action in reversed(batch.actions):
+                    action.undo()
+                session.logger.warning("Shape alignment batch failed; earlier changes were undone.")
+            raise
+    return results[0] if len(results) == 1 else results
+
+
 def _register_shape_align_command(logger):
-    from chimerax.atomic import AtomsArg
-    from chimerax.core.commands import BoolArg, CmdDesc, EnumOf, FloatArg, IntArg, register
+    from chimerax.core.commands import BoolArg, CmdDesc, EnumOf, FloatArg, IntArg, ObjectsArg, register
 
     register("shapealign", CmdDesc(
-        required=[("atoms", AtomsArg)],
-        keyword=[("to", AtomsArg), ("resolution", FloatArg),
+        required=[("moving", ObjectsArg)],
+        keyword=[("to", ObjectsArg), ("resolution", FloatArg),
                  ("max_points", IntArg), ("extra_starts", IntArg), ("move", BoolArg),
                  ("radius", FloatArg), ("correlation", BoolArg), ("color_fit", BoolArg),
                  ("correlation_resolution", FloatArg), ("correlation_window", FloatArg),
                  ("partial", BoolArg), ("fallback_correlation", FloatArg),
                  ("objective", EnumOf(("density", "gradient")))],
         required_arguments=["to"],
-        synopsis="Align models by density or experimental gradient shape scoring; optionally refine at CoFR",
+        synopsis="Align atomic models and/or maps by shape; optionally refine at CoFR",
     ), shape_align, logger=logger)
 
 

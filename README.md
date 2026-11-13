@@ -1,21 +1,20 @@
 # chimerax-trimmings
 Useful aliases and startup settings for UCSF ChimeraX \(https://www.cgl.ucsf.edu/chimerax/). Add these to the "Startup" section of the "Preferences" pane and restart ChimeraX in order to have them take effect. _(Note: Some of these will only work with recent builds of ChimeraX)_. 
 
-I would also recommend (if you are using a laptop) going through each tool in the "Tools" menu, launching it, right clicking on the relevant window and **unchecking** "Dockable tool" - this will ensure that each tool acts as a separate window and does not try to "snap" to the main GUI when you move it around, which I find undesirable on smaller screens (these settings will be persistent across restarts of ChimeraX).
+For more graphics space on a small screen, open a tool from the Tools menu, right-click its window, and uncheck **Dockable tool**. It will remain a separate window instead of snapping to the main GUI. This preference persists across ChimeraX restarts.
 
 This repository contains:
 
 - `chimerax_trimmings.txt`: Startup commands, aliases, keybindings, and Shortcut buttonpanel setup.
-- `chimerax_trimmings.py`: Companion ChimeraX Python commands, including sequence-independent shape alignment. See [SHAPE_ALIGN.md](SHAPE_ALIGN.md).
+- `chimerax_trimmings.py`: Companion ChimeraX Python commands, including shape alignment of atomic models and density maps. See [SHAPE_ALIGN.md](SHAPE_ALIGN.md).
 - `map_salami.py`: Experimental script that , if invoked via runscript, adds a command `map_salami`, which automates the generation of section-by-section map/model density fit figures (can run as `map_salami model #1 selection /A:100-220 map #2 zone 2 patches 3 movie true movie_resolution 1080p segment_size 40 image_height 2000 output_dir ~/Desktop/map_salami_panels`, everything except for map & model is optional; patches controls `MaxComponents` of surface, defaults to `None`; `movie_resolution` can be either 4k or 1080p, defaults to 1080p; `zone` is the surface zone clipping offset, defaults to 2 Å; `segment_size` is the residue range chunk to use, defaults to 40 but will expand to include entire helix/strand or short terminal segments if needed.)
-- Caveat - I have re-organized, updated, and translated from the original `chimera-trimmings` with the help of an LLM (Codex). I have tried to carefully check for errors and unexpected behaviors, and inspect each ChimeraX command invoked, but if you notice anything broken or unexpected, please let me know and I will do my best to fix it.
 
 ## Installation
 
 1. Put `chimerax_trimmings.txt`, `chimerax_trimmings.py`, and `map_salami.py` somewhere permanent on your machine.
 2. Edit the first two lines of `chimerax_trimmings.txt` so the `runscript` paths point to your local copies of the two Python scripts. If upgrading, remove any older separate `runscript` line for `shape_align.py` from Startup preferences; its commands are now included in the main script.
-3. In ChimeraX on macOS, open `UCSF ChimeraX -> Preferences... -> Startup` (I think under Favorites on Windows?)
-4. Paste the contents of your edited `chimerax-trimmings.txt` into the startup commands box.
+3. Open ChimeraX Preferences and select Startup. On macOS, Preferences is in the UCSF ChimeraX application menu.
+4. Paste the contents of your edited `chimerax_trimmings.txt` into the startup commands box.
 5. Restart ChimeraX.
 
 ## Companion Script
@@ -37,74 +36,36 @@ The Python script registers:
 
 ## Fast Shape Alignment
 
-`shapealign` rigidly aligns large structures without sequence alignment or chain
-pairing. It is included in `chimerax_trimmings.py` and loaded by the usual startup
-file. To reload it manually:
+Use `shapealign` to superimpose atomic models and density maps without sequence
+alignment. Model/model, model/map, map/model, and map/map fitting use the same
+syntax:
 
 ```chimerax
-runscript /path/to/chimerax_trimmings.py
+shapealign #2 to #1
+shapealign #2 to #1 objective gradient
+shapealign #2-5 to #1
+shapealign #2/A to #1/B
+shapealign #2 to #1 radius 30
+shapealign #2 to #1 color_fit true
 ```
 
-```chimerax
-shapealign #1 to #2
-shapealign #1/A to #2/B resolution 6
-shapealign #1 to #2 extra_starts 64
-shapealign #1 to #2 move false
-shapealign #1 to #2 radius 30 resolution 4
-shapealign #2-10 to #1
-shapealign #2-10 to #1 color_fit true
-shapealign #1 to #2 objective gradient
-```
+The first input moves; `to` identifies one fixed reference. Multiple moving
+inputs align independently. Atomic selections restrict fitting atoms but the
+whole moving model is repositioned.
 
-The first atom specification identifies one or more moving models; `to` identifies
-one fixed reference. Each moving model is aligned independently. Fitting can use selected chains or residues, but each whole
-moving model is repositioned. Hidden atoms in those specifications are included;
-hydrogens and water are excluded. No atom correspondence is required.
+Maps use full density, independent of contours and display regions. Map values,
+grid metadata, styling, and visibility are unchanged; only the moving owner's
+rigid transform changes.
 
-`objective gradient` is an experimental whole-structure objective for cases
-where bulk density overlap gives a misleading fit. It compares density gradients
-using a negative-Laplacian target field, used for both native optimization and
-ranking. Both complete selected densities contribute to normalization; it never
-switches to partial or chain fitting. `partial true` is incompatible with this
-mode. The existing `objective density` remains the default.
+The default `objective density` compares density overlap. Try the experimental
+`objective gradient` when bulk overlap gives an implausible orientation.
+`radius` locally refines an existing alignment inside a sphere around the
+current center of rotation, in Angstroms. `color_fit true` colors moving atomic
+models by local density agreement; it is not available for moving maps.
 
-For already globally aligned models, `radius 30` enables local refinement using
-only non-water heavy-atom centers within 30 Angstroms of the **current center of
-rotation**, independently in each model. Atom specifications further restrict
-that sphere. The current relative pose is the only starting pose: no global
-orientation search or centroid matching is performed. The range is based on the
-cropped fitting regions and is no broader than twice its final resolution.
-
-The sphere and fitting atoms are fixed at the start of the command. The whole
-moving model still receives the resulting rigid transform; this is not a local
-deformation of its coordinates. `radius` cannot be combined with nonzero
-`extra_starts`. The command does not reset the CoFR to the view or model center.
-In a batch, every model uses the same sphere captured before the first fit.
-Local refinement never triggers a new global search; `partial true` cannot be
-combined with `radius`.
-
-Optional `color_fit true` calculates Gaussian-windowed local density correlation
-and colors fitted atoms and cartoons: red for 0 or lower, white for 0.5, blue for
-1, and gray where correlation is undefined. `correlation true` saves the values
-without recoloring. Both default to false, so the normal fast path does no extra
-scoring work. Atom attribute `shape_correlation` contains sampled values; the same
-residue attribute contains their mean over defined fitted atoms.
-
-| Option | Meaning | Default |
-| --- | --- | --- |
-| `to` | Reference atom specification in a different model | Required |
-| `objective` | Existing density scoring or experimental whole-density gradient scoring | `density` |
-| `resolution` | Override the fine endpoint in Angstroms; the coarse scale remains size-derived | Automatic when omitted |
-| `max_points` | Maximum sampled density voxels per stage | `12000` |
-| `extra_starts` | Additional reproducible broad-search orientations | `0` |
-| `move` | Apply the fit, or only calculate and report it | `true` |
-| `radius` | Enable local refinement inside this radius of the current CoFR, in Angstroms | None (global search) |
-| `correlation` | Save atom/residue local density correlation without recoloring | `false` |
-| `color_fit` | Calculate correlation and color fitted atoms/cartoons | `false` |
-| `correlation_resolution` | Gaussian density resolution for scoring, independent of fitting resolution | `8` |
-| `correlation_window` | Gaussian scoring-neighbourhood FWHM in Angstroms | `12` |
-| `partial` | Force (`true`) or disable (`false`) partial-template search | Automatic when omitted |
-| `fallback_correlation` | Search cutoff: partial/chain backup in density mode, same-objective FFT search in gradient mode; 0 disables quality backups | `0.7` density; `0.5` gradient |
+The command is included in `chimerax_trimmings.py` and supports Undo/Redo.
+See [Shape Alignment](SHAPE_ALIGN.md) for installation, all options, examples,
+and practical limitations.
 
 ## Exposed Hydrophobic Residues
 
@@ -768,11 +729,10 @@ alias usage uncarve synopsis "Remove surface carving from displayed map surfaces
 ## Notes
 
 - The Python file is meant to be sourced inside ChimeraX with `runscript`; it is not a standalone Python program.
-- `nextmodel` and `prevmodel` use the Model Panel tool and therefore depend on ChimeraX's current Model Panel implementation.
-- If you move the repository, update the `runscript` path in the first line of your Startup preferences panel.
+- If you move the scripts, update both `runscript` paths in your Startup preferences.
 
 ## Example 
-I prefer to operate ChimeraX with all panels undocked by default (except for this button panel!), as I find this is the best way to make use of screen real estate on a laptop (which is how I mostly work). So I have a button panel that allows me to quickly access the volume viewer, model panel and log, as well as other shortcuts that I find useful to have on hand. Here is what this looks like in practice:
+The shortcut button panel provides quick access to the Volume Viewer, Model Panel, Log, and display commands. It can stay docked while other tool windows are undocked to leave more room for graphics:
 
 <img width="1624" alt="image" src="https://github.com/olibclarke/chimeras-trimmings/assets/19766818/7f8f578a-48a3-4474-9526-72da8e7a4472">
 
