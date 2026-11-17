@@ -1,14 +1,24 @@
-# ChimeraX Trimmings
+# chimerax-trimmings
+Useful aliases and startup settings for UCSF ChimeraX \(https://www.cgl.ucsf.edu/chimerax/). Add these to the "Startup" section of the "Preferences" pane and restart ChimeraX in order to have them take effect. _(Note: Some of these will only work with recent builds of ChimeraX)_. 
 
-Shortcuts and tools for model and map work in UCSF ChimeraX.
+I would also recommend (if you are using a laptop) going through each tool in the "Tools" menu, launching it, right clicking on the relevant window and **unchecking** "Dockable tool" - this will ensure that each tool acts as a separate window and does not try to "snap" to the main GUI when you move it around, which I find undesirable on smaller screens (these settings will be persistent across restarts of ChimeraX).
 
-## Install
+This repository contains:
 
-1. Download this repository and keep it in a permanent folder.
-2. Edit the two `runscript` paths at the top of [chimerax_trimmings.txt](chimerax_trimmings.txt).
-3. Paste that file into ChimeraX **Preferences → Startup**, then restart ChimeraX.
+- `chimerax_trimmings.txt`: Startup commands, aliases, keybindings, and Shortcut buttonpanel setup.
+- `chimerax_trimmings.py`: Companion ChimeraX Python commands, including sequence-independent shape alignment. See [SHAPE_ALIGN.md](SHAPE_ALIGN.md).
+- `map_salami.py`: Experimental script that , if invoked via runscript, adds a command `map_salami`, which automates the generation of section-by-section map/model density fit figures (can run as `map_salami model #1 selection /A:100-220 map #2 zone 2 patches 3 movie true movie_resolution 1080p segment_size 40 image_height 2000 output_dir ~/Desktop/map_salami_panels`, everything except for map & model is optional; patches controls `MaxComponents` of surface, defaults to `None`; `movie_resolution` can be either 4k or 1080p, defaults to 1080p; `zone` is the surface zone clipping offset, defaults to 2 Å; `segment_size` is the residue range chunk to use, defaults to 40 but will expand to include entire helix/strand or short terminal segments if needed.)
+- Caveat - I have re-organized, updated, and translated from the original `chimera-trimmings` with the help of an LLM (Codex). I have tried to carefully check for errors and unexpected behaviors, and inspect each ChimeraX command invoked, but if you notice anything broken or unexpected, please let me know and I will do my best to fix it.
 
-All domain tools are included in `chimerax_trimmings.py`.
+## Installation
+
+1. Download or clone this repository to a permanent folder. Keep its Python files together.
+2. Edit the first two lines of [chimerax_trimmings.txt](chimerax_trimmings.txt) so the `runscript` paths point to your local copies of the Python scripts. Remove any older separate `runscript` line for `shape_align.py`; its commands are now included in the main script.
+3. In ChimeraX on macOS, open `UCSF ChimeraX -> Preferences... -> Startup`.
+4. Paste the contents of [chimerax_trimmings.txt](chimerax_trimmings.txt) into the startup commands box, or source it from a startup file you already maintain.
+5. Restart ChimeraX.
+
+Windows note: the Startup preferences are typically reached from the `Favorites` menu rather than the application menu.
 
 ## Local domain library
 
@@ -24,6 +34,46 @@ domains #1 source foldseek
 
 For a library stored elsewhere, add `library "/path/to/ecod-cdd"`.
 The library contains ECOD/CDD references; some protein families remain unrepresented.
+
+## Companion Script
+
+The Python script registers:
+
+- `nextmodel`
+- `prevmodel`
+- `nextitem`
+- `previtem`
+- `lowermapthreshold`
+- `raisemapthreshold`
+- `togglemaps`
+- `togglemodels`
+- `cyclelighting`
+- `cyclemodeldisplay`
+- `reorient`
+- `modelmotion`
+- `exposedhydrophobics`
+- `hydrophobicpatches`
+- `patchbrowser`
+- `shapealign`
+- `domains`
+- `domains cancel`
+- `domainbrowser`
+- `tmsegments`
+- `tmsegments cancel`
+
+`togglemaps` and `togglemodels` toggle the currently displayed maps/models on/off. `reorient` attempts to orient the view in a sensible direction - aligning the view to the shortest axis of an ellipsoid defined by the visible components - and repeated invocations of the command cycle through alignment to other axes of the ellipsoid. `modelmotion` activates & freezes selected models for motion, in order to mimick the behavior of legacy Chimera, described in more detail below.
+
+## Shape alignment
+
+```chimerax
+shapealign #2 to #1
+shapealign #2-5 to #1
+shapealign #2 to #1 radius_search
+shapealign #2 to #1 color_fit true
+```
+
+Aligns models or maps by shape. The first input moves; `to` stays fixed.
+See [shape alignment options](SHAPE_ALIGN.md).
 
 ## Domains and sequence features
 
@@ -48,18 +98,6 @@ Pfam searches sequences online unless a local database is configured. InterPro
 requires an exact database sequence. Foldseek searches locally; descriptions and
 exemplars are downloaded. Structural matches suggest a family, not a proven function.
 
-## Shape alignment
-
-```chimerax
-shapealign #2 to #1
-shapealign #2-5 to #1
-shapealign #2 to #1 radius_search
-shapealign #2 to #1 color_fit true
-```
-
-Aligns models or maps by shape. The first input moves; `to` stays fixed.
-See [shape alignment options](SHAPE_ALIGN.md).
-
 ## Transmembrane segments
 
 ```chimerax
@@ -78,23 +116,726 @@ python3 -m venv ~/.local/share/chimerax-trimmings/deeptmhmm
 
 Importing an existing `.3line` result does not require the client.
 
-## Other tools
+## Exposed Hydrophobic Residues
 
-| Command | Use |
+`exposedhydrophobics` replaces the selection with whole protein residues whose
+relative sidechain solvent accessibility exceeds a fractional cutoff.
+
+```chimerax
+exposedhydrophobics #1
+exposedhydrophobics #1/A minimum_exposure 0.4
+exposedhydrophobics #1 residue_names LEU,ILE,VAL,PHE probe_radius 1.4
+exposedhydrophobics #1 minimum_exposure 0.25 minimum_area 10
+```
+
+| Argument | Meaning | Default |
+| --- | --- | --- |
+| Atom specification | Candidate residues, e.g. `#1`, `#1/A`, or `sel` | Required |
+| `minimum_exposure` | Relative sidechain exposure must exceed this fraction, from 0 to 1 | `0.25` (25%) |
+| `minimum_area` | Optional additional sidechain SASA cutoff, in square Angstroms | `0` |
+| `residue_names` | Comma-separated residue names to consider | `ALA,VAL,ILE,LEU,MET,PHE,TRP,PRO` |
+| `probe_radius` | Solvent probe radius in Angstroms | `1.4` |
+
+The calculation uses all non-water atoms in each candidate's model, including
+hidden chains, nucleic acids, ligands, and ions. Restricting candidates to one
+chain does not remove burial by other chains in that model. Separate models are
+calculated independently, so overlapping alternative structures do not bury each
+other. Existing atom radii and any hydrogens present are used. Sidechain area is
+summed using ChimeraX's `sideonly` definition, excluding backbone atoms and CA.
+Glycine therefore has zero sidechain area.
+
+Relative exposure is the sidechain SASA in the full model divided by its sidechain
+SASA with only that residue present. The reference retains the residue's own
+backbone and conformation and uses the same atom radii, hydrogens, and probe radius
+as the full-model calculation. This compares exposed fractions rather than imposing
+the same absolute area on large and small sidechains. It is an isolated-residue
+reference, not a published maximum-accessibility table or tripeptide reference.
+Residues with zero reference area have zero relative exposure. Incomplete
+sidechains are normalized using only the atoms present, so a highly exposed
+fragment does not imply that the missing sidechain would also be exposed.
+
+The command assigns three attributes to every protein residue in the models it
+calculates: `sidechain_sasa` (square Angstroms), `sidechain_sasa_reference` (square
+Angstroms), and `relative_sidechain_sasa` (0 to 1). They support related selections
+without recalculating, for example:
+
+```chimerax
+select #1 & :ARG,LYS,ASP,GLU & ::relative_sidechain_sasa>0.25
+```
+
+Rerun `exposedhydrophobics` after changing coordinates, radii, model composition,
+or the probe radius to refresh those values. It does not create a surface or
+change model visibility, coloring, or coordinates. Selection changes are undoable.
+
+## Binder-Accessible Hydrophobic Patches
+
+`hydrophobicpatches` screens for exposed hydrophobic clusters that a globular
+binder, approximated as a rigid sphere, could contact. It selects the reported
+patches and, by default, gives each patch a distinct atom/cartoon color.
+
+```chimerax
+hydrophobicpatches #1 binder_radius 15
+hydrophobicpatches #1/A binder_mass 15 context #2
+hydrophobicpatches #1 binder_radius 15 samples 128 highlight false
+select #1 & ::hydrophobic_patch_rank=1
+```
+
+Supply exactly one of `binder_radius` (Angstroms) and `binder_mass` (kDa).
+Mass is converted to an equivalent dry sphere at an assumed protein density of
+1.35 g/cm^3; 15 kDa corresponds to about 16.4 Angstroms radius. Use a radius when
+you have a better estimate of the binder's effective steric size.
+
+| Option | Meaning | Default |
+| --- | --- | --- |
+| Atom specification | Candidate residues; the full containing model remains the steric environment | Required |
+| `binder_radius` | Binder sphere radius in Angstroms | Supply this or `binder_mass` |
+| `binder_mass` | Approximate globular binder mass in kDa | Supply this or `binder_radius` |
+| `context` | Additional blocker atoms from separate models, e.g. glycans or assembly partners | None |
+| `minimum_exposure` | Minimum relative sidechain exposure with the solvent probe | `0.25` |
+| `probe_radius` | Solvent probe radius in Angstroms, distinct from the binder radius | `1.4` |
+| `minimum_residues` | Minimum hydrophobic residues in a patch | `3` |
+| `contact_distance` | Maximum atom-surface to binder-surface gap in Angstroms | `3` |
+| `link_distance` | Maximum distance between exposed sidechain atom centers linking residues | `6` |
+| `samples` | Deterministic sphere-placement directions per exposed heavy sidechain atom | `64` |
+| `max_patches` | Maximum number of distinct, non-overlapping patches reported | `10` |
+| `approach` | Require a straight, collision-free approach from outside | `true` |
+| `highlight` | Color patch atoms and cartoons | `true` |
+| `gui` | Automatically open or refresh the patch browser in GUI sessions | `true` |
+| `residue_names` | Hydrophobic residue names | `ALA,VAL,ILE,LEU,MET,PHE,TRP,PRO` |
+
+The screen first applies the same relative sidechain-exposure definition as
+`exposedhydrophobics`, using the solvent probe (1.4 Angstroms by default). It then samples sphere
+placements tangent to exposed sidechain atoms. Every reported patch must have
+one shared clash-free placement near all its reported residues, and its residues
+must form a connected cluster at `link_distance`. With `approach true`, the sphere
+must also have an unobstructed straight outward path to infinity. This is stricter
+than testing whether individual residues are independently accessible.
+
+All non-water atoms in the containing model contribute to exposure and steric
+occlusion, including hidden chains, ligands, and modeled glycans. Each candidate
+model is screened independently; `context` adds blockers from separate models.
+Patches may span chains within a model, but are not combined across models.
+
+Patches are ranked by the summed water-probe SASA of hydrophobic sidechain atoms
+near the sampled binder sphere. This is nearby exposed area, not predicted buried
+interface area or binding energy. The highest-ranked patch is kept first, then
+lower-ranked overlapping alternatives are omitted. Residue attribute
+`hydrophobic_patch_rank` is the rank, or zero for unassigned protein residues in
+the analyzed models. Placement centers and approach directions in scene coordinates
+are available in `session._trimmings_hydrophobic_patches`.
+
+Use these as candidate epitopes for inspection, not predictions of affinity,
+specificity, or binder design success. A sphere omits binder shape, sidechain
+flexibility, missing glycans, and unmodeled membrane/assembly context. Finite
+direction sampling can miss accessible placements; increase `samples` to refine
+the screen. A failed straight-approach test does not rule out a curved approach.
+Incomplete target sidechains retain the exposure limitations described above.
+
+Color and selection changes are undoable together; undo a highlight before
+comparing another set of parameters. `highlight false` leaves colors untouched.
+The command uses NumPy and SciPy supplied with ChimeraX, creates no model copies
+or probe models, and leaves coordinates, map contours, and display masks unchanged.
+
+### Patch Browser
+
+In a graphical ChimeraX session, a search automatically opens a dockable
+**Hydrophobic Patches** panel. Its list-and-navigation layout follows ResNotes,
+but ResNotes does not need to be installed.
+
+- Click a patch in the ranked list, or use **Previous** / **Next**, to select it.
+  Navigation wraps at either end.
+- **Auto-center on patch** fits the patch and adjusts local clipping. Uncheck it
+  to change selection while keeping the current camera.
+- **View from binder approach** orients focused views along the sampled approach
+  direction. Uncheck it to retain the current orientation when centering.
+- **Focus patch** centers the current patch manually.
+- **Restore view** restores the camera, clipping, and rotation center captured
+  when the panel opened. It does not restore or change model positions.
+- **Refresh list** loads the latest search results. New searches refresh the
+  existing panel, and closed-model results are removed automatically.
+
+The details show the residue specification, nearby hydrophobic area, and binder
+sphere radius. Focusing follows a moved target's current transform; rescreen after
+structural edits or changes in the target's position relative to blocker models.
+Hidden models are left hidden, and the panel does not change display masks.
+
+Reopen the latest results with `patchbrowser`. Suppress automatic opening with:
+
+```chimerax
+hydrophobicpatches #1 binder_mass 15 gui false
+```
+
+Without a GUI, searches remain command-only. Browser state is not saved in
+session files; rerun the search after reopening a session.
+
+## Active and Frozen Models
+
+The opt-in `modelmotion` commands provide Chimera-style activation independently
+of atom/model selection. Structures, maps, and independent surfaces are supported.
+Groups expand to their movable members; surfaces owned by a structure or map move
+with that owner. Specify the owner rather than its surface submodel.
+
+```chimerax
+modelmotion active #1
+modelmotion unfreeze #3
+modelmotion freeze #1
+modelmotion status
+modelmotion all
+modelmotion off
+```
+
+`active` replaces the movement set, `unfreeze` adds models, and `freeze` removes
+models. If `freeze` is the first command, all other current models remain active.
+Newly opened models are active by default; existing frozen models stay frozen.
+An empty active set prevents rotation/translation; clearing selection has no effect.
+
+Mouse and trackpad input work simultaneously and use the same active/frozen model
+set. With the Trimmings startup bindings and ChimeraX's standard middle-button and
+wheel bindings, mouse controls are:
+
+| Mouse input | Behavior |
 | --- | --- |
-| `nextmodel` / `prevmodel` | Switch models |
-| `nextitem` / `previtem` | Switch models or maps |
-| `togglemodels` / `togglemaps` | Hide/restore visible models or maps |
-| `cyclelighting` / `cyclemodeldisplay` | Cycle display presets |
-| `reorient` | Reorient visible objects |
-| `modelmotion` | Control which models can move |
-| `exposedhydrophobics` | Find exposed hydrophobic residues |
-| `hydrophobicpatches` / `patchbrowser` | Find and browse hydrophobic patches |
-| `map_salami` | Make map/model-fit panels |
+| Left drag | Rotate active models together |
+| Middle-button drag | Translate active models in the screen plane |
+| Control + middle-button drag | Translate active models along screen Z |
+| Scroll wheel | Keep the existing whole-view zoom binding |
+| Right drag | Keep the Trimmings clipping control |
+| Alt + right drag | Keep the Trimmings contour control |
 
-Use `usage <command>` or `usage aliases` for options.
-The **Shortcuts** panel provides common display and navigation controls.
-See [mouse defaults](default_mousemodes.md) for mouse bindings.
+Custom mouse bindings are respected: existing model rotation/translation bindings
+are redirected to the active set when `modelmotion` is enabled. Selected-model
+movement bindings then use the active set independently of selection.
+
+| Trackpad gesture | Movement |
+| --- | --- |
+| Two-finger swipe | Rotate the active models together |
+| Two-finger twist | Rotate active models around the screen-normal axis |
+| Three-finger swipe | Translate active models in the screen plane |
+| Control + three-finger swipe | Translate active models along screen Z |
+| Pinch | Keep the existing zoom binding |
+
+Trackpad gestures must be enabled in ChimeraX and available to it from macOS.
+Mouse and trackpad rotation use the current ChimeraX center of rotation, including
+the pivot set by `cofron`, `cofroff`, `cofr sel`, or an explicit `cofr` position.
+Mouse bindings that currently
+rotate/translate models are redirected to the same active set; selection, clipping,
+and contour bindings retain their existing behavior. Trackpad movement is undoable
+after a short pause. `modelmotion off` restores the previous mouse and trackpad
+bindings changed on activation.
+Freezing applies to these movement modes; commands such as `fitmap` can still move
+models. Activation is temporary session state and is not saved in session files.
+
+## Keybindings
+
+- `F1`: `prevmodel`
+- `F2`: `nextmodel`
+- `F3`: `centersel`
+- `F4`: `view all`
+- `F5`: `togglemaps`
+- `F6`: `togglemodels`
+- `F7`: `cyclelighting`
+- `F8`: `cyclemodeldisplay`
+- `F9`: `prevmap`
+- `F10`: `nextmap`
+- `F11`: `lowermapthreshold`
+- `F12`: `raisemapthreshold`
+
+## Button Panel
+
+The startup file creates a `Shortcuts` button panel with quick access to commonly used tools and commands.
+
+It currently includes buttons for:
+
+- `Vol_Viewer`: open the Volume Viewer tool
+- `Model_Panel`: open the Model Panel
+- `Log`: open the Log tool
+- `default_disp`: restore the default ribbon/cartoon molecular display
+- `map_sphere`: zone maps to a 15 A sphere around the center of rotation
+- `map_unsphere`: remove map zoning
+- `cofron`: show the center-of-rotation pivot marker
+- `cofroff`: hide the center-of-rotation pivot marker while keeping the CoFR centered on the view
+- `cootmode`: apply the dark-background Coot-style display preset
+- `mark_cofr`: place a marker at the current center of rotation
+- `togglemaps`: hide shown maps, then restore the same set on the next use
+- `togglemodels`: hide shown atomic models, then restore the same set on the next use
+- `reset_mouse_and_help`: restore the default mouse bindings and open the mouse-mode help page
+- `previous_model_map`: show the previous unskipped atomic model or volume map
+- `next_model_map`: show the next unskipped atomic model or volume map
+
+## Alias Reference
+
+_**Note: for all of these aliases, on the Chimerax command line you can type "help `cofron`" or "usage `cofron`" for example to get a short description of usage of the indicated alias in the Log**_
+
+### `cofron`
+
+Centers the rotation point on the current view and shows the pivot marker.
+
+Usage: `cofron`
+
+```chimerax
+alias cofron cofr centerofview showpivot 7,0.25
+alias usage cofron synopsis "Center the rotation point on the view and show the pivot"
+```
+
+### `cofroff`
+
+Recenters the rotation point on the current view and hides the pivot marker.
+
+Usage: `cofroff`
+
+```chimerax
+alias cofroff cofr centerofview showpivot false
+alias usage cofroff synopsis "Recenter the rotation point on the view and hide the pivot marker"
+```
+
+### `symclip`
+
+Sets symmetric clip planes around the center of rotation.
+
+Usage: `symclip <half-distance>`
+
+```chimerax
+alias symclip cofr centerofview; clip near -$1 far $1 position cofr
+alias usage symclip synopsis "Set symmetric clip planes around the center of rotation" $1 "half-distance"
+```
+
+### `modelsel`
+
+Selects atomic models using the `##num_residues` selector.
+
+Usage: `modelsel`
+
+```chimerax
+alias modelsel select ##num_residues
+alias usage modelsel synopsis "Select atomic models"
+```
+
+### `mapsel`
+
+Selects non-atomic models such as maps using the inverse selector.
+
+Usage: `mapsel`
+
+```chimerax
+alias mapsel select ~##num_residues
+alias usage mapsel synopsis "Select non-atomic models such as maps"
+```
+
+### `sidesel`
+
+Selects protein sidechains and nucleic-acid bases for the given atom specification.
+
+Usage: `sidesel <atom-spec>`
+
+```chimerax
+alias sidesel select sidechain & $1 | ~backbone & nucleic & $1
+alias usage sidesel synopsis "Select protein sidechains and nucleic-acid bases" $1 "atom-spec"
+```
+
+### `sidedisp`
+
+Displays protein sidechains and nucleic-acid bases for the given atom specification.
+
+Usage: `sidedisp <atom-spec>`
+
+```chimerax
+alias sidedisp select sidechain & $1 | ~backbone & nucleic & $1; display sel
+alias usage sidedisp synopsis "Display protein sidechains and nucleic-acid bases" $1 "atom-spec"
+```
+
+### `cootmode`
+
+Applies a dark-background Coot-style display preset for model building.
+
+Usage: `cootmode`
+
+```chimerax
+alias cootmode set bgColor black; surface cap false; surface style solid; nucleotides #* atoms; lighting flat; graphics silhouettes false; style stick; ~rib; color ##num_residues gold; color byhet ; disp;  ~disp @H*; style ions sphere; style solvent ball; size ballscale 0.2;  size stickradius 0.07; transparency 70; cofr centerofview; clip near -10 far 10 position cofr; color ~##num_residues cornflower blue
+alias usage cootmode synopsis "Apply the dark-background Coot-style display preset"
+```
+
+### `cootmode_white`
+
+Applies a white-background variant of `cootmode`.
+
+Usage: `cootmode_white`
+
+```chimerax
+alias cootmode_white set bgColor white; surface cap false; surface style solid; nucleotides #* atoms; lighting flat; graphics silhouettes false; style stick; ~rib; color ##num_residues orange; color byhet ; disp;  ~disp @H*; style ions sphere; style solvent ball; size ballscale 0.2;  size stickradius 0.07; transparency 85; cofr centerofview; clip near -10 far 10 position cofr; color ~##num_residues medium blue
+alias usage cootmode_white synopsis "Apply the white-background Coot-style display preset"
+```
+
+### `cootmode_mesh`
+
+Applies a mesh-map variant of `cootmode`.
+
+Usage: `cootmode_mesh`
+
+```chimerax
+alias cootmode_mesh surface cap false; surface style mesh; lighting flat; nucleotides #* atoms; graphics silhouettes false; style stick; ~rib; color ##num_residues gold; color byhet ; disp;  ~disp @H*; style solvent ball; style ions sphere; size ballscale 0.2;  size stickradius 0.07; cofr centerofview; clip near -10 far 10 position cofr; color ~##num_residues #3d60ffff; transparency 50
+alias usage cootmode_mesh synopsis "Apply the mesh Coot-style display preset"
+```
+
+### `ca_and_sidechains`
+
+Shows a CA trace for proteins or phosphate trace for nucleic acids, plus protein sidechains and nucleic-acid bases.
+
+Usage: `ca_and_sidechains <model-spec>`
+
+```chimerax
+alias ca_and_sidechains ~rib $1; ~surf $1; ~disp $1; disp @CA&protein&$1; disp @P&nucleic&$1; style $1 stick; disp sidechain&$1; disp ~backbone&nucleic&$1; size stickradius 0.1; size pseudobondradius 0.1
+alias usage ca_and_sidechains synopsis "Show CA or phosphate trace plus sidechains or bases" $1 "model-spec"
+```
+
+### `ca_trace`
+
+Shows a CA trace for proteins and a phosphate trace for nucleic acids.
+
+Usage: `ca_trace <model-spec>`
+
+```chimerax
+alias ca_trace ~rib $1; ~surf $1; ~disp $1; disp @CA&protein&$1; disp @P&nucleic&$1; style $1 stick; size stickradius 0.1; size pseudobondradius 0.1
+alias usage ca_trace synopsis "Show a CA or phosphate trace" $1 "model-spec"
+```
+
+### `expand_sym`
+
+Expands an asymmetric unit to biological assembly `1` as a new model and shows the result as ribbon copies. This is most useful for mmCIF structures where assembly `1` corresponds to the full biological unit.
+
+Usage: `expand_sym <model-spec>`
+
+Note: this alias assumes the desired biological assembly is `1`.
+
+```chimerax
+alias expand_sym ~disp $1; rib $1; sym $1 assembly 1 copies false newModel true
+alias usage expand_sym synopsis "Expand an asymmetric unit to biological assembly 1 as ribbon copies" $1 "model-spec"
+```
+
+### `map_sphere_15`
+
+Zones maps to a 15 A sphere around the center of rotation.
+
+Usage: `map_sphere_15`
+
+```chimerax
+alias map_sphere_15 volume unzone ~##num_residues; sel; close #10000; marker #10000 position cofr; sel ~sel; volume zone ~##num_residues nearAtoms sel minimalBounds true range 15; close #10000
+alias usage map_sphere_15 synopsis "Zone maps to a 15 A sphere around the center of rotation"
+```
+
+### `cubic_map`
+
+Creates a spherical mask map on a cubic grid.
+
+Usage: `cubic_map <sphere-radius>`
+
+```chimerax
+alias cubic_map shape sphere radius $1 modelid #10000; volume onesmask #10000 spacing 1 border -0.5
+alias usage cubic_map synopsis "Create a spherical mask map on a cubic grid" $1 "sphere radius"
+```
+
+### `map_unsphere`
+
+Removes zoning from all maps.
+
+Usage: `map_unsphere`
+
+```chimerax
+alias map_unsphere volume unzone ~##num_residues
+alias usage map_unsphere synopsis "Remove map zoning from all maps"
+```
+
+### `fit_by_chain`
+
+Splits a model by chain, fits each chain independently into a map, then recombines the result.
+
+Usage: `fit_by_chain <model-spec> <map-spec>`
+
+```chimerax
+alias fit_by_chain split $1; fitmap $1.* inmap $2 eachmodel true; combine $1.* close true
+alias usage fit_by_chain synopsis "Split a model by chain, fit each chain into a map, and recombine" $1 "model-spec" $2 "map-spec"
+```
+
+### `rainbow_new`
+
+Colors models with the `RdYlBu-5` rainbow palette.
+
+Usage: `rainbow_new`
+
+```chimerax
+alias rainbow_new rainbow palette RdYlBu-5
+alias usage rainbow_new synopsis "Color models by rainbow using the RdYlBu-5 palette"
+```
+
+### `default_mol_display`
+
+Restores a default ribbon/cartoon molecular display with chain rainbow coloring.
+
+Usage: `default_mol_display`
+
+```chimerax
+alias default_mol_display ~disp; rib; rainbow chain palette RdYlBu-5; lighting soft
+alias usage default_mol_display synopsis "Restore the default cartoon molecular display"
+```
+
+### `local_fitmap`
+
+Fits a model or map into a local zone cut from a target map around the center of rotation.
+
+Usage: `local_fitmap <model-or-map> <target-map> <zone-radius>`
+
+```chimerax
+alias local_fitmap ~sel; close #10000-10001; marker #10000 position cofr; sel #10000; volume zone $2 nearAtoms sel range $3 newMap true modelid 10001 minimalbounds true; fitmap $1 inmap #10001 eachmodel true; close #10001; close sel; show $2
+alias usage local_fitmap synopsis "Fit a model or map into a local zone around the center of rotation" $1 "model or map to fit" $2 "target map" $3 "zone radius"
+```
+
+### `hidemodels`
+
+Hides all atomic models.
+
+Usage: `hidemodels`
+
+```chimerax
+alias hidemodels hide ##num_residues models
+alias usage hidemodels synopsis "Hide all atomic models"
+```
+
+### `showmodels`
+
+Shows all atomic models.
+
+Usage: `showmodels`
+
+```chimerax
+alias showmodels show ##num_residues models
+alias usage showmodels synopsis "Show all atomic models"
+```
+
+### `caps_off`
+
+Turns clipped surface caps off.
+
+Usage: `caps_off`
+
+```chimerax
+alias caps_off surface cap false
+alias usage caps_off synopsis "Turn clipped surface caps off"
+```
+
+### `caps_on`
+
+Turns clipped surface caps on.
+
+Usage: `caps_on`
+
+```chimerax
+alias caps_on surface cap true
+alias usage caps_on synopsis "Turn clipped surface caps on"
+```
+
+### `open_vseries`
+
+Opens a file browser with volume-series mode enabled.
+
+Usage: `open_vseries`
+
+```chimerax
+alias open_vseries "open browse vseries true"
+alias usage open_vseries synopsis "Open a file browser with volume series enabled"
+```
+
+### `selbetween`
+
+Selects residues between the current selection endpoints.
+
+Usage: `selbetween`
+
+```chimerax
+alias selbetween ks ri
+alias usage selbetween synopsis "Select residues between the current selection endpoints"
+```
+
+### `helix`
+
+Marks residues as helix.
+
+Usage: `helix <residue-spec>`
+
+```chimerax
+alias helix setattr $1 res is_helix true
+alias usage helix synopsis "Mark residues as helix" $1 "residue-spec"
+```
+
+### `strand`
+
+Marks residues as strand.
+
+Usage: `strand <residue-spec>`
+
+```chimerax
+alias strand setattr $1 res is_strand true
+alias usage strand synopsis "Mark residues as strand" $1 "residue-spec"
+```
+
+### `coil`
+
+Clears helix and strand assignment for residues.
+
+Usage: `coil <residue-spec>`
+
+```chimerax
+alias coil setattr $1 res is_strand false; setattr $1 res is_helix false
+alias usage coil synopsis "Clear helix and strand assignment for residues" $1 "residue-spec"
+```
+
+### `rock_movie`
+
+Records a rocking movie to `~/Desktop/rock_movie.mp4`.
+
+Usage: `rock_movie`
+
+```chimerax
+alias rock_movie cofr showpivot false; movie record; rock y 50; wait 600; movie encode ~/Desktop/rock_movie.mp4; stop
+alias usage rock_movie synopsis "Record a rocking movie and save it to the default Desktop file"
+```
+
+### `centersel`
+
+Centers on the current selection and applies local clipping around it.
+
+Usage: `centersel`
+
+```chimerax
+alias centersel cofr sel; clip near 10 position cofr; clip far -10 position cofr; cofr centerOfView showpivot true; view sel
+alias usage centersel synopsis "Center the view on the selection and apply local clipping"
+```
+
+### `volume_project`
+
+Displays a map as a projected image volume.
+
+Usage: `volume_project <map-spec>`
+
+```chimerax
+alias volume_project set bgColor black; volume $1 step 1 sd_level 0,0 sd_level 50,1 color white color white style image projection_mode auto maximum_intensity_projection true bt_correction true linear_interpolation true; lighting depth_cue false
+alias usage volume_project synopsis "Display a map as a maximum-intensity projection" $1 "map-spec"
+```
+
+### `split_diff_map`
+
+Replaces a map with a scaled positive/negative mesh difference map.
+
+Usage: `split_diff_map <input-map> <output-model-id>`
+
+```chimerax
+alias split_diff_map volume scale $1 rms 1 modelId $2; close $1; volume $2 capFaces false meshLighting false squareMesh false level -3 color #da1200000000 level 3 color #0000bda00000; lighting depthCue true; volume $2 style mesh
+alias usage split_diff_map synopsis "Replace a map with a scaled positive and negative mesh difference map" $1 "input map" $2 "output model-id"
+```
+
+### `local_diff_map`
+
+Builds a local difference map from two maps around a model.
+
+Usage: `local_diff_map <model-spec> <first-map> <second-map>`
+
+Depends on: `split_diff_map`
+
+```chimerax
+alias local_diff_map view name tmp; close #1001,1002,1003,1004,1005; fitmap $1 inMap $2; vol zone $2 near $1 range 5 newMap true modelId 1000 minimalBounds true; fitmap $1 inMap $3; vol zone $3 near $1 range 5 newMap true modelId 1001 minimalBounds true; volume scale #1000 sd 0.1 modelId 1002; volume scale #1001 sd 0.1 modelId 1003; fitmap #1003 inMap #1002; volume resample #1003 onGrid #1002 modelId 1004; volume subtract #1002 #1004 modelId 1005 minRms true; volume #1005 step 1; split_diff_map #1005 #1006; close #1000,1001,1002,1003,1004,1005; view tmp
+alias usage local_diff_map synopsis "Build a local difference map between two fitted maps around a model" $1 "model-spec" $2 "first map" $3 "second map"
+```
+
+### `local_diff_map_sphere`
+
+Builds a local difference map from two maps around the center of rotation.
+
+Usage: `local_diff_map_sphere <first-map> <second-map> <radius>`
+
+Depends on: `split_diff_map`
+
+```chimerax
+alias local_diff_map_sphere ~sel; close #10000,#1001,#1002,#1003,#1004,#1005; marker #10000 position cofr; sel #10000; vol zone $1 near sel range $3 newMap true modelId 1000 minimalBounds true; vol zone $2 near sel range $3 newMap true modelId 1001 minimalBounds true; volume scale #1000 sd 0.1 modelId 1002; volume scale #1001 sd 0.1 modelId 1003; fitmap #1003 inMap #1002; volume resample #1003 onGrid #1002 modelId 1004; volume subtract #1002 #1004 modelId 1005 minRms true; volume #1005 step 1; split_diff_map #1005 #1006; close #10000,#1000,#1001,#1002,#1003,#1004,#1005
+alias usage local_diff_map_sphere synopsis "Build a local difference map between two maps around the center of rotation" $1 "first map" $2 "second map" $3 "radius"
+```
+
+### `binary_mask`
+
+Creates a binary mask map at a chosen contour level.
+
+Usage: `binary_mask <map-spec> <contour-level>`
+
+```chimerax
+alias binary_mask volume threshold $1 minimum $2 set 0 maximum $2 setMaximum 1 modelId 2000; volume #2000 level 0.5
+alias usage binary_mask synopsis "Create a binary mask map at a chosen contour level" $1 "map-spec" $2 "contour level"
+```
+
+### `soft_mask`
+
+Creates a soft-edged mask map from a chosen contour level.
+
+Usage: `soft_mask <map-spec> <contour-level>`
+
+```chimerax
+alias soft_mask volume threshold $1 minimum $2 set 0 maximum $2 setMaximum 1 modelId 2000; volume falloff #2000 iterations 20 modelId 2001; volume #2001 level 0.5; close #2000
+alias usage soft_mask synopsis "Create a soft-edged mask map at a chosen contour level" $1 "map-spec" $2 "contour level"
+```
+
+### `delh`
+
+Deletes all hydrogen atoms.
+
+Usage: `delh`
+
+```chimerax
+alias delh delete @H*
+alias usage delh synopsis "Delete all hydrogen atoms"
+```
+
+### `delh_sel`
+
+Deletes hydrogen atoms from the current selection.
+
+Usage: `delh_sel`
+
+```chimerax
+alias delh_sel delete sel & @H*
+alias usage delh_sel synopsis "Delete hydrogen atoms from the current selection"
+```
+
+### `carve`
+
+Carves displayed map surfaces to the current selection by the given distance.
+
+Usage: `carve <distance>`
+
+```chimerax
+alias carve surface zone ~##num_residues nearAtoms sel distance $1
+alias usage carve synopsis "Carve displayed map surfaces to the current selection" $1 "distance"
+```
+
+### `uncarve`
+
+Removes surface carving from displayed map surfaces.
+
+Usage: `uncarve`
+
+```chimerax
+alias uncarve surface unzone ~##num_residues
+alias usage uncarve synopsis "Remove surface carving from displayed map surfaces"
+```
+
+## Notes
+
+- The Python file is meant to be sourced inside ChimeraX with `runscript`; it is not a standalone Python program.
+- `nextmodel` and `prevmodel` use the Model Panel tool and therefore depend on ChimeraX's current Model Panel implementation.
+- If you move the repository, update the `runscript` path in [chimerax_trimmings.txt](chimerax_trimmings.txt).
+
+## Example 
+I prefer to operate ChimeraX with all panels undocked by default (except for this button panel!), as I find this is the best way to make use of screen real estate on a laptop (which is how I mostly work). So I have a button panel that allows me to quickly access the volume viewer, model panel and log, as well as other shortcuts that I find useful to have on hand. Here is what this looks like in practice:
+
+<img width="1624" alt="image" src="https://github.com/olibclarke/chimeras-trimmings/assets/19766818/7f8f578a-48a3-4474-9526-72da8e7a4472">
+
+And here is what it looks like in action:
+https://www.dropbox.com/scl/fi/cdi295s8h7vc5ijf9wr54/chimerax_example_nav.mov?rlkey=mbqn4uk4yodhj1346thyf86oo&dl=0
 
 ## Licenses
 
