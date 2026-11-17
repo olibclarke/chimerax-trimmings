@@ -29,6 +29,8 @@ Install [Foldseek](https://github.com/steineggerlab/foldseek#installation)
 domains #1 source foldseek
 ```
 
+Replace `#1` with your model ID, e.g. `domains #7 source foldseek`.
+
 The ECOD/CDD library (~676 MB) downloads and installs automatically on first use,
 with status-bar progress. The search starts when ready. Use `domains cancel` to
 stop; rerun to resume.
