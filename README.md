@@ -13,7 +13,7 @@ This repository contains:
 ## Installation
 
 1. Download or clone this repository to a permanent folder. Keep its Python files together.
-2. Edit the first two lines of [chimerax_trimmings.txt](chimerax_trimmings.txt) so the `runscript` paths point to your local copies of the Python scripts. Remove any older separate `runscript` line for `shape_align.py`; its commands are now included in the main script.
+2. Edit the first two lines of [chimerax_trimmings.txt](chimerax_trimmings.txt) so the `runscript` paths point to your local copies of the Python scripts.
 3. In ChimeraX on macOS, open `UCSF ChimeraX -> Preferences... -> Startup`.
 4. Paste the contents of [chimerax_trimmings.txt](chimerax_trimmings.txt) into the startup commands box, or source it from a startup file you already maintain.
 5. Restart ChimeraX.
