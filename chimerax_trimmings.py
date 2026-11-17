@@ -8059,6 +8059,22 @@ def _annotate_foldseek(session, atoms, library, regions, color, refresh, timeout
     import numpy as np
     from chimerax.core.errors import UserError
 
+    executable = shutil.which("foldseek") or next((str(p) for p in (
+        Path("/opt/homebrew/bin/foldseek"), Path("/usr/local/bin/foldseek")) if p.is_file()), None)
+    if executable is None:
+        message = "Foldseek not found. Install it, then restart ChimeraX (macOS: brew install foldseek). See Log for help."
+        session.logger.info(
+            '<p><b>Foldseek is required for structural domain searches.</b></p>'
+            '<p>On macOS, run <code>brew install foldseek</code> in Terminal, then restart ChimeraX. '
+            'For other systems, follow the '
+            '<a href="https://github.com/steineggerlab/foldseek#installation">Foldseek installation instructions</a>.</p>'
+            '<p>If already installed, make the <code>foldseek</code> executable available on PATH '
+            'before starting ChimeraX. The standard Homebrew locations are also checked. '
+            'Use <code>domains #1 source pfam</code> to search by sequence without Foldseek.</p>',
+            is_html=True)
+        session.logger.status(message)
+        raise UserError(message)
+
     try:
         module = _foldseek_module()
         library = Path(library).expanduser().resolve() if library else _foldseek_default_library()
@@ -8066,10 +8082,6 @@ def _annotate_foldseek(session, atoms, library, regions, color, refresh, timeout
         manifest = json.loads(manifest_text)
         guidance_backend = _pfam_backend(pfam_backend, pfam_database, library) if pfam_guided else None
         pieces = module.parse_segments(regions) if regions is not None else None
-        executable = shutil.which("foldseek") or next((str(p) for p in (
-            Path("/opt/homebrew/bin/foldseek"), Path("/usr/local/bin/foldseek")) if p.is_file()), None)
-        if executable is None:
-            raise ValueError("Install Foldseek and make its executable available on PATH.")
         entries = _domain_chain_inputs(atoms)
         unique, geometry = {}, []
         for entry in entries:
