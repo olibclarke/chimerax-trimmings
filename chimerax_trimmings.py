@@ -7813,9 +7813,75 @@ _DOMAIN_LIBRARY_RELEASE = {
 }
 
 
+def _domain_library_user_path():
+    from pathlib import Path
+    import os
+    import sys
+    import chimerax
+
+    directories = getattr(chimerax, "app_dirs_unversioned", None)
+    if directories is not None:
+        root = Path(directories.user_data_dir)
+    elif sys.platform == "darwin":
+        root = Path.home() / "Library" / "Application Support" / "ChimeraX"
+    elif os.name == "nt":
+        root = Path(os.environ.get("LOCALAPPDATA", str(Path.home() / "AppData" / "Local"))) / "ChimeraX"
+    else:
+        root = Path(os.environ.get("XDG_DATA_HOME", str(Path.home() / ".local" / "share"))) / "ChimeraX"
+    return root / "trimmings" / "domain-libraries" / "ecod-cdd"
+
+
+def _domain_library_permission_error(error):
+    import errno
+    from urllib.error import URLError
+    import ssl
+
+    return (not isinstance(error, (URLError, ssl.SSLError)) and
+            (isinstance(error, PermissionError) or getattr(error, "errno", None) in
+             (errno.EACCES, errno.EPERM, errno.EROFS)))
+
+
+def _domain_library_download_error(error):
+    import ssl
+    from urllib.error import HTTPError, URLError
+
+    reason = error.reason if isinstance(error, URLError) else error
+    if isinstance(reason, ssl.SSLError):
+        return "HTTPS certificate or TLS verification failed. Check your system/proxy certificate configuration, then retry."
+    if isinstance(error, HTTPError):
+        if error.code in (404, 410):
+            return f"The domain library release was not found on GitHub (HTTP {error.code}). Update Trimmings, then retry."
+        if error.code in (401, 403, 407):
+            return f"The library download was blocked (HTTP {error.code}). Check GitHub access and proxy/firewall settings, then retry."
+        if error.code == 429:
+            return "GitHub is limiting downloads (HTTP 429). Wait and rerun the command to resume."
+        return f"The library server returned HTTP {error.code}. Try again later; rerun the command to resume."
+    if isinstance(reason, TimeoutError):
+        return "The library download timed out. Check your internet connection, then rerun the command to resume."
+    return "Cannot download the domain library. Check your internet connection and proxy/firewall access to GitHub, then rerun to resume."
+
+
+def _domain_library_install_error(error):
+    import errno
+    import ssl
+    from urllib.error import URLError
+
+    if isinstance(error, (URLError, ssl.SSLError)):
+        return _domain_library_download_error(error)
+    if _domain_library_permission_error(error):
+        return "Cannot write the domain library. Check folder permissions or move Trimmings to a writable folder, then retry."
+    if getattr(error, "errno", None) in (errno.ENOSPC, getattr(errno, "EDQUOT", -1)):
+        return "Not enough disk space for the domain library. Free at least 3 GB on the destination drive, then rerun to resume."
+    if isinstance(error, OSError) and not isinstance(error, (InterruptedError, TimeoutError)):
+        return "Cannot read or write the domain library files. Check the destination drive and folder, then retry."
+    return str(error) or type(error).__name__
+
+
 def _install_domain_library(library, cancel, progress):
     """Resume, verify and atomically install the pinned public library."""
     from hashlib import sha256
+    import errno
+    from http.client import IncompleteRead
     import json
     import os
     from pathlib import Path, PurePosixPath
@@ -7823,10 +7889,13 @@ def _install_domain_library(library, cancel, progress):
     import tarfile
     import tempfile
     from time import monotonic
-    from urllib.error import URLError
+    import ssl
+    from urllib.error import HTTPError, URLError
     from urllib.request import Request, urlopen
 
     library = Path(library)
+    if (library / "manifest.json").is_file():
+        return
     library.parent.mkdir(parents=True, exist_ok=True)
     release = _DOMAIN_LIBRARY_RELEASE
     archive = library.parent / (release["sha256"] + ".tar.gz.part")
@@ -7840,25 +7909,28 @@ def _install_domain_library(library, cancel, progress):
 
     # OS locks are released on exit/crash; the small lock file may remain.
     with (library.parent / ".domain-library-install.lock").open("a+b") as lock:
+        if os.name == "nt":
+            import msvcrt
+            lock.write(b"\0")
+            lock.flush()
+            lock.seek(0)
         try:
             if os.name == "nt":
-                import msvcrt
-                lock.write(b"\0")
-                lock.flush()
-                lock.seek(0)
                 msvcrt.locking(lock.fileno(), msvcrt.LK_NBLCK, 1)
             else:
                 import fcntl
                 fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except OSError:
-            raise ValueError("Another ChimeraX instance is installing the domain library. Retry when it finishes.") from None
+        except OSError as error:
+            if error.errno in (errno.EACCES, errno.EAGAIN):
+                raise ValueError("Another ChimeraX instance is installing the domain library. Retry when it finishes.") from None
+            raise
         check()
         if (library / "manifest.json").is_file():
             return
         if library.exists():
             raise ValueError(f"An incomplete library already exists at {library}. Move it aside and rerun the command.")
         if shutil.disk_usage(library.parent).free < 3 * 1024 ** 3:
-            raise ValueError("Installing the domain library needs at least 3 GB of free disk space.")
+            raise ValueError("Installing the domain library needs at least 3 GB of free disk space. Free space on the destination drive, then retry.")
         if archive.is_file() and archive.stat().st_size > release["bytes"]:
             archive.unlink()
         for attempt in range(3):
@@ -7870,8 +7942,13 @@ def _install_domain_library(library, cancel, progress):
             if offset:
                 headers["Range"] = f"bytes={offset}-"
             progress(f"Downloading domain library: {offset / 1e6:.0f} / {release['bytes'] / 1e6:.0f} MB")
+            response, download_error = None, None
             try:
-                with urlopen(Request(release["url"], headers=headers), timeout=30) as response:
+                response = urlopen(Request(release["url"], headers=headers), timeout=30)
+            except (OSError, URLError) as error:
+                download_error = error
+            if response is not None:
+                with response:
                     append = response.status == 206 and offset > 0
                     if response.status == 206:
                         content_range = response.headers.get("Content-Range", "")
@@ -7885,7 +7962,11 @@ def _install_domain_library(library, cancel, progress):
                     with archive.open("ab" if append else "wb") as stream:
                         while True:
                             check()
-                            chunk = response.read(1024 * 1024)
+                            try:
+                                chunk = response.read(1024 * 1024)
+                            except (OSError, URLError, IncompleteRead) as error:
+                                download_error = error
+                                break
                             if not chunk:
                                 break
                             if offset + len(chunk) > release["bytes"]:
@@ -7897,15 +7978,17 @@ def _install_domain_library(library, cancel, progress):
                                 progress(f"Downloading domain library: {100 * offset / release['bytes']:.0f}% "
                                          f"({offset / 1e6:.0f} / {release['bytes'] / 1e6:.0f} MB)")
                                 updated = now
-                if offset != release["bytes"]:
-                    raise OSError("The library download was interrupted.")
+                if download_error is None and offset != release["bytes"]:
+                    download_error = OSError("The library download was interrupted.")
+            if download_error is None:
                 break
-            except (OSError, URLError) as error:
-                check()
-                if attempt == 2:
-                    raise OSError(f"Cannot download the domain library: {error}. Check your connection and rerun to resume.") from None
-                progress("Domain library download interrupted; retrying…")
-                cancel.wait(1)
+            check()
+            reason = download_error.reason if isinstance(download_error, URLError) else download_error
+            if (attempt == 2 or isinstance(reason, ssl.SSLError) or
+                    isinstance(download_error, HTTPError) and 400 <= download_error.code < 500):
+                raise ValueError(_domain_library_download_error(download_error)) from download_error
+            progress("Domain library download interrupted; retrying…")
+            cancel.wait(1)
         progress("Verifying domain library checksum…")
         digest = sha256()
         with archive.open("rb") as stream:
@@ -7953,7 +8036,10 @@ def _install_domain_library(library, cancel, progress):
                     raise ValueError("The downloaded domain library is incomplete: " + path.name)
             check()
             prepared.rename(library)
-        archive.unlink()
+        try:
+            archive.unlink()
+        except OSError:
+            pass  # A leftover archive must not turn a completed installation into a failure.
 
 
 def _install_domain_library_then_search(session, atoms, library, options):
@@ -7983,8 +8069,14 @@ def _install_domain_library_then_search(session, atoms, library, options):
         if cancel.is_set():
             return
         if error is not None:
-            message = f"Domain library installation failed: {error}"
+            from html import escape
+            message = "Domain library installation failed: " + _domain_library_install_error(error)
             session.logger.status(message)
+            session.logger.info(
+                f'<p>Library destination: <code>{escape(str(library))}</code><br>'
+                f'Details: {escape(str(error.__cause__ or error))}<br>'
+                f'<a href="{escape(_DOMAIN_LIBRARY_RELEASE["url"], quote=True)}">Library download</a></p>',
+                is_html=True)
             if synchronous:
                 raise UserError(message)
             session.logger.error(message)
@@ -8000,8 +8092,19 @@ def _install_domain_library_then_search(session, atoms, library, options):
             session.logger.error(str(error))
 
     def install():
+        nonlocal library
         try:
-            _install_domain_library(library, cancel, progress)
+            try:
+                _install_domain_library(library, cancel, progress)
+            except OSError as problem:
+                if not _domain_library_permission_error(problem) or cancel.is_set():
+                    raise
+                fallback = _domain_library_user_path()
+                if fallback.resolve() == library.resolve():
+                    raise
+                progress("Library folder is not writable; trying your ChimeraX user-data folder…")
+                library = fallback
+                _install_domain_library(library, cancel, progress)
             error = None
         except Exception as error_value:
             error = error_value
@@ -8030,6 +8133,9 @@ def _foldseek_default_library():
             return root / 'ecod-cdd'
         if (root / 'cdd-pilot' / 'manifest.json').is_file():
             return root / 'cdd-pilot'
+        fallback = _domain_library_user_path()
+        if (fallback / 'manifest.json').is_file():
+            return fallback
         return root / "ecod-cdd"
     data = json.loads(settings.read_text())
     relative = data.get("library") if isinstance(data, dict) else None
