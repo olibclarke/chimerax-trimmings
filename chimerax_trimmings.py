@@ -3726,10 +3726,6 @@ def _register_shape_align_command(logger):
              _shape_align_help, logger=logger)
 
 
-
-
-
-
 # BEGIN INTEGRATED DOMAIN RUNTIME
 
 class _RuntimeNamespace:
@@ -4325,6 +4321,7 @@ import tempfile as _ex_tempfile
 import time as _ex_time
 from types import SimpleNamespace as _ex_SimpleNamespace
 from urllib.request import Request as _ex_Request, urlopen as _ex_urlopen
+from urllib.error import HTTPError as _ex_HTTPError, URLError as _ex_URLError
 
 def _ex_source_spec(record, structure):
     """Return only explicit source identities and declared domain boundaries."""
@@ -4410,6 +4407,22 @@ def _ex__download(url, path, progress):
             temporary.unlink(missing_ok=True)
 
 def _ex_fetch_source(spec, cache, progress=None):
+    """Keep the exact ECOD domain available if its optional parent cannot be fetched."""
+    try:
+        return _ex__fetch_source(spec, cache, progress)
+    except (_ex_HTTPError, _ex_URLError, TimeoutError, ValueError) as error:
+        uid = spec.get('ecod_uid')
+        if spec.get('provider') == 'ecod' or not isinstance(uid, int) or uid <= 0 or (isinstance(error, ValueError) and str(error) != 'No full AlphaFold model is available for this reference.'):
+            raise
+        if progress:
+            progress('Full source unavailable; retrieving the exact ECOD domain')
+        fallback = {**spec, 'provider': 'ecod', 'domain_only': True, 'full_source_error': str(error)}
+        try:
+            return _ex__fetch_source(fallback, cache, progress)
+        except (_ex_HTTPError, _ex_URLError, TimeoutError) as fallback_error:
+            raise ValueError(f'Could not retrieve the full source ({error}) or the ECOD domain ({fallback_error}). Try again later.') from fallback_error
+
+def _ex__fetch_source(spec, cache, progress=None):
     """Network/cache work only; safe to run outside the GUI thread."""
     spec = dict(spec)
     cache = _ex_Path(cache)
@@ -4980,37 +4993,6 @@ def _fs__run_search_pass(query_dir, queries, library, timeout=120, cancel=None, 
         text = _fs__screen_alignments(query_db, database, alignment_db, result, directory, threads, started + timeout, cancel, progress, executable, convert)
         metadata = _fs_hit_metadata(library, manifest, text, _fs_SCREEN_FIELDS)
         hits = _fs_parse_hits(text, queries, metadata, _fs_SCREEN_FIELDS)
-        accepted = {hit['target'] for hit in hits if _fs_qualifying_hit(hit)}
-        if accepted:
-            source, keys, found = (alignment_db, [], set())
-            lookup = _fs_Path(str(database) + '.lookup')
-            if lookup.is_file():
-                with lookup.open() as stream:
-                    for line in stream:
-                        values = line.rstrip('\n').split('\t')
-                        if len(values) >= 2 and values[1].removesuffix('.pdb') in accepted:
-                            keys.append(values[0])
-                            found.add(values[1].removesuffix('.pdb'))
-            if found == accepted:
-                key_file = directory / 'accepted-targets'
-                key_file.write_text(''.join((key + '\n' for key in keys)))
-                source = directory / 'accepted-alignments'
-                run('filterdb', alignment_db, source, '--filter-file', key_file, '--filter-column', '1', '--threads', command_threads)
-            detailed = directory / 'detailed.tsv'
-            convert(source, detailed, _fs_FIELDS)
-            full_hits = _fs_parse_hits(detailed.read_text(), queries, metadata)
-
-            def key(hit):
-                return tuple((hit[field] for field in ('query', 'target', 'qstart', 'qend', 'tstart', 'tend')))
-            complete = {key(hit): hit for hit in full_hits}
-            for index, hit in enumerate(hits):
-                full = complete.get(key(hit))
-                if full is not None:
-                    if any((hit[field] != full[field] for field in _fs_SCREEN_FIELDS if field not in ('query', 'target'))):
-                        raise ValueError('Foldseek changed an alignment while calculating detailed scores.')
-                    hits[index] = full
-                elif _fs_qualifying_hit(hit):
-                    raise ValueError('Foldseek omitted detailed scores for an accepted candidate.')
     return {'elapsed_seconds': _fs_time.monotonic() - started, 'pilot': manifest.get('pilot', False), 'references': _fs_library_reference_count(manifest), 'queries': queries, 'hits': hits, 'catalog': manifest.get('catalog', 'CDD')}
 
 def _fs_review_windows(hits, queries, index_maps, tested):
@@ -6383,11 +6365,10 @@ def _domain_details_html(session, record, info=None, loading=False):
             label = "Pfam-guided search" if match.get("search_strategy") == "pfam_guided" else "Repeat search"
             parts.append(f'<p>{label}: query positions {first}&ndash;{last} '
                          f'({match["qlen"]} modeled residues). '
-                         'Query coverage and query TM-score below refer to this searched segment.</p>')
+                         'Query coverage below refers to this searched segment.</p>')
         parts.append(f'<p><b>Structural match candidate</b><br>'
                      f'Query coverage: {match["qcov"]:.1%}; reference coverage: {match["tcov"]:.1%}<br>'
-                     f'TM-scores: query {match["qtmscore"]:.3f}, reference {match["ttmscore"]:.3f}, '
-                     f'alignment {match["alntmscore"]:.3f}<br>'
+                     f'Alignment TM-score: {match["alntmscore"]:.3f}<br>'
                      f'Matched reference: {escape(match["target"])}<br>'
                      'The name describes the reference family. Structural similarity alone does not establish '
                      'the query\'s family membership or specific function.</p>')
@@ -6902,13 +6883,14 @@ def _load_domain_exemplar(session, record, structure, *, context=False, notify=N
             notify(message)
     pair = _domain_exemplar_pair(session, record, spec)
     if pair is not None:
-        if context:
+        if context and pair.full is not None:
             module.show_context(pair, pair.full is not None and not pair.full.display)
-        else:
+        elif not context:
             module.realign_pair(session, record, pair)
         pair.group.display = True
         module.focus_pair(session, pair)
-        report(f"{spec['id'].upper()}: {pair.count} residues aligned; RMSD {pair.rmsd:.2f} Å.")
+        report(f"{spec['id'].upper()}: {pair.count} residues aligned; RMSD {pair.rmsd:.2f} Å."
+               + (" Full context unavailable; showing the ECOD domain." if context and pair.full is None else ""))
         return pair
     if key in state.jobs:
         report(f"{spec['id'].upper()} is already loading.")
@@ -6932,11 +6914,11 @@ def _load_domain_exemplar(session, record, structure, *, context=False, notify=N
                 report(f"Opening and aligning {spec['id'].upper()}...")
                 pair = module.open_aligned(session, record, resolved, path)
                 state.pairs[key] = pair
-                if context:
+                if context and pair.full is not None:
                     module.show_context(pair, True)
                 module.focus_pair(session, pair)
                 message = (f"{spec['id'].upper()} aligned: {pair.count} residues, RMSD {pair.rmsd:.2f} Å; "
-                           + ('full source structure not identified.' if pair.full is None else
+                           + ('ECOD domain retrieved; full context unavailable.' if pair.full is None else
                               'full context shown.' if context else 'full context loaded and hidden.'))
                 report(message)
                 session.logger.info(message)
@@ -7512,7 +7494,8 @@ def _create_domain_browser(session):
                     align_label = 'Realign domain' if pair else 'Fetch &amp; align domain'
                     context_label = 'Hide context' if pair and pair.full is not None and pair.full.display else 'Show full context'
                     context_control = (f'<td bgcolor="#dddddd"><a href="trimmings-domain:context:{token}">{context_label}</a></td>'
-                                       if not spec.get('domain_only') else '<td>Full source unavailable</td>')
+                                       if not spec.get('domain_only') and not (pair and pair.full is None)
+                                       else '<td>Full context unavailable</td>')
                     controls = ('<br><table cellspacing="3"><tr>'
                         f'<td bgcolor="#dddddd"><a href="trimmings-domain:align:{token}">{align_label}</a></td>'
                         + context_control + '</tr></table>')
