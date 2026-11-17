@@ -3727,6 +3727,1477 @@ def _register_shape_align_command(logger):
 
 
 
+
+
+
+# BEGIN INTEGRATED DOMAIN RUNTIME
+
+class _RuntimeNamespace:
+    """Expose integrated routines without mixing the backends' public names."""
+    def __init__(self, prefix):
+        object.__setattr__(self, '_prefix', prefix)
+    def __getattr__(self, name):
+        try:
+            return globals()[self._prefix + name]
+        except KeyError:
+            raise AttributeError(name) from None
+    def __setattr__(self, name, value):
+        globals()[self._prefix + name] = value
+    def __delattr__(self, name):
+        try:
+            del globals()[self._prefix + name]
+        except KeyError:
+            raise AttributeError(name) from None
+    def __dir__(self):
+        return sorted(k[len(self._prefix):] for k in globals() if k.startswith(self._prefix))
+
+
+# sequence_features
+
+from collections import Counter as _sf_Counter
+from functools import lru_cache as _sf_lru_cache
+from hashlib import sha256 as _sf_sha256
+import json as _sf_json
+import math as _sf_math
+from pathlib import Path as _sf_Path
+import re as _sf_re
+from time import monotonic as _sf_monotonic, time as _sf_time
+from urllib.parse import urlencode as _sf_urlencode
+from urllib.request import Request as _sf_Request, urlopen as _sf_urlopen
+from uuid import uuid4 as _sf_uuid4
+_sf_VERSION = 1
+_sf_PROSITE_URL = 'https://ftp.expasy.org/databases/prosite/prosite.dat'
+_sf_SCAN_URL = 'https://prosite.expasy.org/cgi-bin/prosite/scanprosite/PSScan.cgi'
+_sf_AMINO_ACIDS = frozenset('ACDEFGHIKLMNPQRSTVWY')
+_sf_CACHE_SECONDS = 14 * 86400
+
+def _sf__check(cancel, deadline=None):
+    if cancel.is_set():
+        raise InterruptedError('Sequence-feature lookup cancelled.')
+    if deadline is not None and _sf_monotonic() >= deadline:
+        raise TimeoutError('Sequence-feature lookup timed out.')
+
+def _sf__atomic_write(path, data):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temp = path.with_name(path.name + '.' + _sf_uuid4().hex + '.tmp')
+    try:
+        temp.write_bytes(data)
+        temp.replace(path)
+    finally:
+        temp.unlink(missing_ok=True)
+
+def _sf__request(url, timeout, data=None):
+    request = _sf_Request(url, data=data, headers={'User-Agent': 'ChimeraX-Trimmings/1.0', 'Content-Type': 'application/x-www-form-urlencoded'})
+    with _sf_urlopen(request, timeout=timeout) as response:
+        content = response.read(40 * 1024 * 1024 + 1)
+    if len(content) > 40 * 1024 * 1024:
+        raise ValueError('Sequence-feature response exceeded the download limit.')
+    return content
+
+@_sf_lru_cache(maxsize=16384)
+def _sf__lnfact(n):
+    return round(_sf_math.lgamma(n + 1), 6) if n <= 10000 else (n + 0.5) * _sf_math.log(n) - n + 0.9189385332
+
+def _sf__seg_probability(counts, length):
+    state = sorted((n for n in counts.values() if n), reverse=True)
+    classes = _sf_Counter(state + [0] * (20 - len(state)))
+    assignments = _sf__lnfact(20) - sum((_sf__lnfact(n) for n in classes.values()))
+    permutations = _sf__lnfact(length) - sum((_sf__lnfact(n) for n in state))
+    return assignments + permutations - length * 2.995732273553991
+
+def _sf__seg_trim(sequence, cancel):
+    size, best, left, right = (len(sequence), 1.0, 0, len(sequence) - 1)
+    for length in range(size, max(1, size - 50), -1):
+        _sf__check(cancel)
+        counts = _sf_Counter((aa for aa in sequence[:length] if aa in _sf_AMINO_ACIDS))
+        for start in range(size - length + 1):
+            probability = _sf__seg_probability(counts, length)
+            if probability < best:
+                best, left, right = (probability, start, start + length - 1)
+            if start + length < size:
+                old, new = (sequence[start], sequence[start + length])
+                if old in _sf_AMINO_ACIDS:
+                    counts[old] -= 1
+                if new in _sf_AMINO_ACIDS:
+                    counts[new] += 1
+    return (left, right)
+
+def _sf_seg(sequence, cancel):
+    """Return inclusive one-based SEG intervals (12, 2.2, 2.5; maxtrim=50).
+
+    Ambiguous residues are excluded from the 20-letter composition; windows
+    containing >2 ambiguous residues cannot trigger or extend a segment.
+    An explicit stack replaces the reference implementation's left-trim recursion.
+    """
+    pending, regions = ([(sequence, 0)], [])
+    while pending:
+        seq, offset = pending.pop()
+        if len(seq) < 12:
+            continue
+        _sf__check(cancel)
+        entropy = [-1.0] * len(seq)
+        for start in range(len(seq) - 11):
+            counts = _sf_Counter((aa for aa in seq[start:start + 12] if aa in _sf_AMINO_ACIDS))
+            total = sum(counts.values())
+            if total >= 10:
+                entropy[start + 5] = abs(sum((n * _sf_math.log(n / total) / _sf_math.log(2) for n in sorted(counts.values(), reverse=True))) / total)
+        i, last, lowlim = (5, len(seq) - 7, 5)
+        while i <= last:
+            if 0 <= entropy[i] <= 2.2:
+                lo, hi = (i, i)
+                while lo >= lowlim and 0 <= entropy[lo] <= 2.5:
+                    lo -= 1
+                lo += 1
+                while hi <= last and 0 <= entropy[hi] <= 2.5:
+                    hi += 1
+                hi -= 1
+                left, right = (lo - 5, hi + 6)
+                trim_left, trim_right = _sf__seg_trim(seq[left:right + 1], cancel)
+                left, right = (left + trim_left, left + trim_right)
+                if i + 6 < left:
+                    pending.append((seq[lo - 5:left], offset + lo - 5))
+                regions.append((left + offset + 1, right + offset + 1))
+                i = min(hi, right + 5)
+                lowlim = i + 1
+            i += 1
+    return sorted(set(regions))
+
+def _sf_low_complexity(sequence, cancel):
+    hits = []
+    for start, end in _sf_seg(sequence, cancel):
+        composition = _sf_Counter(sequence[start - 1:end])
+        summary = ', '.join((f'{aa} {n / (end - start + 1):.0%}' for aa, n in composition.most_common(3)))
+        hits.append({'origin': 'sequence', 'feature_kind': 'low_complexity', 'type': 'Low complexity', 'name': 'Low-complexity region', 'accession': 'SEG', 'source': 'SEG', 'start': start, 'end': end, 'evalue': None, 'bitscore': None, 'outcompeted': False, 'entry_url': 'https://www.ncbi.nlm.nih.gov/books/NBK279684/', 'structures_url': '', 'description': 'Composition: ' + summary + '.', 'evidence': 'SEG prediction; window 12, trigger 2.2, extension 2.5, maxtrim 50. Low complexity does not establish intrinsic disorder.'})
+    return hits
+
+def _sf_compile_pattern(pattern):
+    """Translate PROSITE's constrained pattern language; reject arbitrary regex.
+
+    Character sets containing < or > allow that terminus instead of a residue.
+    Positive lookahead preserves overlapping occurrences. Conserved/excluded
+    positions never accept an ambiguous residue unless explicitly listed.
+    """
+    pattern = pattern.strip().removesuffix('.')
+    tokens = _sf_re.findall('\\[[A-Z<>]+\\]|\\{[A-Z]+\\}|[A-Zx<>]|\\(\\d+(?:,\\d+)?\\)|-', pattern)
+    if ''.join(tokens) != pattern:
+        raise ValueError('Unsupported PROSITE pattern: ' + pattern)
+    pieces = []
+    repeatable = False
+    for token in tokens:
+        if token == '-':
+            repeatable = False
+        elif token.startswith('('):
+            if not repeatable:
+                raise ValueError('Invalid PROSITE repetition.')
+            bounds = [int(n) for n in token[1:-1].split(',')]
+            if not 0 <= bounds[0] <= bounds[-1] <= 1000:
+                raise ValueError('Invalid PROSITE repetition bounds.')
+            pieces.append('{' + token[1:-1] + '}')
+            repeatable = False
+        else:
+            repeatable = token not in ('<', '>')
+            if token.startswith('['):
+                letters = token[1:-1].replace('<', '').replace('>', '')
+                alternatives = ['[' + letters + ']'] if letters else []
+                alternatives += (['\\A'] if '<' in token else []) + (['\\Z'] if '>' in token else [])
+                pieces.append('(?:' + '|'.join(alternatives) + ')')
+            elif token.startswith('{'):
+                allowed = ''.join(sorted(_sf_AMINO_ACIDS - set(token[1:-1])))
+                pieces.append('[' + allowed + ']')
+            else:
+                pieces.append({'x': '[A-Z]', '<': '\\A', '>': '\\Z'}.get(token, token))
+    regex = _sf_re.compile('(?=(' + ''.join(pieces) + '))')
+    if regex.match(''):
+        raise ValueError('A PROSITE pattern must consume at least one residue.')
+    return regex
+
+def _sf_parse_prosite(text):
+    release = _sf_re.search('^CC\\s+Release (.+?)\\.$', text, _sf_re.M)
+    entries = {}
+    for block in text.split('//'):
+        identifier = _sf_re.search('^ID\\s+(\\w+); (PATTERN|MATRIX)\\.', block, _sf_re.M)
+        if not identifier:
+            continue
+        accession = _sf_re.search('^AC\\s+(PS\\d{5});', block, _sf_re.M)
+        if not accession:
+            raise ValueError('Invalid PROSITE accession.')
+        acc = accession[1]
+        if acc in entries:
+            raise ValueError('Duplicate PROSITE accession.')
+        pattern = ''.join(_sf_re.findall('^PA\\s+(.+)$', block, _sf_re.M))
+        if identifier[2] == 'PATTERN' and (not pattern):
+            raise ValueError('Missing PROSITE pattern.')
+        entries[acc] = {'accession': acc, 'name': identifier[1], 'kind': identifier[2], 'description': ' '.join(_sf_re.findall('^DE\\s+(.+)$', block, _sf_re.M)), 'common': bool(_sf_re.search('/SKIP-FLAG=TRUE;', block)), 'pattern': pattern, 'prosite_release': release[1] if release else 'local file', 'regex': _sf_compile_pattern(pattern) if pattern else None}
+    if not entries:
+        raise ValueError('No PROSITE entries found; the response may be an error page.')
+    return entries
+
+@_sf_lru_cache(maxsize=2)
+def _sf__local_prosite(path, modified, size):
+    """Keep compiled definitions between commands; file edits invalidate them."""
+    data = _sf_Path(path).read_bytes()
+    return (_sf_parse_prosite(data.decode('utf-8')), _sf_sha256(data).hexdigest())
+
+def _sf_load_prosite(cache_dir, cancel, deadline, database=None, refresh=False, report=lambda text: None):
+    path = _sf_Path(database).expanduser() if database else _sf_Path(cache_dir) / 'prosite.dat'
+    _sf__check(cancel, deadline)
+    if database or (path.is_file() and (not refresh)):
+        stamp = path.stat()
+        entries, digest = _sf__local_prosite(str(path.resolve()), stamp.st_mtime_ns, stamp.st_size)
+    else:
+        report('downloading PROSITE definitions (once; sequences stay local)')
+        _sf__check(cancel, deadline)
+        data = _sf__request(_sf_PROSITE_URL, min(60, max(0.1, deadline - _sf_monotonic())))
+        entries, digest = (_sf_parse_prosite(data.decode('utf-8')), _sf_sha256(data).hexdigest())
+        _sf__check(cancel, deadline)
+        _sf__atomic_write(path, data)
+    _sf__check(cancel, deadline)
+    return (entries, digest)
+
+def _sf_pattern_hits(sequence, entries, common, cancel):
+    results = []
+    for entry in entries.values():
+        _sf__check(cancel)
+        if entry['kind'] != 'PATTERN' or (entry['common'] and (not common)):
+            continue
+        for match in entry['regex'].finditer(sequence):
+            start, end = (match.start(1) + 1, match.end(1))
+            results.append(_sf__prosite_hit(entry, sequence, start, end, 'pattern'))
+    return results
+
+def _sf__prosite_hit(entry, sequence, start, end, kind):
+    return {**{key: value for key, value in entry.items() if key not in ('regex', 'kind')}, 'origin': 'prosite', 'feature_kind': 'motif' if kind == 'pattern' else 'profile', 'database': 'prosite' if kind == 'pattern' else 'profile', 'source': 'PROSITE', 'type': 'Pattern match' if kind == 'pattern' else 'Profile-supported region', 'start': start, 'end': end, 'matched_sequence': sequence[start - 1:end], 'evalue': None, 'bitscore': None, 'outcompeted': False, 'entry_url': 'https://prosite.expasy.org/' + entry['accession'], 'structures_url': '', 'evidence': 'Sequence pattern match; function is not established by this match alone.' if kind == 'pattern' else "ScanProsite profile match at the standard level-0 cutoff. A profile region alone does not establish a particular residue's function."}
+
+def _sf_parse_scanprosite(payload, sequence, identifier, entries, common=False):
+    try:
+        if not isinstance(payload, dict) or type(payload['n_match']) is not int or type(payload['n_seq']) is not int or (payload['n_seq'] not in (0, 1)) or (not isinstance(payload['matchset'], list)) or (payload['n_match'] != len(payload['matchset'])):
+            raise ValueError()
+        results = []
+        for match in payload['matchset']:
+            if match.get('sequence_id') != identifier and match.get('sequence_ac') != identifier:
+                raise ValueError()
+            acc, start, end = (match['signature_ac'], match['start'], match['stop'])
+            if acc not in entries or type(start) is not int or type(end) is not int or (not 1 <= start <= end <= len(sequence)):
+                raise ValueError()
+            entry = entries[acc]
+            if entry['common'] and (not common):
+                continue
+            if entry['kind'] == 'MATRIX':
+                score, level = (float(match['score']), int(match['level']))
+                if not _sf_math.isfinite(score) or level < 0:
+                    raise ValueError()
+                hit = _sf__prosite_hit(entry, sequence, start, end, 'profile')
+                hit.update(score=score, profile_level=level, source='ScanProsite')
+                results.append(hit)
+        return results
+    except (KeyError, TypeError, ValueError, OverflowError):
+        raise ValueError('Invalid ScanProsite results or sequence coordinates; local features were retained.') from None
+
+def _sf_search(sequences, cache_dir, timeout, cancel, report, *, database=None, common=False, profiles=False, refresh=False):
+    """Local SEG + PROSITE, optionally enriched online; successful zeroes cache too.
+
+    Local features survive a failed definition download or optional online search.
+    Failures are warnings, never cached as valid empty remote responses.
+    """
+    deadline = _sf_monotonic() + timeout
+    cache_dir = _sf_Path(cache_dir)
+    results, warnings = ({}, [])
+    try:
+        entries, digest = _sf_load_prosite(cache_dir, cancel, deadline, database, refresh, report)
+    except Exception as error:
+        _sf__check(cancel, deadline)
+        if database:
+            raise
+        entries, digest = ({}, 'unavailable')
+        warnings.append('PROSITE patterns unavailable; low-complexity features retained: ' + str(error))
+    for index, sequence in enumerate(dict.fromkeys(sequences), 1):
+        _sf__check(cancel, deadline)
+        report(f'local sequence {index}/{len(sequences)}')
+        fingerprint = _sf_json.dumps([_sf_VERSION, sequence, digest, common])
+        path = cache_dir / 'results' / (_sf_sha256(fingerprint.encode()).hexdigest() + '.json')
+        local = _sf__read_cache(path, len(sequence)) if entries and (not refresh) else None
+        if local is None:
+            local = _sf_low_complexity(sequence, cancel) + _sf_pattern_hits(sequence, entries, common, cancel)
+            if entries:
+                _sf__atomic_write(path, _sf_json.dumps({'fetched': _sf_time(), 'hits': local}).encode())
+        results[sequence] = list(local)
+    if profiles and entries:
+        for index, sequence in enumerate(results, 1):
+            _sf__check(cancel)
+            if _sf_monotonic() >= deadline:
+                warnings.append('ScanProsite profile time budget exhausted; local features retained.')
+                break
+            fingerprint = _sf_json.dumps([_sf_VERSION, sequence, digest, common])
+            path = cache_dir / 'results' / (_sf_sha256(fingerprint.encode()).hexdigest() + '.json')
+            online_path = path.with_name(path.stem + '-profiles.json')
+            online = _sf__read_cache(online_path, len(sequence)) if not refresh else None
+            if online is None:
+                report(f'ScanProsite profiles {index}/{len(sequences)} (sending sequence)')
+                identifier = 'trimmings_' + _sf_sha256(sequence.encode()).hexdigest()
+                data = _sf_urlencode({'seq': '>' + identifier + '\n' + sequence, 'output': 'json', 'skip': '0' if common else '1', 'lowscore': '0'}).encode()
+                try:
+                    payload = _sf_json.loads(_sf__request(_sf_SCAN_URL, min(60, max(0.1, deadline - _sf_monotonic())), data))
+                    online = _sf_parse_scanprosite(payload, sequence, identifier, entries, common)
+                    _sf__check(cancel, deadline)
+                    _sf__atomic_write(online_path, _sf_json.dumps({'fetched': _sf_time(), 'hits': online}).encode())
+                except Exception as error:
+                    _sf__check(cancel)
+                    warnings.append('ScanProsite profiles unavailable; local features retained: ' + str(error))
+                    online = []
+            results[sequence].extend(online)
+    return (results, warnings)
+
+def _sf__read_cache(path, sequence_length):
+    try:
+        payload = _sf_json.loads(path.read_text())
+        if 0 <= _sf_time() - payload['fetched'] < _sf_CACHE_SECONDS and isinstance(payload['hits'], list) and all((isinstance(hit, dict) and {'start', 'end', 'accession', 'origin', 'feature_kind', 'name', 'type', 'source', 'outcompeted', 'evalue', 'bitscore'} <= hit.keys() and (type(hit['start']) is int) and (type(hit['end']) is int) and (1 <= hit['start'] <= hit['end'] <= sequence_length) for hit in payload['hits'])):
+            return payload['hits']
+    except (OSError, ValueError, TypeError, KeyError):
+        pass
+    return None
+
+_SEQUENCE_FEATURE_RUNTIME = _RuntimeNamespace('_sf_')
+
+# domain_pfam
+
+from functools import lru_cache as _pl_lru_cache
+import gzip as _pl_gzip
+import hashlib as _pl_hashlib
+import json as _pl_json
+import math as _pl_math
+import os as _pl_os
+from pathlib import Path as _pl_Path
+import re as _pl_re
+import shutil as _pl_shutil
+import signal as _pl_signal
+import subprocess as _pl_subprocess
+import tempfile as _pl_tempfile
+import time as _pl_time
+_pl_VERSION = 1
+
+def _pl_executable(name):
+    return _pl_shutil.which(name) or next((str(path) for path in (_pl_Path('/opt/homebrew/bin') / name, _pl_Path('/usr/local/bin') / name) if path.is_file() and _pl_os.access(path, _pl_os.X_OK)), None)
+
+def _pl_discover(root, database=None, library=None):
+    """Find an installed, pressed Pfam bundle; never download or index it here."""
+    configured = database or _pl_os.environ.get('CHIMERAX_PFAM_DB')
+    paths = []
+    if configured:
+        path = _pl_Path(configured).expanduser()
+        paths = [path / 'Pfam-A.hmm' if path.is_dir() else path]
+    else:
+        base = _pl_Path(root) / '.domain_data'
+        libraries = [_pl_Path(library).expanduser()] if library else []
+        settings = base / 'default-library.json'
+        if not library and settings.is_file():
+            value = _pl_json.loads(settings.read_text()).get('library')
+            if isinstance(value, str) and value:
+                libraries.append(base / value)
+        for folder in libraries:
+            manifest_path = folder / 'manifest.json'
+            if manifest_path.is_file():
+                manifest = _pl_json.loads(manifest_path.read_text())
+                if manifest.get('profile_database'):
+                    paths.append(folder / manifest['profile_database'])
+        candidates = list(base.glob('*/profiles/Pfam*/Pfam-A.hmm'))
+
+        def release_key(path):
+            return tuple((int(p) for p in _pl_re.findall('\\d+', path.parent.name)))
+        paths.extend(sorted(candidates, key=release_key, reverse=True))
+    hmmscan = _pl_executable('hmmscan')
+    if hmmscan is None:
+        if configured:
+            raise ValueError('HMMER hmmscan is not installed or available on PATH.')
+        return None
+    for database_path in paths:
+        database_path = database_path.resolve()
+        metadata_path = _pl_Path(str(database_path) + '.dat.gz')
+        files = [database_path, metadata_path, *(_pl_Path(str(database_path) + suffix) for suffix in ('.h3f', '.h3i', '.h3m', '.h3p'))]
+        if not all((path.is_file() for path in files)):
+            continue
+        if any((path.stat().st_mtime_ns < database_path.stat().st_mtime_ns for path in files[2:])):
+            continue
+        version_file = database_path.parent / 'Pfam.version.gz'
+        release = None
+        if version_file.is_file():
+            with _pl_gzip.open(version_file, 'rt') as stream:
+                match = _pl_re.search('Pfam release\\s*:\\s*([\\d.]+)', stream.read())
+                release = match[1] if match else None
+            files.append(version_file)
+        if release is None:
+            match = _pl_re.fullmatch('Pfam([\\d.]+)', database_path.parent.name)
+            release = match[1] if match else 'unknown release'
+        programs = {'hmmscan': hmmscan, 'hmmfetch': _pl_executable('hmmfetch'), 'hmmpress': _pl_executable('hmmpress')}
+        signature = [_pl_VERSION, programs, [(str(path), path.stat().st_size, path.stat().st_mtime_ns) for path in [*files, *(_pl_Path(p) for p in programs.values() if p)]]]
+        identity = 'local-' + _pl_hashlib.sha256(_pl_json.dumps(signature).encode()).hexdigest()
+        return {'kind': 'local', 'identity': identity, 'database': str(database_path), 'metadata': str(metadata_path), 'hmmscan': hmmscan, 'release': release, 'hmmfetch': programs['hmmfetch'], 'hmmpress': programs['hmmpress']}
+    if configured:
+        raise ValueError('The configured Pfam database needs matching .dat.gz metadata and current hmmpress indexes.')
+    return None
+
+@_pl_lru_cache(maxsize=4)
+def _pl__metadata(path, size, modified):
+    families, current = ({}, {})
+    with _pl_gzip.open(path, 'rt', encoding='utf-8') as stream:
+        for line in stream:
+            if line.startswith('#=GF '):
+                key, value = line[5:].split(None, 1)
+                if key == 'NE':
+                    current.setdefault('NE', []).append(value.strip())
+                else:
+                    current[key] = value.strip()
+            elif line.strip() == '//':
+                accession = current['AC'].split('.')[0]
+                ga = [float(v.strip(';')) for v in current['GA'].split()]
+                if not _pl_re.fullmatch('PF\\d{5,}', accession) or accession in families or len(ga) != 2 or (not all((_pl_math.isfinite(v) for v in ga))):
+                    raise ValueError('Invalid Pfam family metadata.')
+                families[accession] = {'accession': accession, 'version': current['AC'], 'ga': ga, 'name': current['ID'], 'description': current.get('DE', ''), 'type': current['TP'], 'length': int(current['ML']), 'clan': current.get('CL'), 'nested': current.get('NE', [])}
+                current = {}
+    if current or not families:
+        raise ValueError('Incomplete Pfam family metadata.')
+    return families
+
+def _pl_metadata(backend):
+    path = _pl_Path(backend['metadata'])
+    stat = path.stat()
+    return _pl__metadata(str(path), stat.st_size, stat.st_mtime_ns)
+
+def _pl__run(arguments, output, deadline, cancel, progress):
+    if cancel.is_set():
+        raise InterruptedError('Pfam search cancelled.')
+    if _pl_time.monotonic() >= deadline:
+        raise TimeoutError('Local Pfam search timed out.')
+    with output.open('w') as log:
+        process = _pl_subprocess.Popen([str(a) for a in arguments], stdout=log, stderr=_pl_subprocess.STDOUT, start_new_session=_pl_os.name != 'nt')
+        last_report = _pl_time.monotonic()
+        try:
+            while process.poll() is None:
+                if cancel.is_set():
+                    raise InterruptedError('Pfam search cancelled.')
+                if _pl_time.monotonic() >= deadline:
+                    raise TimeoutError('Local Pfam search timed out.')
+                if _pl_time.monotonic() - last_report >= 1:
+                    progress()
+                    last_report = _pl_time.monotonic()
+                cancel.wait(0.05)
+        finally:
+            if process.poll() is None:
+                try:
+                    if _pl_os.name == 'nt':
+                        process.terminate()
+                    else:
+                        _pl_os.killpg(process.pid, _pl_signal.SIGTERM)
+                except ProcessLookupError:
+                    pass
+                try:
+                    process.wait(timeout=2)
+                except _pl_subprocess.TimeoutExpired:
+                    try:
+                        if _pl_os.name == 'nt':
+                            process.kill()
+                        else:
+                            _pl_os.killpg(process.pid, _pl_signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+                    process.wait()
+    if process.returncode:
+        raise ValueError('Local HMMER failed: ' + output.read_text(errors='replace')[-1500:].strip())
+
+def _pl_parse_table(path, families, queries, release):
+    hits = []
+    for line in _pl_Path(path).read_text().splitlines():
+        if not line.strip() or line.startswith('#'):
+            continue
+        row = line.split(maxsplit=22)
+        if len(row) < 22:
+            raise ValueError('Truncated local HMMER domain table.')
+        accession = row[1].split('.')[0]
+        family, query = (families[accession], queries[row[3]])
+        if row[1] != family['version'] or int(row[2]) != family['length'] or int(row[5]) != len(query['sequence']):
+            raise ValueError('Local Pfam profiles and metadata do not match.')
+        first, last = (int(row[17]), int(row[18]))
+        hf, hl = (int(row[15]), int(row[16]))
+        seq_score, score, evalue, bias = (float(row[i]) for i in (7, 13, 12, 14))
+        if not 1 <= first <= last <= len(query['sequence']) or not 1 <= hf <= hl <= family['length'] or (not all((_pl_math.isfinite(v) for v in (seq_score, score, evalue, bias)))) or (evalue < 0):
+            raise ValueError('Invalid local Pfam alignment coordinates or scores.')
+        offset = query['start'] - 1
+        hits.append({'origin': 'pfam', 'source': 'Pfam local (' + release + ')', 'database': 'pfam', 'accession': accession, 'name': family['name'], 'type': family['type'], 'description': family['description'], 'start': first + offset, 'end': last + offset, 'evalue': evalue, 'bitscore': score, 'outcompeted': False, 'tentative': seq_score < family['ga'][0] or score < family['ga'][1], 'gathering_cutoff': family['ga'][1], 'sequence_gathering_cutoff': family['ga'][0], 'sequence_score': seq_score, 'profile_coverage': (hl - hf + 1) / family['length'], 'composition_bias': bias, 'pfam_backend': 'local', 'pfam_release': release, 'query_region': [query['start'], query['start'] + len(query['sequence']) - 1], '_owner': query['owner']})
+    return hits
+
+def _pl_resolve(hits, families):
+    """Deduplicate retries, then apply same-clan competition with nested exceptions."""
+    selected = []
+    for original in sorted(hits, key=lambda h: (h['tentative'], h['evalue'], -h['bitscore'])):
+        hit = {**original, 'outcompeted': False}
+
+        def overlap(other):
+            return max(0, min(hit['end'], other['end']) - max(hit['start'], other['start']) + 1)
+        if any((old['accession'] == hit['accession'] and overlap(old) >= 0.5 * min(old['end'] - old['start'] + 1, hit['end'] - hit['start'] + 1) for old in selected)):
+            continue
+        family = families[hit['accession']]
+        for old in selected:
+            previous = families[old['accession']]
+            if not old['outcompeted'] and old['accession'] != hit['accession'] and family['clan'] and (family['clan'] == previous['clan']) and overlap(old) and (old['name'] not in family['nested']) and (hit['name'] not in previous['nested']):
+                hit['outcompeted'] = True
+                break
+        selected.append(hit)
+    return selected
+
+def _pl_retry_queries(sequence, hits, owner):
+    curated = {p for h in hits if not h['tentative'] and (not h['outcompeted']) for p in range(h['start'], h['end'] + 1)}
+    regions = set()
+    for hit in hits:
+        if hit['tentative'] and (not hit['outcompeted']):
+            regions.add((max(1, hit['start'] - 12), min(len(sequence), hit['end'] + 12)))
+    first = None
+    for p in range(1, len(sequence) + 2):
+        if p <= len(sequence) and p not in curated:
+            if first is None:
+                first = p
+        elif first is not None:
+            if p - first >= 20:
+                regions.add((max(1, first - 12), min(len(sequence), p + 11)))
+            first = None
+    return [{'sequence': sequence[a - 1:b], 'start': a, 'owner': owner} for a, b in sorted(regions) if (a, b) != (1, len(sequence))]
+
+def _pl_search(sequences, backend, timeout, cancel, report):
+    """Curated full scan, reported tentative hits, and ordinary targeted retries."""
+    if not _pl_math.isfinite(timeout) or timeout <= 0:
+        raise ValueError('Local Pfam timeout must be finite and positive.')
+    if cancel.is_set():
+        raise InterruptedError('Pfam search cancelled.')
+    deadline = _pl_time.monotonic() + timeout
+    sequences = list(dict.fromkeys(sequences))
+    if not sequences:
+        return {}
+    families = _pl_metadata(backend)
+    full = {f'chain{i}': {'sequence': seq, 'start': 1, 'owner': i} for i, seq in enumerate(sequences)}
+    release = backend['release']
+    with _pl_tempfile.TemporaryDirectory(prefix='trimmings-pfam-') as temporary:
+        folder = _pl_Path(temporary)
+
+        def scan(database, queries, name, curated, expected_models):
+            report('Local Pfam ' + release + ': ' + name)
+            fasta, table, log = (folder / (name + suffix) for suffix in ('.fasta', '.tsv', '.log'))
+            fasta.write_text(''.join((f">{key}\n{q['sequence']}\n" for key, q in queries.items())))
+            options = ['--cut_ga'] if curated else ['-E', '10', '--domE', '10']
+            _pl__run([backend['hmmscan'], '--noali', '--cpu', '4', '-Z', len(families), '--domtblout', table, *options, database, fasta], log, deadline, cancel, lambda: report('Local Pfam ' + release + ': ' + name))
+            counts = _pl_re.findall('Target model\\(s\\):\\s+(\\d+)', log.read_text())
+            if len(counts) != len(queries) or any((int(n) != expected_models for n in counts)):
+                raise ValueError('Local Pfam database inventory does not match its metadata.')
+            hits = _pl_parse_table(table, families, queries, release)
+            if curated and any((h['tentative'] for h in hits)):
+                raise ValueError('A local curated match failed its recorded gathering thresholds.')
+            return hits
+        all_hits = scan(backend['database'], full, 'curated scan', True, len(families))
+        reported = scan(backend['database'], full, 'tentative scan', False, len(families))
+        all_hits.extend((h for h in reported if h['tentative'] and h['evalue'] <= 0.01))
+        if backend.get('hmmfetch') and backend.get('hmmpress'):
+            candidates_by_owner = {owner: {h['accession'] for h in all_hits if h['_owner'] == owner} for owner in range(len(sequences))}
+            candidates = set().union(*candidates_by_owner.values())
+            regions = {}
+            for owner, seq in enumerate(sequences):
+                hits = _pl_resolve([h for h in all_hits if h['_owner'] == owner], families)
+                for query in _pl_retry_queries(seq, hits, owner):
+                    regions[f'region{len(regions)}'] = query
+            if candidates and regions:
+                keys, subset = (folder / 'keys', folder / 'candidates.hmm')
+                keys.write_text(''.join((families[a]['version'] + '\n' for a in sorted(candidates))))
+                report('Local Pfam ' + release + ': preparing region retries')
+                _pl__run([backend['hmmfetch'], '-o', subset, '-f', backend['database'], keys], folder / 'fetch.log', deadline, cancel, lambda: report('Preparing local Pfam profiles'))
+                _pl__run([backend['hmmpress'], '-f', subset], folder / 'press.log', deadline, cancel, lambda: report('Indexing local Pfam profiles'))
+                retries = scan(subset, regions, 'padded region retries', True, len(candidates))
+                all_hits.extend((h for h in retries if h['accession'] in candidates_by_owner[h['_owner']]))
+        results = {}
+        for owner, seq in enumerate(sequences):
+            results[seq] = [{key: value for key, value in h.items() if key != '_owner'} for h in _pl_resolve([h for h in all_hits if h['_owner'] == owner], families)]
+        return results
+
+_PFAM_LOCAL_RUNTIME = _RuntimeNamespace('_pl_')
+
+# domain_exemplars
+
+import json as _ex_json
+import math as _ex_math
+from pathlib import Path as _ex_Path
+import re as _ex_re
+import tempfile as _ex_tempfile
+import time as _ex_time
+from types import SimpleNamespace as _ex_SimpleNamespace
+from urllib.request import Request as _ex_Request, urlopen as _ex_urlopen
+
+def _ex_source_spec(record, structure):
+    """Return only explicit source identities and declared domain boundaries."""
+    match = structure.get('domain_match', {})
+    if match.get('locations'):
+        return {'provider': 'pdb', 'id': structure['accession'].lower(), 'database': match['database'], 'accession': match['accession'], 'regions': match.get('regions', []), 'mapped': True}
+    reference = record.get('structural_match', {}).get('reference', {})
+    same_url = bool(structure.get('url')) and structure['url'] == reference.get('structure_url')
+    if not same_url and structure.get('accession') not in (reference.get('pdb'), reference.get('ecod_domain'), reference.get('id'), reference.get('uniprot')):
+        return None
+
+    def source(provider, identifier, **extra):
+        spec = {'provider': provider, 'id': identifier, 'regions': regions, 'mapped': False, **extra}
+        uid = reference.get('ecod_uid')
+        if reference.get('catalog') == 'ECOD' and isinstance(uid, int) and (uid > 0):
+            spec['ecod_uid'] = uid
+        return spec
+
+    def domain_only():
+        uid = reference.get('ecod_uid')
+        return source('ecod', str(uid), domain_only=True) if reference.get('catalog') == 'ECOD' and isinstance(uid, int) and (uid > 0) else None
+    predicted = None
+    if reference.get('catalog') == 'ECOD' and reference.get('structure_source') == 'predicted_or_other':
+        predicted = _ex_re.fullmatch('([OPQ][0-9][A-Z0-9]{3}[0-9]|[A-NR-Z][0-9](?:[A-Z][A-Z0-9]{2}[0-9]){1,2})_F1_nD[1-9][0-9]*', reference.get('ecod_domain') or '')
+    chain_id = reference.get('chain') or ('A' if predicted else None)
+    regions = []
+    text = reference.get('ecod_seqid_range', '')
+    if text:
+        pieces = {}
+        for item in text.split(','):
+            parsed = _ex_re.fullmatch('(?:(.+):)?(\\d+)-(\\d+)', item.strip())
+            if not parsed or int(parsed[2]) > int(parsed[3]):
+                return domain_only()
+            chain = parsed[1] or chain_id
+            if not chain:
+                return domain_only()
+            pieces.setdefault(chain, []).append({'start': int(parsed[2]), 'end': int(parsed[3])})
+        regions = [{'chain': chain, 'segments': segments} for chain, segments in pieces.items()]
+    elif reference.get('segments') and reference.get('chain') and (not reference.get('parent_target')):
+        regions = [{'chain': reference['chain'], 'segments': [{'start': a, 'end': b} for a, b in reference['segments']]}]
+    if not regions:
+        return domain_only()
+    if reference.get('pdb'):
+        return source('pdb', reference['pdb'].lower())
+    if reference.get('structure_source') == 'alphafold' and reference.get('uniprot'):
+        return source('alphafold', reference['uniprot'])
+    if predicted:
+        return source('alphafold', predicted[1], fragment=1)
+    return domain_only()
+
+def _ex__coordinate_file_valid(path):
+    with _ex_Path(path).open('rb') as stream:
+        data = stream.read(65536).lstrip()
+    if _ex_Path(path).suffix == '.pdb':
+        return data.startswith(b'ATOM  ') or b'\nATOM  ' in data
+    return data.startswith(b'data_')
+
+def _ex__download(url, path, progress):
+    request = _ex_Request(url, headers={'User-Agent': 'ChimeraX-Trimmings/1.0'})
+    temporary = None
+    try:
+        with _ex_urlopen(request, timeout=45) as response, _ex_tempfile.NamedTemporaryFile(dir=path.parent, delete=False) as stream:
+            temporary = _ex_Path(stream.name)
+            total, size, updated = (int(response.headers.get('Content-Length', 0)), 0, 0)
+            while (block := response.read(1024 * 1024)):
+                size += len(block)
+                if size > 1024 * 1024 * 1024:
+                    raise ValueError('Structure download exceeds 1 GB.')
+                stream.write(block)
+                if progress and _ex_time.monotonic() - updated > 1:
+                    progress(f'Downloading {size / 1048576:.1f}' + (f'/{total / 1048576:.1f}' if total else '') + ' MB')
+                    updated = _ex_time.monotonic()
+        if total and size != total:
+            raise ValueError('Incomplete structure download.')
+        with temporary.open('rb') as stream:
+            data = stream.read(65536).lstrip()
+        valid = data.startswith(b'ATOM  ') or b'\nATOM  ' in data if path.suffix == '.pdb' else data.startswith(b'data_')
+        if not valid:
+            raise ValueError('The source did not return a PDB structure.' if path.suffix == '.pdb' else 'The source did not return an mmCIF structure.')
+        temporary.replace(path)
+    finally:
+        if temporary:
+            temporary.unlink(missing_ok=True)
+
+def _ex_fetch_source(spec, cache, progress=None):
+    """Network/cache work only; safe to run outside the GUI thread."""
+    spec = dict(spec)
+    cache = _ex_Path(cache)
+    cache.mkdir(parents=True, exist_ok=True)
+    provider, identifier = (spec['provider'], spec['id'])
+    if provider == 'ecod':
+        uid = spec.get('ecod_uid')
+        if not isinstance(uid, int) or uid <= 0:
+            raise ValueError('Invalid ECOD domain UID.')
+        path = cache / f'ecod-{uid}.pdb'
+        if not (path.is_file() and 0 <= _ex_time.time() - path.stat().st_mtime < 14 * 86400 and _ex__coordinate_file_valid(path)):
+            _ex__download(f'http://prodata.swmed.edu/ecod/api/domain/{uid}/pdb', path, progress)
+        return (path, spec)
+    if provider == 'pdb':
+        if not _ex_re.fullmatch('[A-Za-z0-9]{4}|pdb_[A-Za-z0-9]+', identifier):
+            raise ValueError('Invalid PDB accession.')
+        url = f'https://files.rcsb.org/download/{identifier.upper()}.cif'
+    elif provider == 'alphafold':
+        if not _ex_re.fullmatch('[A-Z0-9]{6,10}', identifier):
+            raise ValueError('Invalid AlphaFold accession.')
+        with _ex_urlopen(_ex_Request(f'https://alphafold.ebi.ac.uk/api/prediction/{identifier}', headers={'User-Agent': 'ChimeraX-Trimmings/1.0'}), timeout=30) as response:
+            predictions = _ex_json.load(response)
+        first = min((p['start'] for r in spec['regions'] for p in r['segments']))
+        last = max((p['end'] for r in spec['regions'] for p in r['segments']))
+        expected = f"AF-{identifier}-F{spec['fragment']}" if spec.get('fragment') else None
+        model = next((m for m in predictions if m.get('uniprotAccession') == identifier and m.get('cifUrl') and (not m.get('isComplex')) and (expected is None or m.get('modelEntityId', m.get('entryId')) == expected) and (int(m.get('uniprotStart', m.get('sequenceStart', 1))) <= first) and (int(m.get('uniprotEnd', m.get('sequenceEnd', 0))) >= last)), None)
+        if model is None:
+            raise ValueError('No full AlphaFold model is available for this reference.')
+        url = model['cifUrl']
+        if not url.startswith('https://alphafold.ebi.ac.uk/'):
+            raise ValueError('Unexpected AlphaFold coordinate source.')
+        spec['sequence_offset'] = int(model.get('uniprotStart', model.get('sequenceStart', 1))) - 1
+        if model.get('chainId'):
+            spec['regions'] = [{**region, 'chain': model['chainId']} for region in spec['regions']]
+    else:
+        raise ValueError('Unsupported structure source.')
+    suffix = f"-F{spec['fragment']}" if spec.get('fragment') else ''
+    if provider == 'alphafold':
+        suffix += '-v' + str(model.get('latestVersion', 'current'))
+    path = cache / f'{provider}-{identifier}{suffix}.cif'
+    usable = path.is_file() and 0 <= _ex_time.time() - path.stat().st_mtime < 14 * 86400
+    if usable:
+        usable = _ex__coordinate_file_valid(path)
+    if not usable:
+        _ex__download(url, path, progress)
+    if spec.get('ecod_uid'):
+        uid = spec['ecod_uid']
+        domain_path = cache / f'ecod-{uid}.pdb'
+        usable = domain_path.is_file() and 0 <= _ex_time.time() - domain_path.stat().st_mtime < 14 * 86400 and _ex__coordinate_file_valid(domain_path)
+        if not usable:
+            _ex__download(f'http://prodata.swmed.edu/ecod/api/domain/{uid}/pdb', domain_path, progress)
+        spec['domain_path'] = str(domain_path)
+    return (path, spec)
+
+def _ex_region_residues(model, region, offset=0):
+    from chimerax.atomic import Residues
+    candidates = [c for c in model.chains if c.chain_id == region['chain']]
+    if not candidates:
+        candidates = [c for c in model.chains if any((r.mmcif_chain_id == region['chain'] for r in c.existing_residues))]
+    selected = []
+    for chain in candidates:
+        for segment in region['segments']:
+            a, b = (segment['start'] - offset, segment['end'] - offset)
+            if not 1 <= a <= b <= len(chain.residues):
+                continue
+            members = [r for r in chain.residues[a - 1:b] if r is not None]
+            for index, field in [(a - 1, 'author_start'), (b - 1, 'author_end')]:
+                expected = segment.get(field)
+                residue = chain.residues[index]
+                if expected is not None and residue is not None and (str(residue.number) + residue.insertion_code.strip() != str(expected)):
+                    raise ValueError('The exemplar residue numbering disagrees with its domain mapping.')
+            selected.extend(members)
+    return Residues(list(dict.fromkeys(selected)))
+
+def _ex_copy_region(session, model, residues, name):
+    """Copy only selected atoms/bonds, avoiding a whole-complex temporary copy."""
+    from chimerax.atomic import AtomicStructure
+    result = AtomicStructure(session, name=name, auto_style=False, log_info=False)
+    atom_map = {}
+    try:
+        for residue in residues:
+            new = result.new_residue(residue.name, residue.chain_id, residue.number, residue.insertion_code)
+            new.ss_type, new.ss_id = (residue.ss_type, residue.ss_id)
+            new.ribbon_color = residue.ribbon_color
+            for atom in residue.atoms:
+                copied = result.new_atom(atom.name, atom.element)
+                new.add_atom(copied)
+                copied.coord, copied.bfactor, copied.occupancy = (atom.coord, atom.bfactor, atom.occupancy)
+                copied.color = atom.color
+                atom_map[atom] = copied
+        for bond in residues.atoms.intra_bonds:
+            a, b = bond.atoms
+            result.new_bond(atom_map[a], atom_map[b])
+        result.scene_position = model.scene_position
+        result.atoms.displays = False
+        result.residues.ribbon_displays = True
+        return result
+    except BaseException:
+        result.delete()
+        raise
+
+def _ex_align_full(session, record, full, spec):
+    from chimerax.match_maker import match, defaults, CP_SPECIFIC_SPECIFIC
+    baseline, best = (full.scene_position, None)
+    failures = []
+    for region in spec['regions']:
+        full.scene_position = baseline
+        try:
+            selected = _ex_region_residues(full, region, spec.get('sequence_offset', 0))
+            if len(selected) < 3:
+                continue
+            chains = selected.unique_chains
+            if len(chains) != 1:
+                raise ValueError('A domain occurrence must map to one polymer chain.')
+            fits = match(session, CP_SPECIFIC_SPECIFIC, [(record['chain'], chains[0])], defaults['matrix'], defaults['alignment_algorithm'], defaults['gap_open'], defaults['gap_extend'], domain_residues=(record['residues'], selected), cutoff_distance=defaults['iter_cutoff'], always_raise_errors=True, log_parameters=False, verbose=None, compute_ss=False)
+            if not fits:
+                continue
+            fit = fits[0]
+            count, rmsd = (len(fit['final match atoms']), fit['final RMSD'])
+            if count < 3 or not _ex_math.isfinite(rmsd):
+                continue
+            rank = (-count, rmsd)
+            if best is None or rank < best[0]:
+                best = (rank, full.scene_position, selected, count, rmsd)
+        except Exception as error:
+            failures.append(str(error))
+    if best is None:
+        full.scene_position = baseline
+        raise ValueError('No mapped occurrence could be aligned: ' + (failures[0] if failures else 'fewer than three matching residues.'))
+    _, full.scene_position, selected, count, rmsd = best
+    return (selected, count, rmsd)
+
+def _ex_open_aligned(session, record, spec, path):
+    from chimerax.core.models import Model
+    from chimerax.mmcif import open_mmcif
+    group = Model(f"{spec['id'].upper()} aligned to {record['chain_spec']} {record['name']}", session)
+    models = []
+    try:
+        full = None
+        if not spec.get('domain_only'):
+            models, _ = open_mmcif(session, str(path), auto_style=False, log_info=False, max_models=1)
+            if not models or models[0].num_atoms == 0:
+                raise ValueError('The coordinate file contains no atoms.')
+            full = models[0]
+            full.name = f"{spec['id'].upper()} full context"
+            full.display = False
+        session.models.add([group])
+        if models:
+            session.models.add(models, parent=group)
+        if full is not None and (not full.ss_assigned):
+            from chimerax.dssp import compute_ss
+            compute_ss(full)
+        if spec.get('domain_path') or spec.get('domain_only'):
+            from chimerax.pdb import open_pdb
+            domains, _ = open_pdb(session, str(path) if spec.get('domain_only') else spec['domain_path'], auto_style=False, log_info=False, max_models=1)
+            if not domains or not domains[0].num_atoms:
+                raise ValueError('ECOD returned an empty domain structure.')
+            domain = domains[0]
+            domain.display = False
+            session.models.add(domains, parent=group)
+            if not domain.ss_assigned:
+                from chimerax.dssp import compute_ss
+                compute_ss(domain)
+            domain_spec = {'regions': [{'chain': c.chain_id, 'segments': [{'start': 1, 'end': len(c.residues)}]} for c in domain.chains if len(c.residues)]}
+            members, count, rmsd = _ex_align_full(session, record, domain, domain_spec)
+            context_rmsd = 0
+            if full is not None:
+                selected, _, context_rmsd = _ex_align_full(session, {'chain': members.unique_chains[0], 'residues': members}, full, spec)
+                _ex_style_reference(full, selected)
+            _ex_style_reference(domain, members)
+            crop = _ex_copy_region(session, domain, members, f"ECOD {spec['ecod_uid']} aligned domain")
+            session.models.add([crop], parent=group)
+            crop.scene_position = domain.scene_position
+            session.models.close(domains)
+            relation = full.scene_position.inverse() * crop.scene_position if full is not None else None
+        else:
+            selected, count, rmsd = _ex_align_full(session, record, full, spec)
+            _ex_style_reference(full, selected)
+            crop = _ex_copy_region(session, full, selected, f"{spec['id'].upper()} aligned domain")
+            session.models.add([crop], parent=group)
+            crop.scene_position = full.scene_position
+            relation, context_rmsd = (None, 0)
+        return _ex_SimpleNamespace(group=group, domain=crop, full=full, count=count, rmsd=rmsd, source=spec, context_relation=relation, context_rmsd=context_rmsd)
+    except BaseException:
+        if group.id is not None:
+            session.models.close([group])
+        else:
+            for model in models:
+                model.delete()
+            group.delete()
+        raise
+
+def _ex_style_reference(full, selected):
+    import numpy as np
+    full.atoms.displays = False
+    full.residues.ribbon_displays = True
+    full.atoms.colors = np.tile(np.array([180, 180, 180, 255], dtype=np.uint8), (len(full.atoms), 1))
+    full.residues.ribbon_colors = np.tile(np.array([180, 180, 180, 255], dtype=np.uint8), (len(full.residues), 1))
+    selected.atoms.colors = np.tile(np.array([255, 190, 70, 255], dtype=np.uint8), (len(selected.atoms), 1))
+    selected.ribbon_colors = np.tile(np.array([255, 190, 70, 255], dtype=np.uint8), (len(selected), 1))
+
+def _ex_realign_pair(session, record, pair):
+    relation = getattr(pair, 'context_relation', None)
+    if relation is not None or pair.full is None:
+        original = pair.domain.scene_position
+        try:
+            regions = [{'chain': c.chain_id, 'segments': [{'start': 1, 'end': len(c.residues)}]} for c in pair.domain.chains if len(c.residues)]
+            _, count, rmsd = _ex_align_full(session, record, pair.domain, {'regions': regions})
+            if pair.full is not None:
+                pair.full.scene_position = pair.domain.scene_position * relation.inverse()
+            pair.count, pair.rmsd = (count, rmsd)
+        except BaseException:
+            pair.domain.scene_position = original
+            raise
+        return
+    showing, original = (pair.full.display, pair.full.scene_position)
+    crop = None
+    pair.full.display = False
+    try:
+        selected, count, rmsd = _ex_align_full(session, record, pair.full, pair.source)
+        _ex_style_reference(pair.full, selected)
+        crop = _ex_copy_region(session, pair.full, selected, pair.domain.name)
+        session.models.add([crop], parent=pair.group)
+        crop.scene_position = pair.full.scene_position
+        session.models.close([pair.domain])
+        pair.domain, pair.count, pair.rmsd = (crop, count, rmsd)
+        pair.full.display, pair.domain.display = (showing, not showing)
+    except BaseException:
+        if crop is not None and crop is not pair.domain and (not crop.deleted):
+            if crop.id is not None:
+                session.models.close([crop])
+            else:
+                crop.delete()
+        pair.full.scene_position, pair.full.display = (original, showing)
+        raise
+
+def _ex_show_context(pair, show):
+    if pair.full is None:
+        raise ValueError('ECOD provides this domain, but its full source structure is not identified.')
+    relation = getattr(pair, 'context_relation', None)
+    if show:
+        pair.full.scene_position = pair.domain.scene_position * relation.inverse() if relation is not None else pair.domain.scene_position
+    else:
+        pair.domain.scene_position = pair.full.scene_position * relation if relation is not None else pair.full.scene_position
+    pair.full.display, pair.domain.display = (bool(show), not show)
+
+def _ex_focus_pair(session, pair):
+    """Frame the visible exemplar, updating clipping after a context switch."""
+    model = pair.full if pair.full is not None and pair.full.display else pair.domain
+    bounds = model.atoms.scene_bounds
+    if bounds is None:
+        return
+    view, center = (session.main_view, bounds.center())
+    view.view_all(bounds, pad=0.15)
+    normal, depth = (view.camera.view_direction(), max(bounds.radius(), 1.0))
+    view.clip_planes.set_clip_position('near', center - depth * normal, view)
+    view.clip_planes.set_clip_position('far', center + depth * normal, view)
+    view.center_of_rotation = center
+
+_DOMAIN_EXEMPLAR_RUNTIME = _RuntimeNamespace('_ex_')
+
+# domain_foldseek
+
+import json as _fs_json
+import math as _fs_math
+import os as _fs_os
+from pathlib import Path as _fs_Path
+import re as _fs_re
+import signal as _fs_signal
+import subprocess as _fs_subprocess
+import tempfile as _fs_tempfile
+import time as _fs_time
+_fs_FIELDS = ('query', 'target', 'evalue', 'bits', 'qstart', 'qend', 'qlen', 'tstart', 'tend', 'tlen', 'qcov', 'tcov', 'qtmscore', 'ttmscore', 'alntmscore', 'qaln', 'taln')
+_fs_SCREEN_FIELDS = tuple((field for field in _fs_FIELDS if field not in ('qtmscore', 'ttmscore')))
+_fs_ALIGNMENT_FIELDS = tuple((field for field in _fs_SCREEN_FIELDS if field != 'alntmscore'))
+_fs_DEFAULT_THREADS = 4
+_fs_SEARCH_VERSION = 12
+
+def _fs_parse_segments(text):
+    if not _fs_re.fullmatch('\\d+-\\d+(?:_\\d+-\\d+)*(?:,\\d+-\\d+(?:_\\d+-\\d+)*)*', text):
+        raise ValueError('Use comma-separated domains, with underscore-separated pieces for discontinuous domains.')
+    domains = [[tuple(map(int, pair.split('-'))) for pair in domain.split('_')] for domain in text.split(',')]
+    if any((a < 1 or b < a for domain in domains for a, b in domain)):
+        raise ValueError('Domain ranges must be positive and increasing.')
+    if any((b >= c for domain in domains for (_, b), (c, _) in zip(domain, domain[1:]))):
+        raise ValueError('Pieces within one domain must be ordered and non-overlapping.')
+    return domains
+
+def _fs_parse_hits(text, queries, manifest, fields=_fs_FIELDS):
+    targets = {record['id']: record for record in manifest['records']}
+    hits = []
+    for line in text.splitlines():
+        values = line.split('\t')
+        if len(values) != len(fields):
+            raise ValueError('Invalid Foldseek output columns.')
+        row = dict(zip(fields, values))
+        query, target = (row['query'].removesuffix('.pdb'), row['target'].removesuffix('.pdb'))
+        if query not in queries or target not in targets:
+            raise ValueError('Foldseek returned an unknown query or target identifier.')
+        for field in ('evalue', 'bits', 'qcov', 'tcov', 'qtmscore', 'ttmscore', 'alntmscore'):
+            if field not in fields and field in ('qtmscore', 'ttmscore'):
+                row[field] = None
+                continue
+            row[field] = float(row[field])
+            if not _fs_math.isfinite(row[field]) or row[field] < 0:
+                raise ValueError('Invalid Foldseek score.')
+        for field in ('qcov', 'tcov', 'qtmscore', 'ttmscore'):
+            if row[field] is not None and row[field] > 1:
+                raise ValueError(f"Invalid normalized Foldseek score: {field}={row[field]:g} for {queries[query].get('label', query)} against {target}.")
+        for field in ('qstart', 'qend', 'qlen', 'tstart', 'tend', 'tlen'):
+            row[field] = int(row[field])
+        target_length = targets[target].get('length')
+        if target_length is None:
+            target_length = len(targets[target]['sequence'])
+        if row['qlen'] != len(queries[query]['positions']) or not 1 <= row['qstart'] <= row['qend'] <= row['qlen'] or row['tlen'] != target_length or (not 1 <= row['tstart'] <= row['tend'] <= row['tlen']) or (len(row['qaln']) != len(row['taln'])) or (len(row['qaln'].replace('-', '')) != row['qend'] - row['qstart'] + 1) or (len(row['taln'].replace('-', '')) != row['tend'] - row['tstart'] + 1):
+            raise ValueError('Invalid Foldseek alignment coordinates.')
+        q, t, aligned = (row['qstart'] - 1, row['tstart'] - 1, [])
+        for aa, bb in zip(row['qaln'], row['taln']):
+            if aa != '-' and bb != '-':
+                aligned.append(queries[query]['positions'][q])
+            q += aa != '-'
+            t += bb != '-'
+        if q != row['qend'] or t != row['tend']:
+            raise ValueError('Foldseek alignment strings do not match their endpoints.')
+        if row['alntmscore'] > 1:
+            span = min(row['qend'] - row['qstart'] + 1, row['tend'] - row['tstart'] + 1)
+            if span <= 1 or len(aligned) != span or row['alntmscore'] > span / (span - 1) + 0.0005:
+                raise ValueError(f"Invalid normalized Foldseek score: alntmscore={row['alntmscore']:g} for {queries[query].get('label', query)} against {target}.")
+            row['alntmscore_raw'] = row['alntmscore']
+            row['alntmscore'] = min(1.0, row['alntmscore'] * (span - 1) / span)
+        hits.append({**row, 'query': query, 'target': target, 'reference': targets[target], 'aligned_positions': aligned})
+    return sorted(hits, key=lambda hit: (hit['evalue'], -hit['bits']))
+
+def _fs_qualifying_hit(hit):
+    return hit['evalue'] <= 0.01 and hit['tcov'] >= 0.5 and (hit['alntmscore'] >= 0.5) and (len(hit['aligned_positions']) >= 20)
+
+def _fs_select_matches(hits, per_family=True):
+    """Keep distinct occurrences; collapse competing representatives of one occurrence."""
+    selected, footprints = ([], {})
+    for hit in sorted(hits, key=lambda h: (h['evalue'], -h['bits'])):
+        if not _fs_qualifying_hit(hit):
+            continue
+        key = (hit['query'], hit['reference']['accession'] if per_family else None)
+        positions = set(hit['aligned_positions'])
+        if any((len(positions & previous) / min(len(positions), len(previous)) >= 0.5 for previous in footprints.get(key, []))):
+            continue
+        footprints.setdefault(key, []).append(positions)
+        selected.append(hit)
+    return selected
+
+def _fs_library_reference_count(manifest):
+    return manifest['reference_count'] if manifest.get('schema') == 2 else len(manifest['records'])
+
+def _fs_library_file(library, name):
+    path = (_fs_Path(library) / name).resolve()
+    if not path.is_relative_to(_fs_Path(library).resolve()):
+        raise ValueError('Reference-library files must be inside the library directory.')
+    return path
+
+def _fs_hit_metadata(library, manifest, text, fields=_fs_FIELDS):
+    if manifest['schema'] == 1:
+        return manifest
+    import sqlite3
+    from contextlib import closing
+    targets = set()
+    for line in text.splitlines():
+        values = line.split('\t')
+        if len(values) != len(fields):
+            raise ValueError('Invalid Foldseek output columns.')
+        targets.add(values[1].removesuffix('.pdb'))
+    path = _fs_library_file(library, manifest['reference_metadata'])
+    records = []
+    with closing(sqlite3.connect(f'file:{path}?mode=ro', uri=True)) as connection:
+        identifiers = sorted(targets)
+        for first in range(0, len(identifiers), 500):
+            batch = identifiers[first:first + 500]
+            rows = connection.execute('SELECT record FROM refs WHERE id IN (' + ','.join(('?' for _ in batch)) + ')', batch)
+            records.extend((_fs_json.loads(row[0]) for row in rows))
+    return {**manifest, 'records': records}
+
+def _fs__run_foldseek(command, log_path, timeout, cancel=None, progress=None):
+    """Run one stage with cancellation, progress and a bounded lifetime."""
+    if timeout <= 0:
+        raise TimeoutError('Foldseek search timed out.')
+    if cancel is not None and cancel.is_set():
+        raise InterruptedError('Foldseek search cancelled.')
+    started = _fs_time.monotonic()
+    next_progress = started + 1
+    with _fs_Path(log_path).open('a+') as log:
+        process = _fs_subprocess.Popen(list(map(str, command)), stdout=log, stderr=_fs_subprocess.STDOUT, start_new_session=True)
+        try:
+            while process.poll() is None:
+                if cancel is not None and cancel.is_set():
+                    raise InterruptedError('Foldseek search cancelled.')
+                if _fs_time.monotonic() - started > timeout:
+                    raise TimeoutError('Foldseek search timed out.')
+                if progress is not None and _fs_time.monotonic() >= next_progress:
+                    progress()
+                    next_progress = _fs_time.monotonic() + 1
+                _fs_time.sleep(0.05)
+            if process.returncode:
+                log.seek(0)
+                raise RuntimeError('Foldseek failed: ' + log.read()[-2500:])
+        finally:
+            if process.poll() is None:
+                _fs_os.killpg(process.pid, _fs_signal.SIGTERM)
+                try:
+                    process.wait(timeout=3)
+                except _fs_subprocess.TimeoutExpired:
+                    _fs_os.killpg(process.pid, _fs_signal.SIGKILL)
+                    process.wait()
+
+def _fs__parallel_scoring(jobs, directory, deadline, cancel, progress):
+    """Score independent alignment shards without exceeding the CPU budget."""
+    from concurrent.futures import ThreadPoolExecutor, wait, FIRST_COMPLETED
+    from threading import Event
+    from types import SimpleNamespace
+    stopping = Event()
+    token = SimpleNamespace(is_set=lambda: stopping.is_set() or (cancel is not None and cancel.is_set()))
+
+    def worker(index, commands):
+        for command in commands:
+            _fs__run_foldseek(command, directory / f'score-{index}.log', deadline - _fs_time.monotonic(), token)
+    pool = ThreadPoolExecutor(max_workers=len(jobs))
+    pending = {pool.submit(worker, index, commands) for index, commands in enumerate(jobs)}
+    next_progress = _fs_time.monotonic() + 1
+    try:
+        while pending:
+            if token.is_set():
+                raise InterruptedError('Foldseek search cancelled.')
+            if _fs_time.monotonic() >= deadline:
+                raise TimeoutError('Foldseek search timed out.')
+            ready, pending = wait(pending, timeout=0.05, return_when=FIRST_COMPLETED)
+            for future in ready:
+                future.result()
+            if progress is not None and _fs_time.monotonic() >= next_progress:
+                progress()
+                next_progress = _fs_time.monotonic() + 1
+    finally:
+        stopping.set()
+        for future in pending:
+            future.cancel()
+        pool.shutdown(wait=True, cancel_futures=True)
+
+def _fs__screen_alignments(query_db, database, alignment_db, result, directory, threads, deadline, cancel, progress, executable, convert):
+    index = _fs_Path(str(alignment_db) + '.index')
+    size = sum((int(line.split()[2]) for line in index.read_text().splitlines())) if index.is_file() else 0
+    workers = min(threads, 8, max(1, size // 16384))
+    if workers == 1:
+        convert(alignment_db, result, _fs_SCREEN_FIELDS)
+        return result.read_text()
+    ordering = directory / 'ordering.tsv'
+    convert(alignment_db, ordering, _fs_ALIGNMENT_FIELDS)
+    rows = [line.split('\t') for line in ordering.read_text().splitlines()]
+    if any((len(row) != len(_fs_ALIGNMENT_FIELDS) for row in rows)):
+        raise ValueError('Invalid Foldseek alignment columns.')
+    order = [tuple(row) for row in rows]
+    if len(set(order)) != len(order):
+        convert(alignment_db, result, _fs_SCREEN_FIELDS)
+        return result.read_text()
+    jobs, tables = ([], [])
+    for shard in range(workers):
+        source, table = (directory / f'shard-{shard}', directory / f'shard-{shard}.tsv')
+        tables.append(table)
+        jobs.append([[executable, 'filterdb', alignment_db, source, '--filter-expression', f'$1 % {workers} == {shard}', '--threads', '1'], [executable, 'convertalis', query_db, database, source, table, '--threads', '1', '--format-output', ','.join(_fs_SCREEN_FIELDS), '--exact-tmscore', '1']])
+    _fs__parallel_scoring(jobs, directory, deadline, cancel, progress)
+    scored = {}
+    for table in tables:
+        for line in table.read_text().splitlines():
+            values = line.split('\t')
+            if len(values) != len(_fs_SCREEN_FIELDS):
+                raise ValueError('Invalid Foldseek score columns.')
+            fields = dict(zip(_fs_SCREEN_FIELDS, values))
+            key = tuple((fields[field] for field in _fs_ALIGNMENT_FIELDS))
+            if key in scored:
+                raise ValueError('Foldseek scored an alignment more than once.')
+            scored[key] = line
+    if set(scored) != set(order):
+        raise ValueError('Foldseek changed or omitted alignments during parallel scoring.')
+    return ''.join((scored[key] + '\n' for key in order))
+
+def _fs__merge_alignment_shards(shards, destination, prefilter, deadline, cancel=None):
+    """Restore structurealign's global score/length/target ordering per query."""
+    expected = [int(line.split()[0]) for line in _fs_Path(str(prefilter) + '.index').read_text().splitlines()]
+    rows = {key: [] for key in expected}
+    seen, dbtype = (set(), None)
+    for shard in shards:
+        kind = _fs_Path(str(shard) + '.dbtype').read_bytes()
+        if dbtype is not None and kind != dbtype:
+            raise ValueError('Candidate alignment shards have different database types.')
+        dbtype = kind
+        with _fs_Path(shard).open('rb') as stream:
+            for line in _fs_Path(str(shard) + '.index').read_text().splitlines():
+                if cancel is not None and cancel.is_set():
+                    raise InterruptedError('Foldseek search cancelled.')
+                if _fs_time.monotonic() >= deadline:
+                    raise TimeoutError('Foldseek search timed out.')
+                key, offset, length = map(int, line.split())
+                if key not in rows or offset < 0 or length < 1:
+                    raise ValueError('Invalid candidate alignment shard index.')
+                stream.seek(offset)
+                data = stream.read(length)
+                if len(data) != length or not data.endswith(b'\x00'):
+                    raise ValueError('Truncated candidate alignment shard.')
+                for record in data[:-1].splitlines(keepends=True):
+                    fields = record.split()
+                    if len(fields) < 10:
+                        raise ValueError('Invalid candidate alignment record.')
+                    target, score, target_length = (int(fields[0]), int(fields[1]), int(fields[9]))
+                    if (key, target) in seen:
+                        raise ValueError('Candidate alignment was calculated more than once.')
+                    seen.add((key, target))
+                    rows[key].append(((-score, target_length, target), record))
+    with _fs_Path(destination).open('wb') as data, _fs_Path(str(destination) + '.index').open('w') as index:
+        for key in expected:
+            offset = data.tell()
+            for _, record in sorted(rows[key], key=lambda row: row[0]):
+                data.write(record)
+            data.write(b'\x00')
+            index.write(f'{key}\t{offset}\t{data.tell() - offset}\n')
+    if dbtype is None:
+        raise ValueError('No candidate alignment shards were produced.')
+    _fs_Path(str(destination) + '.dbtype').write_bytes(dbtype)
+
+def _fs__candidate_parallel_alignment(query_db, database, alignment_db, directory, threads, deadline, cancel, progress, executable, max_seqs, evalue):
+    """Keep the full prefilter, then independently align target-candidate shards."""
+    directory.mkdir()
+    prefilter = directory / 'prefilter'
+    _fs__run_foldseek([executable, 'ungappedprefilter', str(query_db) + '_ss', str(database) + '_ss', prefilter, '--threads', threads, '--max-seqs', max_seqs, '--comp-bias-corr', '1', '--comp-bias-corr-scale', '0.15', '--min-ungapped-score', '30', '--sub-mat', 'aa:3di.out,nucl:3di.out', '-c', '0', '--cov-mode', '0', '-e', '1.7976931348623157e+308', '--prefilter-mode', '1'], directory / 'prefilter.log', deadline - _fs_time.monotonic(), cancel, progress)
+    workers = min(threads, 8)
+    jobs, shards = ([], [])
+    for worker in range(workers):
+        selected, aligned = (directory / f'prefilter-{worker}', directory / f'alignments-{worker}')
+        shards.append(aligned)
+        jobs.append([[executable, 'filterdb', prefilter, selected, '--filter-expression', f'$1 % {workers} == {worker}', '--threads', '1'], [executable, 'structurealign', query_db, database, selected, aligned, '--threads', '1', '-a', '1', '--alignment-mode', '3', '--alignment-type', '2', '--sort-by-structure-bits', '1', '--comp-bias-corr', '1', '--comp-bias-corr-scale', '0.5', '--sub-mat', 'aa:3di.out,nucl:3di.out', '--min-aln-len', '20', '--exact-tmscore', '1', '-e', evalue, '--compressed', '0']])
+    _fs__parallel_scoring(jobs, directory, deadline, cancel, progress)
+    _fs__merge_alignment_shards(shards, alignment_db, prefilter, deadline, cancel)
+
+def _fs__run_search_pass(query_dir, queries, library, timeout=120, cancel=None, executable='foldseek', threads=_fs_DEFAULT_THREADS, progress=None, manifest=None, max_seqs=1000, evalue=10, candidate_parallel=True):
+    library = _fs_Path(library).resolve()
+    if manifest is None:
+        manifest = _fs_json.loads((library / 'manifest.json').read_text())
+    if manifest.get('schema') not in (1, 2) or (manifest['schema'] == 1 and (not isinstance(manifest.get('records'), list))):
+        raise ValueError('Unsupported domain library manifest.')
+    database = _fs_library_file(library, manifest['database'])
+    if timeout <= 0 or not _fs_math.isfinite(timeout) or threads < 1:
+        raise ValueError('Search timeout and thread count must be positive.')
+    if cancel is not None and cancel.is_set():
+        raise InterruptedError('Foldseek search cancelled.')
+    started = _fs_time.monotonic()
+    command_threads = min(4, threads)
+    with _fs_tempfile.TemporaryDirectory(prefix='domain-foldseek-') as directory:
+        directory = _fs_Path(directory)
+        query_db, alignment_db = (directory / 'query', directory / 'alignments')
+        result = directory / 'hits.tsv'
+
+        def run(*arguments):
+            _fs__run_foldseek([executable, *arguments], directory / 'log', timeout - (_fs_time.monotonic() - started), cancel, progress)
+
+        def convert(source, destination, fields):
+            run('convertalis', query_db, database, source, destination, '--threads', command_threads, '--format-output', ','.join(fields), '--exact-tmscore', '1')
+        run('createdb', query_dir, query_db, '--threads', command_threads, '--chain-name-mode', '0')
+        parallel = candidate_parallel and command_threads > 1 and (len(queries) <= command_threads // 2) and (max((len(query['positions']) for query in queries.values())) >= 256) and (_fs_library_reference_count(manifest) >= 512) and _fs_Path(str(query_db) + '_ss').is_file() and _fs_Path(str(database) + '_ss').is_file() and (not any((_fs_Path(str(database) + suffix).exists() for suffix in ('.idx', '_ss.idx'))))
+        if parallel:
+            _fs__candidate_parallel_alignment(query_db, database, alignment_db, directory / 'candidate-shards', command_threads, started + timeout, cancel, progress, executable, max_seqs, evalue)
+        else:
+            run('search', query_db, database, alignment_db, directory / 'work', '--threads', command_threads, '-a', '1', '--alignment-mode', '3', '--max-seqs', max_seqs, '-e', evalue, '-s', '9.5', '-k', '6', '--prefilter-mode', '1', '--min-aln-len', '20', '--exact-tmscore', '1')
+        text = _fs__screen_alignments(query_db, database, alignment_db, result, directory, threads, started + timeout, cancel, progress, executable, convert)
+        metadata = _fs_hit_metadata(library, manifest, text, _fs_SCREEN_FIELDS)
+        hits = _fs_parse_hits(text, queries, metadata, _fs_SCREEN_FIELDS)
+        accepted = {hit['target'] for hit in hits if _fs_qualifying_hit(hit)}
+        if accepted:
+            source, keys, found = (alignment_db, [], set())
+            lookup = _fs_Path(str(database) + '.lookup')
+            if lookup.is_file():
+                with lookup.open() as stream:
+                    for line in stream:
+                        values = line.rstrip('\n').split('\t')
+                        if len(values) >= 2 and values[1].removesuffix('.pdb') in accepted:
+                            keys.append(values[0])
+                            found.add(values[1].removesuffix('.pdb'))
+            if found == accepted:
+                key_file = directory / 'accepted-targets'
+                key_file.write_text(''.join((key + '\n' for key in keys)))
+                source = directory / 'accepted-alignments'
+                run('filterdb', alignment_db, source, '--filter-file', key_file, '--filter-column', '1', '--threads', command_threads)
+            detailed = directory / 'detailed.tsv'
+            convert(source, detailed, _fs_FIELDS)
+            full_hits = _fs_parse_hits(detailed.read_text(), queries, metadata)
+
+            def key(hit):
+                return tuple((hit[field] for field in ('query', 'target', 'qstart', 'qend', 'tstart', 'tend')))
+            complete = {key(hit): hit for hit in full_hits}
+            for index, hit in enumerate(hits):
+                full = complete.get(key(hit))
+                if full is not None:
+                    if any((hit[field] != full[field] for field in _fs_SCREEN_FIELDS if field not in ('query', 'target'))):
+                        raise ValueError('Foldseek changed an alignment while calculating detailed scores.')
+                    hits[index] = full
+                elif _fs_qualifying_hit(hit):
+                    raise ValueError('Foldseek omitted detailed scores for an accepted candidate.')
+    return {'elapsed_seconds': _fs_time.monotonic() - started, 'pilot': manifest.get('pilot', False), 'references': _fs_library_reference_count(manifest), 'queries': queries, 'hits': hits, 'catalog': manifest.get('catalog', 'CDD')}
+
+def _fs_review_windows(hits, queries, index_maps, tested):
+    """Revisit provisional assignments without letting them block their own region."""
+    stronger = {root: set() for root in queries}
+    proposals = []
+    for hit in _fs_select_matches(hits, per_family=False):
+        root = hit['query']
+        indices = {index_maps[root][p] for p in hit['aligned_positions']}
+        first = max(0, min(indices) - 12)
+        last = min(len(queries[root]['positions']), max(indices) + 13)
+        runs, start = ([], None)
+        for index in range(first, last + 1):
+            available = index < last and index not in stronger[root]
+            if available and start is None:
+                start = index
+            elif not available and start is not None:
+                runs.append((start, index))
+                start = None
+        if runs:
+            a, b = max(runs, key=lambda span: sum((span[0] <= p < span[1] for p in indices)))
+            window = (root, a, b)
+            if sum((a <= p < b for p in indices)) >= 20 and (*window, 5000) not in tested:
+                proposals.append((hit['evalue'], hit['bits'], window))
+        stronger[root].update(indices)
+    counts, selected = ({}, [])
+    for _, _, window in sorted(proposals, key=lambda row: (-row[0], row[1])):
+        root = window[0]
+        if counts.get(root, 0) < 4 and window not in selected:
+            selected.append(window)
+            counts[root] = counts.get(root, 0) + 1
+    return selected
+
+def _fs_search_windows(queries, index_maps, covered, pass_hits, tested, depth):
+    """Propose unassigned stretches and bounded searches around plausible hits."""
+    windows = {}
+    for root, query in queries.items():
+        start = None
+        for index in range(len(query['positions']) + 1):
+            unassigned = index < len(query['positions']) and index not in covered[root]
+            if unassigned and start is None:
+                start = index
+            elif not unassigned and start is not None:
+                window = (root, start, index)
+                if index - start >= 20 and (*window, depth) not in tested:
+                    windows[f'residual{len(windows)}'] = window
+                start = None
+    focused = {root: [] for root in queries}
+    for hit in sorted(pass_hits, key=lambda h: (h['evalue'], -h['bits'])):
+        if _fs_qualifying_hit(hit) or hit['evalue'] > 10 or hit['tcov'] < 0.5 or (hit['alntmscore'] < 0.5) or (len(hit['aligned_positions']) < 20):
+            continue
+        root = hit['query']
+        indices = {index_maps[root][p] for p in hit['aligned_positions']}
+        if len(indices & covered[root]) >= 0.5 * len(indices) or len(focused[root]) >= 4:
+            continue
+        first, last = (max(0, min(indices) - 12), min(len(queries[root]['positions']), max(indices) + 13))
+        window = (root, first, last)
+        if (*window, depth) in tested or window in windows.values():
+            continue
+        if any((max(0, min(last, b) - max(first, a)) / max(last - first, b - a) >= 0.7 for a, b in focused[root])):
+            continue
+        focused[root].append((first, last))
+        windows[f'focus{len(windows)}'] = window
+    return windows
+
+def _fs_guided_windows(queries, guidance):
+    """Pad confident sequence boundaries and cover every remaining modeled residue."""
+    from bisect import bisect_left, bisect_right
+    windows = {}
+    useful = False
+    for root, query in queries.items():
+        positions = query['positions']
+        spans = set()
+        for a, b in (guidance or {}).get(root, []):
+            first, last = (bisect_left(positions, a), bisect_right(positions, b))
+            if last - first >= 20:
+                spans.add((max(0, first - 12), min(len(positions), last + 12)))
+        if not spans:
+            spans.add((0, len(positions)))
+        useful |= spans != {(0, len(positions))}
+        covered = set((i for a, b in spans for i in range(a, b)))
+        start = None
+        for i in range(len(positions) + 1):
+            if i < len(positions) and i not in covered:
+                if start is None:
+                    start = i
+            elif start is not None:
+                a, b = (max(0, start - 12), min(len(positions), i + 12))
+                a = max(0, min(a, b - 20))
+                b = min(len(positions), max(b, a + 20))
+                spans.add((a, b))
+                start = None
+        for first, last in sorted(spans):
+            windows[f'guided{len(windows)}'] = (root, first, last)
+    return windows if useful else {}
+
+def _fs_run_search(query_dir, queries, library, timeout=120, cancel=None, executable='foldseek', threads=_fs_DEFAULT_THREADS, progress=None, guidance=None, candidate_parallel=True):
+    """Revisit unassigned stretches and focus plausible below-cutoff placements."""
+    started = _fs_time.monotonic()
+    manifest = _fs_json.loads((_fs_Path(library) / 'manifest.json').read_text())
+    source_lines = {}
+    for identifier, query in queries.items():
+        lines = (_fs_Path(query_dir) / (identifier + '.pdb')).read_text().splitlines(keepends=True)
+        source_lines[identifier] = [line for line in lines if line.startswith('ATOM  ') and line[12:16].strip() == 'CA']
+        if len(source_lines[identifier]) != len(query['positions']):
+            raise ValueError('Query coordinate file does not match its residue index map.')
+    index_maps = {identifier: {p: i for i, p in enumerate(query['positions'])} for identifier, query in queries.items()}
+    covered = {identifier: set() for identifier in queries}
+    windows = {identifier: (identifier, 0, len(query['positions'])) for identifier, query in queries.items()}
+    tested, hits, result, final_review = (set(), [], None, False)
+    with _fs_tempfile.TemporaryDirectory(prefix='domain-repeat-') as directory:
+
+        def prepare(next_windows, name):
+            folder = _fs_Path(directory) / str(name)
+            folder.mkdir()
+            active = {}
+            for identifier, (root, first, last) in next_windows.items():
+                lines = [f'{line[:6]}{number:5d}{line[11:22]}{number:4d}{line[26:]}' for number, line in enumerate(source_lines[root][first:last], 1)]
+                (folder / (identifier + '.pdb')).write_text(''.join(lines) + 'TER\nEND\n')
+                active[identifier] = {'positions': queries[root]['positions'][first:last], 'label': queries[root].get('label', root)}
+            return (folder, active)
+        folder = _fs_Path(query_dir)
+        active_queries = queries
+        initial = _fs_guided_windows(queries, guidance)
+        if initial:
+            windows = initial
+            folder, active_queries = prepare(windows, 'guided')
+        review_after = 4 if initial else 3
+        search_round = 0
+        while True:
+            search_round += 1
+            guided = bool(initial) and search_round == 1
+            max_seqs = 5000 if final_review else 1000
+            remaining = timeout - (_fs_time.monotonic() - started)
+            if remaining <= 0:
+                raise TimeoutError('Foldseek search timed out.')
+            phase = 'Pfam-guided search' if guided else 'final review' if final_review else 'search'
+            message = f'{phase} pass {search_round}, {len(active_queries)} query region(s)'
+            report = (lambda message=message: progress(message)) if progress is not None else None
+            if report is not None:
+                report()
+            result = _fs__run_search_pass(folder, active_queries, library, remaining, cancel, executable, threads, report, manifest, max_seqs=max_seqs, evalue=0.01 if final_review or guided else 10, **{} if candidate_parallel else {'candidate_parallel': False})
+            for identifier, window in windows.items():
+                if not guided:
+                    tested.add((*window, max_seqs))
+            pass_hits = []
+            for hit in result['hits']:
+                root, first, last = windows[hit['query']]
+                hit['search_query'] = hit['query']
+                hit['query'] = root
+                hit['search_round'] = search_round
+                hit['prefilter_limit'] = max_seqs
+                hit['search_region'] = [queries[root]['positions'][first], queries[root]['positions'][last - 1]]
+                hit['original_query_length'] = len(queries[root]['positions'])
+                if guided:
+                    hit['search_strategy'] = 'pfam_guided'
+                hits.append(hit)
+                pass_hits.append(hit)
+            covered = {identifier: set() for identifier in queries}
+            for hit in _fs_select_matches(hits, per_family=False):
+                root = hit['query']
+                covered[root].update((index_maps[root][position] for position in hit['aligned_positions']))
+            if final_review:
+                next_windows = {key: window for key, window in _fs_search_windows(queries, index_maps, covered, pass_hits, tested, 5000).items() if key.startswith('residual')}
+                if not next_windows:
+                    break
+                folder, active_queries = prepare(next_windows, search_round)
+                windows = next_windows
+                continue
+            next_windows = _fs_search_windows(queries, index_maps, covered, pass_hits, tested, 1000)
+            if not next_windows or search_round >= review_after:
+                final_review = True
+                next_windows = _fs_search_windows(queries, index_maps, covered, pass_hits, tested, 5000)
+                for window in _fs_review_windows(hits, queries, index_maps, tested):
+                    if window not in next_windows.values():
+                        next_windows[f'review{len(next_windows)}'] = window
+            if not next_windows:
+                break
+            folder, active_queries = prepare(next_windows, search_round)
+            windows = next_windows
+    return {**result, 'queries': queries, 'hits': sorted(hits, key=lambda h: (h['evalue'], -h['bits'])), 'elapsed_seconds': _fs_time.monotonic() - started, 'search_rounds': search_round}
+
+_DOMAIN_SEARCH_RUNTIME = _RuntimeNamespace('_fs_')
+
+# END INTEGRATED DOMAIN RUNTIME
+
+
 _PFAM_API = "https://www.ebi.ac.uk/Tools/hmmer/api/v1"
 _PFAM_POLL_SECONDS = 5
 _PFAM_CACHE_VERSION = 3
@@ -3735,7 +5206,6 @@ _PFAM_TENTATIVE_OVERLAP = 0.5
 _DOMAIN_BROWSER_VERSION = 21
 _DOMAIN_BROWSER_IMPLEMENTATION = object()
 _DOMAIN_INFO_RENDER_VERSION = 3
-_DOMAIN_EXEMPLAR_MODULE = None
 _DOMAIN_INFO_ENRICH_VERSION = 2
 _INTERPRO_CACHE_VERSION = 2
 
@@ -3749,21 +5219,10 @@ def _sequence_feature_kind(hit):
                             "active_site", "binding_site", "conserved_site", "ptm", "site"} else None
 
 
-def _sequence_feature_backend():
-    import importlib.util
-    from pathlib import Path
 
-    path = Path(__file__).with_name("sequence_features.py")
-    stamp = (str(path), path.stat().st_mtime_ns)
-    cached = globals().get("_SEQUENCE_FEATURE_MODULE_CACHE")
-    if cached is None or cached[0] != stamp:
-        spec = importlib.util.spec_from_file_location("trimmings_sequence_features", path)
-        module = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(module)
-        globals()["_SEQUENCE_FEATURE_MODULE_CACHE"] = stamp, module
-    else:
-        module = cached[1]
-    return module
+
+def _sequence_feature_backend():
+    return _SEQUENCE_FEATURE_RUNTIME
 
 
 def _start_domain_features(entries, options, timeout, cancel, report):
@@ -3818,24 +5277,9 @@ def _domain_completion_counts(records):
 
 
 def _pfam_local_backend(database=None, library=None):
-    import importlib.util
     from pathlib import Path
-
-    path = Path(__file__).with_name("domain_pfam.py")
-    if not path.is_file():
-        if database:
-            raise ValueError("Put domain_pfam.py beside chimerax_trimmings.py for local Pfam searches.")
-        return None
-    stamp = (str(path), path.stat().st_mtime_ns)
-    cached = globals().get("_PFAM_MODULE_CACHE")
-    if cached is None or cached[0] != stamp:
-        spec = importlib.util.spec_from_file_location("trimmings_domain_pfam", path)
-        module = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(module)
-        globals()["_PFAM_MODULE_CACHE"] = stamp, module
-    else:
-        module = cached[1]
-    backend = module.discover(path.parent, database, library)
+    module = _PFAM_LOCAL_RUNTIME
+    backend = module.discover(Path(__file__).parent, database, library)
     return {**backend, "module": module} if backend else None
 
 
@@ -5417,17 +6861,7 @@ def _prefetch_domain_info(session, records):
 
 
 def _domain_exemplar_module():
-    global _DOMAIN_EXEMPLAR_MODULE
-    if _DOMAIN_EXEMPLAR_MODULE is None:
-        import importlib.util
-        from pathlib import Path
-        path = Path(__file__).with_name('domain_exemplars.py')
-        if not path.is_file():
-            raise ValueError('Place domain_exemplars.py beside chimerax_trimmings.py to fetch aligned exemplars.')
-        spec = importlib.util.spec_from_file_location('trimmings_domain_exemplars', path)
-        _DOMAIN_EXEMPLAR_MODULE = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(_DOMAIN_EXEMPLAR_MODULE)
-    return _DOMAIN_EXEMPLAR_MODULE
+    return _DOMAIN_EXEMPLAR_RUNTIME
 
 
 def _domain_exemplar_state(session):
@@ -6246,16 +7680,7 @@ def domains_cancel(session):
 
 
 def _foldseek_module():
-    import importlib.util
-    from pathlib import Path
-
-    path = Path(__file__).with_name("domain_foldseek.py")
-    if not path.is_file():
-        raise ValueError("Place domain_foldseek.py beside chimerax_trimmings.py to enable local structural searches.")
-    spec = importlib.util.spec_from_file_location("trimmings_domain_foldseek", path)
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module
+    return _DOMAIN_SEARCH_RUNTIME
 
 
 def _foldseek_segments(positions):
@@ -6388,6 +7813,8 @@ def _foldseek_default_library():
     root = Path(__file__).parent / ".domain_data"
     settings = root / "default-library.json"
     if not settings.is_file():
+        if (root / 'ecod-cdd' / 'manifest.json').is_file():
+            return root / 'ecod-cdd'
         return root / "cdd-pilot"
     data = json.loads(settings.read_text())
     relative = data.get("library") if isinstance(data, dict) else None
