@@ -22,20 +22,16 @@ Windows note: the Startup preferences are typically reached from the `Favorites`
 
 ## Local domain library
 
-1. Install [Foldseek](https://github.com/steineggerlab/foldseek#installation).
-   On macOS: `brew install foldseek`.
-2. In ChimeraX:
+Install [Foldseek](https://github.com/steineggerlab/foldseek#installation)
+(macOS: `brew install foldseek`), then run:
 
 ```chimerax
 domains #1 source foldseek
 ```
 
-On first use, the library downloads (~676 MB) and installs automatically, with
-progress in the status bar. The search then starts. Use `domains cancel` to stop;
-rerun the command to resume the download.
-
-For a library stored elsewhere, add `library "/path/to/ecod-cdd"`.
-The library contains ECOD/CDD references; some protein families remain unrepresented.
+The ECOD/CDD library (~676 MB) downloads and installs automatically on first use,
+with status-bar progress. The search starts when ready. Use `domains cancel` to
+stop; rerun to resume.
 
 ## Companion Script
 
