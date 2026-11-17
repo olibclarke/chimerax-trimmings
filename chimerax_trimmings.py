@@ -4985,7 +4985,8 @@ def _fs__run_search_pass(query_dir, queries, library, timeout=120, cancel=None, 
         def convert(source, destination, fields):
             run('convertalis', query_db, database, source, destination, '--threads', command_threads, '--format-output', ','.join(fields), '--exact-tmscore', '1')
         run('createdb', query_dir, query_db, '--threads', command_threads, '--chain-name-mode', '0')
-        parallel = candidate_parallel and command_threads > 1 and (len(queries) <= command_threads // 2) and (max((len(query['positions']) for query in queries.values())) >= 256) and (_fs_library_reference_count(manifest) >= 512) and _fs_Path(str(query_db) + '_ss').is_file() and _fs_Path(str(database) + '_ss').is_file() and (not any((_fs_Path(str(database) + suffix).exists() for suffix in ('.idx', '_ss.idx'))))
+        query_lengths = [len(query['positions']) for query in queries.values()]
+        parallel = candidate_parallel and command_threads > 1 and (max(query_lengths) >= 256) and (max(query_lengths) * command_threads >= 2 * sum(query_lengths)) and (_fs_library_reference_count(manifest) >= 512) and _fs_Path(str(query_db) + '_ss').is_file() and _fs_Path(str(database) + '_ss').is_file() and (not any((_fs_Path(str(database) + suffix).exists() for suffix in ('.idx', '_ss.idx'))))
         if parallel:
             _fs__candidate_parallel_alignment(query_db, database, alignment_db, directory / 'candidate-shards', command_threads, started + timeout, cancel, progress, executable, max_seqs, evalue)
         else:
