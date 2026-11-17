@@ -7806,6 +7806,219 @@ def _domain_structural_display_boundaries(entry, hits):
     return selected
 
 
+_DOMAIN_LIBRARY_RELEASE = {
+    "url": "https://github.com/olibclarke/chimerax-trimmings/releases/download/domains-2026-11-17/trimmings-ecod-cdd-v295.2.tar.gz",
+    "sha256": "fe9d8d6a0cf780c9d9da2b7a5cb6f5d66c24a8f03afc6164bccc3a5b1a939bd1",
+    "bytes": 675634414,
+}
+
+
+def _install_domain_library(library, cancel, progress):
+    """Resume, verify and atomically install the pinned public library."""
+    from hashlib import sha256
+    import json
+    import os
+    from pathlib import Path, PurePosixPath
+    import shutil
+    import tarfile
+    import tempfile
+    from time import monotonic
+    from urllib.error import URLError
+    from urllib.request import Request, urlopen
+
+    library = Path(library)
+    library.parent.mkdir(parents=True, exist_ok=True)
+    release = _DOMAIN_LIBRARY_RELEASE
+    archive = library.parent / (release["sha256"] + ".tar.gz.part")
+    deadline = monotonic() + 7200
+
+    def check():
+        if cancel.is_set():
+            raise InterruptedError("Domain library installation cancelled; rerun the command to resume.")
+        if monotonic() > deadline:
+            raise TimeoutError("Domain library download timed out; rerun the command to resume.")
+
+    # OS locks are released on exit/crash; the small lock file may remain.
+    with (library.parent / ".domain-library-install.lock").open("a+b") as lock:
+        try:
+            if os.name == "nt":
+                import msvcrt
+                lock.write(b"\0")
+                lock.flush()
+                lock.seek(0)
+                msvcrt.locking(lock.fileno(), msvcrt.LK_NBLCK, 1)
+            else:
+                import fcntl
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            raise ValueError("Another ChimeraX instance is installing the domain library. Retry when it finishes.") from None
+        check()
+        if (library / "manifest.json").is_file():
+            return
+        if library.exists():
+            raise ValueError(f"An incomplete library already exists at {library}. Move it aside and rerun the command.")
+        if shutil.disk_usage(library.parent).free < 3 * 1024 ** 3:
+            raise ValueError("Installing the domain library needs at least 3 GB of free disk space.")
+        if archive.is_file() and archive.stat().st_size > release["bytes"]:
+            archive.unlink()
+        for attempt in range(3):
+            check()
+            offset = archive.stat().st_size if archive.is_file() else 0
+            if offset == release["bytes"]:
+                break
+            headers = {"User-Agent": "ChimeraX-Trimmings/1.0", "Accept-Encoding": "identity"}
+            if offset:
+                headers["Range"] = f"bytes={offset}-"
+            progress(f"Downloading domain library: {offset / 1e6:.0f} / {release['bytes'] / 1e6:.0f} MB")
+            try:
+                with urlopen(Request(release["url"], headers=headers), timeout=30) as response:
+                    append = response.status == 206 and offset > 0
+                    if response.status == 206:
+                        content_range = response.headers.get("Content-Range", "")
+                        if not content_range.startswith(f"bytes {offset}-") or not content_range.endswith(f"/{release['bytes']}"):
+                            raise ValueError("The library server returned an invalid download range. Rerun the command.")
+                    elif response.status != 200:
+                        raise ValueError(f"Library download returned HTTP {response.status}.")
+                    if not append:
+                        offset = 0
+                    updated = 0
+                    with archive.open("ab" if append else "wb") as stream:
+                        while True:
+                            check()
+                            chunk = response.read(1024 * 1024)
+                            if not chunk:
+                                break
+                            if offset + len(chunk) > release["bytes"]:
+                                raise ValueError("The library download is larger than the published release.")
+                            stream.write(chunk)
+                            offset += len(chunk)
+                            now = monotonic()
+                            if now - updated >= 0.25 or offset == release["bytes"]:
+                                progress(f"Downloading domain library: {100 * offset / release['bytes']:.0f}% "
+                                         f"({offset / 1e6:.0f} / {release['bytes'] / 1e6:.0f} MB)")
+                                updated = now
+                if offset != release["bytes"]:
+                    raise OSError("The library download was interrupted.")
+                break
+            except (OSError, URLError) as error:
+                check()
+                if attempt == 2:
+                    raise OSError(f"Cannot download the domain library: {error}. Check your connection and rerun to resume.") from None
+                progress("Domain library download interrupted; retrying…")
+                cancel.wait(1)
+        progress("Verifying domain library checksum…")
+        digest = sha256()
+        with archive.open("rb") as stream:
+            while chunk := stream.read(1024 * 1024):
+                check()
+                digest.update(chunk)
+        if digest.hexdigest() != release["sha256"]:
+            archive.unlink()
+            raise ValueError("Domain library checksum failed. Rerun the command to download a fresh copy.")
+        progress("Installing domain library…")
+        with tempfile.TemporaryDirectory(prefix=".domain-library-", dir=library.parent) as temporary:
+            destination = Path(temporary)
+            extracted, updated = 0, 0
+            with tarfile.open(archive, "r|gz") as bundle:
+                for member in bundle:
+                    check()
+                    relative = PurePosixPath(member.name)
+                    if (relative.is_absolute() or ".." in relative.parts or "\\" in member.name or ":" in member.name
+                            or not relative.parts or relative.parts[0] != "ecod-cdd"
+                            or not (member.isdir() or member.isfile())):
+                        raise ValueError("Invalid file in the domain library archive.")
+                    target = destination.joinpath(*relative.parts)
+                    if member.isdir():
+                        target.mkdir(parents=True, exist_ok=True)
+                        continue
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    with bundle.extractfile(member) as source, target.open("xb") as output:
+                        while chunk := source.read(1024 * 1024):
+                            check()
+                            output.write(chunk)
+                            extracted += len(chunk)
+                            now = monotonic()
+                            if now - updated >= 0.25:
+                                progress(f"Installing domain library: {extracted / 1e6:.0f} MB extracted")
+                                updated = now
+            prepared = destination / "ecod-cdd"
+            manifest = json.loads((prepared / "manifest.json").read_text())
+            if manifest.get("schema") != 2 or manifest.get("reference_count", 0) <= 0:
+                raise ValueError("The downloaded domain library has an invalid manifest.")
+            database = _fs_library_file(prepared, manifest["database"])
+            for path in [database, *[Path(str(database) + suffix) for suffix in
+                         (".dbtype", ".index", "_ss", "_ss.dbtype", "_ss.index", "_ca", "_ca.dbtype", "_ca.index")],
+                         _fs_library_file(prepared, manifest["reference_metadata"])]:
+                if not path.is_file():
+                    raise ValueError("The downloaded domain library is incomplete: " + path.name)
+            check()
+            prepared.rename(library)
+        archive.unlink()
+
+
+def _install_domain_library_then_search(session, atoms, library, options):
+    """Keep installation off the GUI thread and continue the original command."""
+    from threading import Event, Thread
+    from time import monotonic
+    from chimerax.core.errors import UserError
+
+    cancel, started = Event(), monotonic()
+    session._trimmings_domain_job = cancel
+    synchronous = options["wait"] or not session.ui.is_gui
+
+    def status(message):
+        if getattr(session, "_trimmings_domain_job", None) is cancel and not cancel.is_set():
+            session.logger.status(f"{message} ({int(monotonic() - started)}s elapsed)", blank_after=0)
+
+    def progress(message):
+        if synchronous:
+            status(message)
+        else:
+            session.ui.thread_safe(status, message)
+
+    def finish(error):
+        if getattr(session, "_trimmings_domain_job", None) is not cancel:
+            return
+        session._trimmings_domain_job = None
+        if cancel.is_set():
+            return
+        if error is not None:
+            message = f"Domain library installation failed: {error}"
+            session.logger.status(message)
+            if synchronous:
+                raise UserError(message)
+            session.logger.error(message)
+            return
+        session.logger.info(f"Domain library installed at {library}. Starting Foldseek search.")
+        session.logger.status("Domain library installed. Starting Foldseek search…")
+        try:
+            _annotate_foldseek(session, atoms, str(library), **options)
+        except UserError as error:
+            if synchronous:
+                raise
+            session.logger.status(str(error))
+            session.logger.error(str(error))
+
+    def install():
+        try:
+            _install_domain_library(library, cancel, progress)
+            error = None
+        except Exception as error_value:
+            error = error_value
+        if synchronous:
+            finish(error)
+        else:
+            session.ui.thread_safe(finish, error)
+
+    session.logger.info("Downloading the domain library on first use (~676 MB). "
+                        "The search will start automatically. Use 'domains cancel' to stop; rerun to resume.")
+    status("Preparing domain library download…")
+    if synchronous:
+        install()
+    else:
+        Thread(target=install, name="ChimeraX domain library install", daemon=True).start()
+
+
 def _foldseek_default_library():
     from pathlib import Path
     import json
@@ -7815,7 +8028,9 @@ def _foldseek_default_library():
     if not settings.is_file():
         if (root / 'ecod-cdd' / 'manifest.json').is_file():
             return root / 'ecod-cdd'
-        return root / "cdd-pilot"
+        if (root / 'cdd-pilot' / 'manifest.json').is_file():
+            return root / 'cdd-pilot'
+        return root / "ecod-cdd"
     data = json.loads(settings.read_text())
     relative = data.get("library") if isinstance(data, dict) else None
     if not isinstance(relative, str) or not relative or Path(relative).is_absolute():
@@ -8077,7 +8292,14 @@ def _annotate_foldseek(session, atoms, library, regions, color, refresh, timeout
 
     try:
         module = _foldseek_module()
+        automatic_library = library is None
         library = Path(library).expanduser().resolve() if library else _foldseek_default_library()
+        if automatic_library and not (library / "manifest.json").is_file():
+            _domain_chain_inputs(atoms)
+            return _install_domain_library_then_search(session, atoms, library, dict(
+                regions=regions, color=color, refresh=refresh, timeout=timeout, wait=wait, gui=gui,
+                pfam_guided=pfam_guided, deduplicate=deduplicate, pfam_backend=pfam_backend,
+                pfam_database=pfam_database, feature_options=feature_options))
         manifest_text = (library / "manifest.json").read_text()
         manifest = json.loads(manifest_text)
         guidance_backend = _pfam_backend(pfam_backend, pfam_database, library) if pfam_guided else None

@@ -24,13 +24,15 @@ Windows note: the Startup preferences are typically reached from the `Favorites`
 
 1. Install [Foldseek](https://github.com/steineggerlab/foldseek#installation).
    On macOS: `brew install foldseek`.
-2. Download the [domain library](https://github.com/olibclarke/chimerax-trimmings/releases/download/domains-2026-11-17/trimmings-ecod-cdd-v295.2.tar.gz).
-   Extract it and put the `ecod-cdd` folder inside `.domain_data` in this repository.
-3. In ChimeraX:
+2. In ChimeraX:
 
 ```chimerax
 domains #1 source foldseek
 ```
+
+On first use, the library downloads (~676 MB) and installs automatically, with
+progress in the status bar. The search then starts. Use `domains cancel` to stop;
+rerun the command to resume the download.
 
 For a library stored elsewhere, add `library "/path/to/ecod-cdd"`.
 The library contains ECOD/CDD references; some protein families remain unrepresented.
