@@ -1,21 +1,49 @@
-# chimerax-trimmings
-Useful aliases and startup settings for UCSF ChimeraX \(https://www.cgl.ucsf.edu/chimerax/). Add these to the "Startup" section of the "Preferences" pane and restart ChimeraX in order to have them take effect. _(Note: Some of these will only work with recent builds of ChimeraX)_. 
+# ChimeraX Trimmings
 
-For more graphics space on a small screen, open a tool from the Tools menu, right-click its window, and uncheck **Dockable tool**. It will remain a separate window instead of snapping to the main GUI. This preference persists across ChimeraX restarts.
+A compact UCSF ChimeraX setup for interactive model and map work.
+
+[MIT licensed](LICENSE). Database attribution and optional-service terms: [THIRD_PARTY.md](THIRD_PARTY.md).
 
 This repository contains:
 
-- `chimerax_trimmings.txt`: Startup commands, aliases, keybindings, and Shortcut buttonpanel setup.
-- `chimerax_trimmings.py`: Companion ChimeraX Python commands, including shape alignment of atomic models and density maps. See [SHAPE_ALIGN.md](SHAPE_ALIGN.md).
-- `map_salami.py`: Experimental script that , if invoked via runscript, adds a command `map_salami`, which automates the generation of section-by-section map/model density fit figures (can run as `map_salami model #1 selection /A:100-220 map #2 zone 2 patches 3 movie true movie_resolution 1080p segment_size 40 image_height 2000 output_dir ~/Desktop/map_salami_panels`, everything except for map & model is optional; patches controls `MaxComponents` of surface, defaults to `None`; `movie_resolution` can be either 4k or 1080p, defaults to 1080p; `zone` is the surface zone clipping offset, defaults to 2 Å; `segment_size` is the residue range chunk to use, defaults to 40 but will expand to include entire helix/strand or short terminal segments if needed.)
+- [chimerax_trimmings.txt](chimerax_trimmings.txt): startup commands, aliases, keybindings, and button-panel setup
+- [chimerax_trimmings.py](chimerax_trimmings.py): companion ChimeraX Python commands, including fast shape alignment and experimental whole-structure gradient scoring
+- [map_salami.py](map_salami.py): map/model-fit panel and movie export
 
 ## Installation
 
-1. Put `chimerax_trimmings.txt`, `chimerax_trimmings.py`, and `map_salami.py` somewhere permanent on your machine.
-2. Edit the first two lines of `chimerax_trimmings.txt` so the `runscript` paths point to your local copies of the two Python scripts. If upgrading, remove any older separate `runscript` line for `shape_align.py` from Startup preferences; its commands are now included in the main script.
-3. Open ChimeraX Preferences and select Startup. On macOS, Preferences is in the UCSF ChimeraX application menu.
-4. Paste the contents of your edited `chimerax_trimmings.txt` into the startup commands box.
+1. Download or clone this repository to a permanent folder. Keep its Python files together.
+2. Edit the first two lines of [chimerax_trimmings.txt](chimerax_trimmings.txt) so the `runscript` paths point to your local copies of the Python scripts. Remove any older separate `runscript` line for `shape_align.py`; its commands are now included in the main script.
+3. In ChimeraX on macOS, open `UCSF ChimeraX -> Preferences... -> Startup`.
+4. Paste the contents of [chimerax_trimmings.txt](chimerax_trimmings.txt) into the startup commands box, or source it from a startup file you already maintain.
 5. Restart ChimeraX.
+
+Windows note: the Startup preferences are typically reached from the `Favorites` menu rather than the application menu.
+
+## Local domain library
+
+1. Install [Foldseek](https://github.com/steineggerlab/foldseek#installation)
+   (macOS: `brew install foldseek`; Linux: follow the linked instructions).
+2. Download the [library](https://github.com/olibclarke/chimerax-trimmings/releases/download/domains-2026-11-17/trimmings-ecod-cdd-v295.2.tar.gz)
+   ([SHA256](https://github.com/olibclarke/chimerax-trimmings/releases/download/domains-2026-11-17/trimmings-ecod-cdd-v295.2.tar.gz.sha256)).
+   From this repository's folder, extract it:
+
+```bash
+mkdir -p .domain_data
+tar -xzf ~/Downloads/trimmings-ecod-cdd-v295.2.tar.gz -C .domain_data
+```
+
+3. In ChimeraX, after loading the helper:
+
+```chimerax
+domains #1 source foldseek library "/absolute/path/to/chimerax-trimmings/.domain_data/ecod-cdd"
+```
+
+The bundle has 456,934 ECOD/CDD references with Pfam annotation support;
+it does not cover every Pfam family. Searching needs neither HMMER nor Gemmi.
+Browse matches, fetch/align exemplar domains, or show their full-structure context.
+Queries stay local; descriptions/exemplars use public services. Stop with `domains cancel`.
+[Library details and upstream alternative](DOMAIN_LIBRARY.md) · [Search options](DOMAIN_FOLDSEEK.md) · [Build Pfam templates](PFAM_LIBRARY.md).
 
 ## Companion Script
 
@@ -23,10 +51,14 @@ The Python script registers:
 
 - `nextmodel`
 - `prevmodel`
+- `nextitem`
+- `previtem`
+- `lowermapthreshold`
+- `raisemapthreshold`
 - `togglemaps`
 - `togglemodels`
-- `reorient`
-- `modelmotion`
+- `cyclelighting`
+- `cyclemodeldisplay`
 - `exposedhydrophobics`
 - `hydrophobicpatches`
 - `patchbrowser`
@@ -37,7 +69,7 @@ The Python script registers:
 - `tmsegments`
 - `tmsegments cancel`
 
-`togglemaps` and `togglemodels` toggle the currently displayed maps/models on/off. `reorient` attempts to orient the view in a sensible direction - aligning the view to the shortest axis of an ellipsoid defined by the visible components - and repeated invocations of the command cycle through alignment to other axes of the ellipsoid. `modelmotion` activates & freezes selected models for motion, in order to mimick the behavior of legacy Chimera, described in more detail below.
+`togglemaps` and `togglemodels` are stateful hide/restore commands. `cyclemodeldisplay` cycles the currently shown atomic models through the saved original display state plus several preset representations.
 
 ## Fast Shape Alignment
 
@@ -101,51 +133,286 @@ and practical limitations.
 ```chimerax
 domains #1
 domains #1 source interpro
+domains #1 source foldseek
 domains #1-3
 domains #1/A color false
+domains #1 source pfam include_tentative false
+domains #1 source pfam pfam_backend online
+domains #1 features false
+domains #1 source features
+domains #1 source features prosite_profiles true
+domains #1 source tmsegments
+domains #1 source tmsegments results /path/predicted_topologies.3line
 domainbrowser #2
 domains cancel
 ```
 
-**Sources.** Pfam sends each full chain sequence to the
-[EMBL-EBI HMMER API](https://hmmer-web-docs.readthedocs.io/en/latest/api.html)
-for a new search using fixed, curated family cutoffs. InterPro sends sequence
+**Sources.** Pfam automatically uses an installed local Pfam/HMMER bundle when
+available, otherwise it sends each distinct full chain sequence to the
+[EMBL-EBI HMMER API](https://hmmer-web-docs.readthedocs.io/en/latest/api.html).
+Both use curated family cutoffs. Local searches also retry padded regions with
+ordinary HMMER settings and retain reported tentative candidates. InterPro sends sequence
 checksums to the [InterPro Matches API](https://github.com/ProteinsWebTeam/interpro-matches-api)
 and retrieves existing matches from databases including SUPERFAMILY, CATH-Gene3D,
 Pfam, SMART, and CDD. It can provide broader coverage, but requires the exact
 sequence to be indexed; use Pfam for novel or modified sequences.
 
+Local Pfam is optional: keep `domain_pfam.py` beside the main helper and install
+HMMER plus a pressed Pfam database with matching family metadata. The
+[Pfam builder](PFAM_LIBRARY.md#use-the-profiles-in-chimerax) prepares this bundle
+before structural-library construction finishes. Automatic discovery checks
+`CHIMERAX_PFAM_DB`, profiles bundled with the configured structural library, and
+`.domain_data/*/profiles/Pfam*/Pfam-A.hmm`. Use `pfam_database "/path/Pfam-A.hmm"`
+for another installation. No profiles are downloaded automatically.
+
+`pfam_backend auto` is the default. An unavailable or failed local backend falls
+back to the online service, with the backend recorded in the Log. A valid empty
+local result stays local. `pfam_backend local` requires local resources and never
+submits sequences online; `pfam_backend online` always uses the service. These
+settings also apply to `pfam_guided true` Foldseek searches. Local details show
+the profile release, profile coverage, and any padded retry range. Changing the
+backend, database, or local executables invalidates the search cache. Online and
+local results can differ because their Pfam releases differ.
+
+An optional **local Foldseek search** compares the loaded coordinates with
+domain references. The workspace default retains ECOD/CDD's complete structural
+reference collection with [audited Pfam mappings](DOMAIN_LIBRARY.md#add-pfam-annotation-without-rebuilding-the-structures).
+Matches with localized sequence-profile support use Pfam names, accessions and InterPro descriptions; original
+ECOD classifications and reference links remain in the details. Localized,
+complete profile signatures take precedence over inconsistent family-wide
+cross-references. Unsupported mappings retain fold-level ECOD labels and do not
+supply Pfam functional descriptions. Names, accessions, descriptions and example
+structures use the same validated family, including when reusing cached hits.
+A [Pfam-only library](PFAM_LIBRARY.md#use-the-published-pfam-foldseek-library)
+uses consistent Pfam accessions for InterPro descriptions and example structures,
+including templates whose coordinates originally came from ECOD. The verified
+workspace snapshot covers **46,654 of 52,484** folded-scope families; its coverage
+audit records the remaining gaps. A [bulk installer](DOMAIN_LIBRARY.md) provides the complete
+published ECOD F40 database (456,394 targets) and supports merging custom
+references. A small experimental CDD pilot is available, plus a
+resumable CDD-wide builder using sequence-verified PDB and AlphaFold crops.
+A [Pfam-first builder](PFAM_LIBRARY.md) bundles every profile in a pinned Pfam
+release and fills structural-reference gaps with a resumable, audited pipeline.
+The [InterPro-guided completion pass](PFAM_LIBRARY.md#interpro-guided-folded-domain-completion)
+uses annotated PDB/AlphaFold occurrences to fill gaps in a folded-domain target,
+keeping motifs and disorder separate from structural templates. Full Pfam
+sequence profiles remain available regardless of structural scope.
+Both use C-alpha-only references and display structural candidates, scores,
+and reference links in the same browser. Foldseek retries unassigned stretches
+and plausible candidate regions at domain scale, using the same acceptance
+cutoffs on every pass. A broader final review revisits provisional assignments
+so weaker early matches cannot block better alternatives. Exact display-only
+scores are deferred until a candidate passes the annotation filters. Independent
+exact-score calculations are balanced across the existing four-thread CPU budget.
+Sequence-identical copies with the same modeled query positions share one
+representative search by default; results map back to each copy's own residues.
+Use `deduplicate false` to compare their individual conformations.
+An optional `pfam_guided true` first searches distinct sequences with the selected
+Pfam backend, then searches padded Pfam regions and every remaining stretch with Foldseek.
+Curated Pfam assignments retain overlapping Foldseek evidence in their details.
+Unresolved regions still receive the extensive structural fallback search.
+See
+[Local structural domain matching](DOMAIN_FOLDSEEK.md) for setup, selected-region
+queries, the pilot benchmark, and its limited coverage.
+
 Matches describe domains, repeats, families, and superfamilies; they may overlap
-or leave regions unannotated. Boundaries follow database alignments, including
-missing residues and insertion codes, rather than partitioning the structure
-geometrically. There is no adjustable confidence threshold. Matching annotations
+or leave regions unannotated. Boundaries start from database alignments, retaining
+missing residues and insertion codes. Foldseek colors and selects the complete matched range, filling
+internal alignment gaps while preserving explicitly separate query pieces.
+Adjacent structural matches can share a display boundary, refined locally using
+C-alpha contacts and secondary structure when supported. Inserted domains and
+sequence annotations remain separate. Scoring retains the actual paired residues;
+details identify adjusted display boundaries. There is no adjustable confidence threshold. Matching annotations
 share colors across models; unassigned target residues are gray. Only residues
-in the requested selection receive colors and attributes.
+in the requested selection receive new annotations and attributes.
+Family colors are allocated together using perceptual color and hue separation,
+with extra contrast for neighbors in the sequence or in space.
+Different signatures keep separate colors even when they share an integrated
+InterPro entry; copies of the same signature retain the same color across models.
+If a new neighboring assignment requires a color change, existing analyzed copies
+are updated together, with Undo/Redo support. `color false` preserves colors.
+Browser swatches reflect the actual ribbon colors. Fully covered alternative
+assignments have a crossed, empty swatch and an explanation instead of an unused
+family color; higher-priority assignments control their overlapping residues.
 
 **Browser.** Results persist across searches. Choose a model from the **Model**
-dropdown or use **< / >** to cycle through analyzed models. Each model remembers
-its current domain. **Show only selected model** hides other atomic structures;
-Undo restores visibility. Click a domain or use **Previous / Next** to select
+dropdown or use **< / >** to cycle through analyzed models. The model arrow
+buttons automatically show only the selected atomic model; Undo restores prior
+visibility. Each model remembers its current domain. **Show only selected model**
+also hides other atomic structures. Click a domain or use **Previous / Next** to select
 its residues. **Auto-center on domain**, **Focus domain**, and **Restore view**
 control the camera. Switching models alone keeps the current view and selection.
+The list is organized by domain/feature signature, including for a single model.
+Each expandable parent shows its copy count and collates occurrences across chains
+and models. Selecting a parent selects all listed copies; expand it to select an
+individual occurrence and inspect its scores. **Previous / Next** moves between
+groups when a parent is selected, or between occurrences when a child is selected.
+The model dropdown and **Nearby / Selected** filters apply before grouping, so
+copy counts describe the current view. A group spanning multiple models has no
+single model for **Show only selected model**; select a child or choose a model.
 
-Details load automatically: available function descriptions, InterPro/GO
-annotations, database links, and representative or example PDB structures.
+Use **Nearby** to identify annotated domains around the current center of rotation
+(default radius **6 Å**, measured to the nearest domain atom in visible models).
+Use **Selected** to list every annotation overlapping the selected residues.
+Both tabs update automatically and respect the Model filter. Automatic updates
+show details without changing the selection or camera; clicking a row uses the
+usual domain selection and focus controls. **All domains** restores the full list.
+
+Details prefetch in the background across analyzed models: available function
+descriptions, InterPro/GO annotations, database links, and example PDB structures.
+The selected entry takes priority. Successful remote lookups are cached on disk
+for 14 days; descriptions and formatted details are reused within the session.
+For Foldseek hits with localized Pfam support, available InterPro/Pfam
+descriptions and example PDBs take priority. Unverified ECOD family-level links
+remain candidate links; the displayed region keeps its structural classification.
+Local library descriptions provide a
+fallback, and the matched structural reference remains linked.
+Keep `domain_exemplars.py` beside the main helper to enable the **Structures**
+controls where source coordinates and domain boundaries are known.
+This includes PDB-backed ECOD matches and AlphaFold-derived ECOD references
+identified as `<UniProt>_F1_nD<number>`, including their discontinuous boundaries.
+ECOD domains use the exact **Download Domain PDB** endpoint from their ECOD page;
+the full PDB or AlphaFold model is fitted to that domain for hidden context.
+AlphaFold source identity, model coverage and chain are checked against its API;
+unknown prediction identifiers are not guessed. The current AlphaFold model is
+retrieved, which may differ in version from ECOD's original template.
+Other ECOD identifiers still offer their exact domain download; when the full
+source cannot be identified, only the domain is loaded and context is marked unavailable.
+**Fetch & align domain** downloads the structure in the background,
+fits its mapped domain to the selected occurrence with ChimeraX Matchmaker,
+and shows a separate domain model. The full structure is also loaded, hidden
+by default, with exactly the same alignment. **Show full context / Hide context**
+switches between them; the domain is gold and its surrounding structure gray.
+Fetching or realigning frames the visible exemplar; switching context refits
+the view and clipping to the domain or full structure and centers rotation there.
+Each has its own model entry. **Realign domain** updates the fit after moving
+the query. Alignment uses mapped domain residues, preserves discontinuous
+regions, and reports the fitted residue count and RMSD. Coordinate downloads
+are cached for 14 days. The query's coordinates and colors are unchanged.
+PDB exemplars include DOI/PubMed links to their deposited primary structure paper
+when available. Publications load separately in the background and are cached per
+PDB entry across families and models.
 These describe the family; functions and specificity can differ between members.
-**Reload details** retries metadata retrieval without repeating the search.
+**Reload details** bypasses the description cache without repeating the search.
+Example PDBs require a matching domain mapped onto a crystallized chain;
+membership of the parent protein or a shared paper is insufficient. Details show
+the matched family, chain, and residue range. Older unverified structure lists
+are refreshed in the background. Citation cleanup also repairs separators left
+in cached descriptions. After reloading the helper, `domainbrowser` replaces an
+open panel from the previous script instance without rerunning domain searches.
+
+**Sequence features.** Domain searches also run SEG low-complexity detection and
+PROSITE pattern matching by default, using Python's standard library. Local scans
+run alongside the domain lookup, share cancellation, and apply together in one Undo
+action. Use `features false` to skip these additional scans, or
+`domains #1 source features` to run feature analysis alone. The current browser
+view is preserved when domains and features are analyzed together.
+The feature helper downloads the public PROSITE definitions once (about 26 MB), then works offline;
+no sequences are sent for local scans. Use `prosite_database "/path/prosite.dat"`
+to supply definitions offline. If the download fails, SEG results are still returned.
+The original SIB definition file and its license notice are retained unchanged.
+
+**Transmembrane features.** `domains #1 source tmsegments` predicts membrane
+segments with the existing DeepTMHMM/BioLib backend and preserves domain colors.
+Use `results "/path/predicted_topologies.3line"` to import predictions offline, or
+`python "/path/to/biolib/venv/bin/python"` for another configured client. Both
+`tmsegments` and this source add separate **TM helix** and **TM beta strand** groups
+to **Sequence features**, with per-chain segment numbers, selectable copies, and
+**Nearby / Selected** filtering. Later domain/local-feature searches retain them.
+DeepTMHMM runs only when explicitly requested; ordinary domain searches do not
+submit remote topology predictions. Both routes reuse the same session cache and
+complete-chain mapping, and support Undo/Redo. Either `domains cancel` or
+`tmsegments cancel` stops a prediction started through `domains`.
+See [DeepTMHMM setup and imports](#transmembrane-helices-and-beta-strands).
+
+Choose **Sequence features** or **All annotations** in the browser to see motifs,
+sites, low-complexity regions, and available Pfam disorder/coiled-coil annotations.
+Pfam motifs and InterPro sites appear automatically after their respective searches,
+without an additional search. An older InterPro session cache is refreshed once to
+recover previously discarded sites. **Nearby** and **Selected** work in every view.
+Features can overlap domains and each other; selecting one preserves domain colors.
+Separate `sequence_feature_names` and `sequence_feature_accessions` residue attributes
+support selection, and results/attributes support Undo/Redo. Running feature analysis
+retains domain results; subsequent domain searches retain independently scanned features.
+
+Local PROSITE matches show the pattern, matched sequence, description and documentation
+link. They are candidate sequence signatures, not confirmed functional sites. Common,
+nonspecific signatures are hidden unless `prosite_common true` is set. SEG uses the
+standard 12/2.2/2.5 settings with probability-based boundary trimming; low complexity
+does not imply disorder. Repeated and overlapping motif occurrences are retained.
+
+Optional `prosite_profiles true` also sends distinct sequences to the
+[ScanProsite API](https://prosite.expasy.org/scanprosite/scanprosite_doc.html) for scored
+profile matches at its standard cutoff. These appear as **Profile-supported region**;
+individual catalytic/binding residues are shown only when supplied as site annotations
+by InterPro. Online failure retains the local results. Local results and successful
+online results, including empty results, are cached on disk for 14 days by sequence,
+definition checksum, algorithm and options. Automatic features reuse this cache
+even when `refresh true` repeats a domain search; use
+`domains #1 source features refresh true` to refresh feature results and public
+definitions. Each identical sequence is analyzed once across models. A feature
+backend failure leaves valid domain results available and is reported in the Log.
+See [PROSITE](https://prosite.expasy.org/) and its
+[license](https://prosite.expasy.org/prosite_license.html).
+PROSITE data is CC BY-NC-ND 4.0; commercial use requires a separate license.
+It is downloaded unchanged on demand and is not part of our structural library.
+Without the necessary permission, use `features false` to avoid the automatic
+PROSITE feature pass. Do not include its definitions or caches in an unrestricted
+database release. See [redistribution notes](THIRD_PARTY.md).
 
 | Option | Purpose | Default |
 | --- | --- | --- |
-| `source` | `pfam` search or `interpro` lookup | `pfam` |
-| `color` | Color atoms and cartoons; attributes are always assigned | `true` |
+| `source` | `pfam`, `interpro`, local `foldseek`, local `features`, or DeepTMHMM `tmsegments` | `pfam` |
+| `results` | Import a DeepTMHMM `.3line` file; applies to `source tmsegments` | Predict or reuse cached topology |
+| `python` | BioLib client Python; applies to `source tmsegments` | Existing DeepTMHMM environment |
+| `features` | Also run local SEG and PROSITE scans with any domain source | `true` |
+| `prosite_profiles` | Add online ScanProsite profile matches to enabled feature scans | `false` |
+| `prosite_common` | Include common/nonspecific PROSITE signatures | `false` |
+| `prosite_database` | Existing `prosite.dat` file for feature scans | Download and cache public definitions |
+| `library` | Reference-library directory; applies to `foldseek` | Configured local library, otherwise `cdd-pilot` |
+| `regions` | Quoted sequence ranges to search separately; applies to `foldseek` | Requested residues as one query per chain |
+| `pfam_guided` | Use Pfam boundaries to guide local Foldseek searches | `false` |
+| `pfam_backend` | `auto`, `local`, or `online`; applies to Pfam and Pfam-guided Foldseek | `auto` |
+| `pfam_database` | Local `Pfam-A.hmm` file or containing directory | Automatic discovery |
+| `deduplicate` | Share Foldseek searches across identical sequences with the same modeled query positions | `true` |
+| `color` | Color domain atoms and cartoons; sequence features preserve domain colors | `true` |
 | `include_overlaps` | Include competing Pfam assignments | `false` |
+| `include_tentative` | Show reported below-cutoff Pfam candidates with E-value ≤ 0.01 | `true` for Pfam |
 | `refresh` | Repeat the search instead of using session-cached results | `false` |
 | `gui` | Open or refresh the browser | `true` |
 | `wait` | Wait for completion before subsequent script commands | `false` |
-| `timeout` | Maximum lookup time in seconds | `600` |
+| `timeout` | Maximum lookup time in seconds | `600`; `1200` for `source tmsegments` |
+
+Pfam's clan competition can hide a weaker assignment even for a one-residue
+alignment overlap within the same clan. Use `include_overlaps true` to display
+significant competing hits. Pfam includes reported below-cutoff candidates with
+independent domain E-value ≤ 0.01 by default, labeled **tentative** in the browser
+and log. Use `include_tentative false` for curated matches only.
+Details show their score and the domain
+gathering cutoff. A tentative hit is hidden if at least 50% of its sequence
+footprint overlaps the combined footprints of curated matches. Small boundary
+overlaps are retained. This rule also applies with `include_overlaps true`.
+Curated assignments take priority for coloring remaining overlaps. Both options
+can be combined, and toggling either reuses cached hits.
+The service may omit weaker candidates entirely. InterPro retains all returned
+locations. Foldseek retains separate occurrences of a family and searches
+remaining stretches for repeat matches. Structural assignments sharing at least
+**70% of both aligned residue footprints** collapse into one browser row, choosing
+the lowest E-value, then highest bit score. Shorter, strongly contained matches
+also group when they have comparable size or share an explicit Pfam family or
+ECOD homology group with the primary. The row's details retain the alternative
+names, accessions, scores, and links. Small overlaps, separate repeats, and
+unrelated small inserted domains remain separate. Primary footprints
+are not expanded to cover the alternatives. Rerunning the same command applies
+this grouping to session-cached hits without repeating the structural search.
 
 Searches run in the background in graphical sessions; use `wait true` in scripts
-that depend on the result. Colors, attributes, and browser results support
+that depend on the result. Foldseek shows an elapsed-seconds counter in the
+status bar, updated about once per second, with the current search pass and
+query-region count. Completion posts a separate status and Log message with
+elapsed time, match count, and model count. Cancellation, timeout, and failure
+replace the running status; cached results are identified explicitly.
+Colors, attributes, and browser results support
 Undo/Redo. Reanalyzing a chain replaces its results while retaining other models.
 Results are cached per source for the current session; rerun `domains` after
 loading a saved session to rebuild the browser.
@@ -153,6 +420,8 @@ loading a saved session to rebuild the browser.
 Residue attributes `domain_name` and `domain_accession` hold the primary match;
 `domain_names` and `domain_accessions` retain overlapping matches separated by
 ` | `. For example: `select #1 & ::domain_accession=PF00071`.
+`domain_tentative` records whether the primary assignment is tentative; select
+those residues with `select #1 & ::domain_tentative=true`.
 
 
 ## Transmembrane Helices and Beta Strands
@@ -168,6 +437,7 @@ tmsegments #1
 tmsegments #1/A
 tmsegments #1-3 wait true
 tmsegments #1 color false
+tmsegments #1 gui false
 tmsegments #1 refresh true timeout 1800
 tmsegments cancel
 ```
@@ -186,6 +456,11 @@ The default timeout is 1200 seconds. Cancellation/timeout stops the local client
 an already submitted remote job may continue on BioLib.
 
 ### BioLib setup
+
+DeepTMHMM has separate academic/commercial terms; obtain the applicable
+[DTU/BioLib license](https://services.healthtech.dtu.dk/services/DeepTMHMM-1.0/)
+for commercial use. The MIT license of the BioLib Python client does not grant
+rights to the predictor. No predictor weights or containers are distributed here.
 
 The command is included in `chimerax_trimmings.py`; no extra startup script is
 needed. The BioLib client runs in a separate Python environment. On macOS, create
@@ -244,6 +519,14 @@ modeled residues is still reported. Unknown/nonstandard sequence letters are
 rejected rather than silently deleted or replaced. If the full polymer sequence
 is unavailable, the helper warns before using ChimeraX's inferred chain sequence.
 
+Results also open the **Sequence features** browser view, grouping helices and
+beta strands separately across models and chains. These browser records and
+`sequence_feature_names` / `sequence_feature_accessions` update together with
+the topology attributes in one Undo action. `gui false` suppresses opening the
+browser. Segments without modeled residues remain in the Log. `domains #1 source
+tmsegments` offers the same prediction/import workflow while retaining domain colors;
+the original `tmsegments` command keeps its optional membrane coloring.
+
 Annotations and coloring support Undo/Redo. Reanalyzing a chain replaces its TM
 annotations, including clearing earlier assignments when no TM segments are
 predicted; other chains' records remain available. Predictions for a chain that
@@ -251,7 +534,6 @@ was deleted or whose sequence/residue mapping changed during submission are
 skipped. The combined records are available as `session._trimmings_tm_records`.
 Attributes/records are session annotations; this helper does not add a custom
 mmCIF export or persist the prediction cache across ChimeraX sessions.
-
 
 ## Exposed Hydrophobic Residues
 
@@ -318,8 +600,9 @@ select #1 & ::hydrophobic_patch_rank=1
 ```
 
 Supply exactly one of `binder_radius` (Angstroms) and `binder_mass` (kDa).
-Mass is converted to an equivalent sphere at an assumed protein density of
-1.35 g/cm^3; e.g. 15 kDa corresponds to about 16.4 Angstroms radius.
+Mass is converted to an equivalent dry sphere at an assumed protein density of
+1.35 g/cm^3; 15 kDa corresponds to about 16.4 Angstroms radius. Use a radius when
+you have a better estimate of the binder's effective steric size.
 
 | Option | Meaning | Default |
 | --- | --- | --- |
@@ -404,15 +687,14 @@ hydrophobicpatches #1 binder_mass 15 gui false
 Without a GUI, searches remain command-only. Browser state is not saved in
 session files; rerun the search after reopening a session.
 
-## Modelmotion
+## Active and Frozen Models
 
-The `modelmotion` commands provide legacy Chimera-style activation independently
+The opt-in `modelmotion` commands provide Chimera-style activation independently
 of atom/model selection. Structures, maps, and independent surfaces are supported.
 Groups expand to their movable members; surfaces owned by a structure or map move
 with that owner. Specify the owner rather than its surface submodel.
 
-E.g.
-```python
+```chimerax
 modelmotion active #1
 modelmotion unfreeze #3
 modelmotion freeze #1
@@ -452,8 +734,9 @@ movement bindings then use the active set independently of selection.
 | Pinch | Keep the existing zoom binding |
 
 Trackpad gestures must be enabled in ChimeraX and available to it from macOS.
-Rotation uses the current ChimeraX center of rotation, including the pivot set by
-`cofron`, `cofroff`, or an explicit `cofr` position. Mouse bindings that currently
+Mouse and trackpad rotation use the current ChimeraX center of rotation, including
+the pivot set by `cofron`, `cofroff`, `cofr sel`, or an explicit `cofr` position.
+Mouse bindings that currently
 rotate/translate models are redirected to the same active set; selection, clipping,
 and contour bindings retain their existing behavior. Trackpad movement is undoable
 after a short pause. `modelmotion off` restores the previous mouse and trackpad
@@ -463,57 +746,57 @@ models. Activation is temporary session state and is not saved in session files.
 
 ## Keybindings
 
-- `F1`: Previous model
-- `F2`: Next model
-- `F3`: Center selection
-- `F4`: View all
-- `F5`: Toggle maps
-- `F6`: Toggle models
-- `F7`: Cycle lighting presets
-- `F8`: Cycle model display options
-- `F9`: Previous map (Ignores models)
-- `F10`: Next map (Ignores models)
+- `F1`: `prevmodel`
+- `F2`: `nextmodel`
+- `F3`: `centersel`
+- `F4`: `view all`
+- `F5`: `togglemaps`
+- `F6`: `togglemodels`
+- `F7`: `cyclelighting`
+- `F8`: `cyclemodeldisplay`
+- `F9`: `prevmap`
+- `F10`: `nextmap`
+- `F11`: `lowermapthreshold`
+- `F12`: `raisemapthreshold`
 
 ## Button Panel
 
-The startup file creates a `Shortcuts` button panel with quick access to commonly used tools/commands.
+The startup file creates a `Shortcuts` button panel with quick access to commonly used tools and commands.
 
 It currently includes buttons for:
 
 - `Vol_Viewer`: open the Volume Viewer tool
 - `Model_Panel`: open the Model Panel
-- `Log`: open the Log viewer
-- `default_disp`: Set some nice defaults for model/map display
-- `map_sphere`: Zone maps to a 15 A sphere around the center of rotation
-- `map_unsphere`: Undo map zoning
-- `cofron`: Make sure the center of rotation is centered between the clip planes and show the center-of-rotation pivot marker
-- `cofroff`: Hide the center-of-rotation pivot marker while keeping the CoFR centered between the clip planes.
-- `cootmode`: Apply a Coot-style display preset for models/maps
-- `mark_cofr`: Place a marker at the current center of rotation
-- `togglemaps`: Hide shown maps, then restore the same set on the next use
-- `togglemodels`: Hide shown atomic models, then restore the same set on the next use
-- `reset_mouse_and_help`: Restore the default mouse bindings and open the mouse-mode help page
-- `previous_model`: Step to the previous model in the Model Panel
-- `next_model`: Step to the next model in the Model Panel
+- `Log`: open the Log tool
+- `default_disp`: restore the default ribbon/cartoon molecular display
+- `map_sphere`: zone maps to a 15 A sphere around the center of rotation
+- `map_unsphere`: remove map zoning
+- `cofron`: show the center-of-rotation pivot marker
+- `cofroff`: hide the center-of-rotation pivot marker while keeping the CoFR centered on the view
+- `cootmode`: apply the dark-background Coot-style display preset
+- `mark_cofr`: place a marker at the current center of rotation
+- `togglemaps`: hide shown maps, then restore the same set on the next use
+- `togglemodels`: hide shown atomic models, then restore the same set on the next use
+- `reset_mouse_and_help`: restore the default mouse bindings and open the mouse-mode help page
+- `previous_model_map`: show the previous unskipped atomic model or volume map
+- `next_model_map`: show the next unskipped atomic model or volume map
 
 ## Alias Reference
 
-_**Note: for all of these aliases, on the Chimerax command line you can type "help `cofron`" or "usage `cofron`" for example to get a short description of usage of the indicated alias in the Log**_
-
 ### `cofron`
 
-Centers the rotation point between the clip planes and shows the pivot marker.
+Centers the rotation point on the current view and shows the pivot marker.
 
 Usage: `cofron`
 
 ```chimerax
 alias cofron cofr centerofview showpivot 7,0.25
-alias usage cofron synopsis "Centers the rotation point on the view and show the pivot"
+alias usage cofron synopsis "Center the rotation point on the view and show the pivot"
 ```
 
 ### `cofroff`
 
-Recenters the rotation point between the clip planes and hides the pivot marker.
+Recenters the rotation point on the current view and hides the pivot marker.
 
 Usage: `cofroff`
 
@@ -530,29 +813,51 @@ Usage: `symclip <half-distance>`
 
 ```chimerax
 alias symclip cofr centerofview; clip near -$1 far $1 position cofr
-alias usage symclip synopsis "Set symmetric clip planes around the center of rotation" $1 "Half-width"
+alias usage symclip synopsis "Set symmetric clip planes around the center of rotation" $1 "half-distance"
 ```
 
-### `selmodel`
+### `modelsel`
 
-Selects all atomic models.
+Selects atomic models using the `##num_residues` selector.
 
-Usage: `selmodel`
+Usage: `modelsel`
 
 ```chimerax
-alias selmodel sel ##num_residues
-alias usage selmodel synopsis "Select atomic models"
+alias modelsel select ##num_residues
+alias usage modelsel synopsis "Select atomic models"
 ```
 
-### `selmap`
+### `mapsel`
 
-Selects all non-atomic models such as maps.
+Selects non-atomic models such as maps using the inverse selector.
 
-Usage: `selmap`
+Usage: `mapsel`
 
 ```chimerax
-alias selmap sel ~##num_residues
-alias usage selmap synopsis "Select non-atomic models such as maps"
+alias mapsel select ~##num_residues
+alias usage mapsel synopsis "Select non-atomic models such as maps"
+```
+
+### `sidesel`
+
+Selects protein sidechains and nucleic-acid bases for the given atom specification.
+
+Usage: `sidesel <atom-spec>`
+
+```chimerax
+alias sidesel select sidechain & $1 | ~backbone & nucleic & $1
+alias usage sidesel synopsis "Select protein sidechains and nucleic-acid bases" $1 "atom-spec"
+```
+
+### `sidedisp`
+
+Displays protein sidechains and nucleic-acid bases for the given atom specification.
+
+Usage: `sidedisp <atom-spec>`
+
+```chimerax
+alias sidedisp select sidechain & $1 | ~backbone & nucleic & $1; display sel
+alias usage sidedisp synopsis "Display protein sidechains and nucleic-acid bases" $1 "atom-spec"
 ```
 
 ### `cootmode`
@@ -590,7 +895,7 @@ alias usage cootmode_mesh synopsis "Apply the mesh Coot-style display preset"
 
 ### `ca_and_sidechains`
 
-Shows a CA trace for proteins or phosphate backbone trace for nucleic acids, plus protein sidechains and nucleic-acid bases.
+Shows a CA trace for proteins or phosphate trace for nucleic acids, plus protein sidechains and nucleic-acid bases.
 
 Usage: `ca_and_sidechains <model-spec>`
 
@@ -608,6 +913,19 @@ Usage: `ca_trace <model-spec>`
 ```chimerax
 alias ca_trace ~rib $1; ~surf $1; ~disp $1; disp @CA&protein&$1; disp @P&nucleic&$1; style $1 stick; size stickradius 0.1; size pseudobondradius 0.1
 alias usage ca_trace synopsis "Show a CA or phosphate trace" $1 "model-spec"
+```
+
+### `expand_sym`
+
+Expands an asymmetric unit to biological assembly `1` as a new model and shows the result as ribbon copies. This is most useful for mmCIF structures where assembly `1` corresponds to the full biological unit.
+
+Usage: `expand_sym <model-spec>`
+
+Note: this alias assumes the desired biological assembly is `1`.
+
+```chimerax
+alias expand_sym ~disp $1; rib $1; sym $1 assembly 1 copies false newModel true
+alias usage expand_sym synopsis "Expand an asymmetric unit to biological assembly 1 as ribbon copies" $1 "model-spec"
 ```
 
 ### `map_sphere_15`
@@ -654,6 +972,17 @@ alias fit_by_chain split $1; fitmap $1.* inmap $2 eachmodel true; combine $1.* c
 alias usage fit_by_chain synopsis "Split a model by chain, fit each chain into a map, and recombine" $1 "model-spec" $2 "map-spec"
 ```
 
+### `rainbow_new`
+
+Colors models with the `RdYlBu-5` rainbow palette.
+
+Usage: `rainbow_new`
+
+```chimerax
+alias rainbow_new rainbow palette RdYlBu-5
+alias usage rainbow_new synopsis "Color models by rainbow using the RdYlBu-5 palette"
+```
+
 ### `default_mol_display`
 
 Restores a default ribbon/cartoon molecular display with chain rainbow coloring.
@@ -674,6 +1003,28 @@ Usage: `local_fitmap <model-or-map> <target-map> <zone-radius>`
 ```chimerax
 alias local_fitmap ~sel; close #10000-10001; marker #10000 position cofr; sel #10000; volume zone $2 nearAtoms sel range $3 newMap true modelid 10001 minimalbounds true; fitmap $1 inmap #10001 eachmodel true; close #10001; close sel; show $2
 alias usage local_fitmap synopsis "Fit a model or map into a local zone around the center of rotation" $1 "model or map to fit" $2 "target map" $3 "zone radius"
+```
+
+### `hidemodels`
+
+Hides all atomic models.
+
+Usage: `hidemodels`
+
+```chimerax
+alias hidemodels hide ##num_residues models
+alias usage hidemodels synopsis "Hide all atomic models"
+```
+
+### `showmodels`
+
+Shows all atomic models.
+
+Usage: `showmodels`
+
+```chimerax
+alias showmodels show ##num_residues models
+alias usage showmodels synopsis "Show all atomic models"
 ```
 
 ### `caps_off`
@@ -722,7 +1073,7 @@ alias usage selbetween synopsis "Select residues between the current selection e
 
 ### `helix`
 
-Marks selected residues as helix.
+Marks residues as helix.
 
 Usage: `helix <residue-spec>`
 
@@ -733,7 +1084,7 @@ alias usage helix synopsis "Mark residues as helix" $1 "residue-spec"
 
 ### `strand`
 
-Marks selected residues as strand.
+Marks residues as strand.
 
 Usage: `strand <residue-spec>`
 
@@ -744,7 +1095,7 @@ alias usage strand synopsis "Mark residues as strand" $1 "residue-spec"
 
 ### `coil`
 
-Clears helix and strand assignment for selected residues.
+Clears helix and strand assignment for residues.
 
 Usage: `coil <residue-spec>`
 
@@ -808,28 +1159,6 @@ Depends on: `split_diff_map`
 ```chimerax
 alias local_diff_map view name tmp; close #1001,1002,1003,1004,1005; fitmap $1 inMap $2; vol zone $2 near $1 range 5 newMap true modelId 1000 minimalBounds true; fitmap $1 inMap $3; vol zone $3 near $1 range 5 newMap true modelId 1001 minimalBounds true; volume scale #1000 sd 0.1 modelId 1002; volume scale #1001 sd 0.1 modelId 1003; fitmap #1003 inMap #1002; volume resample #1003 onGrid #1002 modelId 1004; volume subtract #1002 #1004 modelId 1005 minRms true; volume #1005 step 1; split_diff_map #1005 #1006; close #1000,1001,1002,1003,1004,1005; view tmp
 alias usage local_diff_map synopsis "Build a local difference map between two fitted maps around a model" $1 "model-spec" $2 "first map" $3 "second map"
-```
-
-### `selside`
-
-Selects protein sidechains and nucleic-acid bases for the given atom specification.
-
-Usage: `selside <atom-spec>`
-
-```chimerax
-alias selside sel sidechain & $1 | ~backbone & nucleic & $1
-alias usage selside synopsis "Select protein sidechains and nucleic-acid bases" $1 "atom-spec"
-```
-
-### `dispside`
-
-Displays protein sidechains and nucleic-acid bases for the given atom specification.
-
-Usage: `dispside <atom-spec>`
-
-```chimerax
-alias dispside sel sidechain & $1 | ~backbone & nucleic & $1; disp sel
-alias usage dispside synopsis "Display protein sidechains and nucleic-acid bases" $1 "atom-spec"
 ```
 
 ### `local_diff_map_sphere`
@@ -911,16 +1240,8 @@ alias uncarve surface unzone ~##num_residues
 alias usage uncarve synopsis "Remove surface carving from displayed map surfaces"
 ```
 
-
 ## Notes
 
 - The Python file is meant to be sourced inside ChimeraX with `runscript`; it is not a standalone Python program.
-- If you move the scripts, update both `runscript` paths in your Startup preferences.
-
-## Example 
-The shortcut button panel provides quick access to the Volume Viewer, Model Panel, Log, and display commands. It can stay docked while other tool windows are undocked to leave more room for graphics:
-
-<img width="1624" alt="image" src="https://github.com/olibclarke/chimeras-trimmings/assets/19766818/7f8f578a-48a3-4474-9526-72da8e7a4472">
-
-And here is what it looks like in action:
-https://www.dropbox.com/scl/fi/cdi295s8h7vc5ijf9wr54/chimerax_example_nav.mov?rlkey=mbqn4uk4yodhj1346thyf86oo&dl=0
+- `nextmodel` and `prevmodel` use the Model Panel tool and therefore depend on ChimeraX's current Model Panel implementation.
+- If you move the repository, update the `runscript` path in [chimerax_trimmings.txt](chimerax_trimmings.txt).

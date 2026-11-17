@@ -1,3 +1,4 @@
 /tests/
 __pycache__/
 *.py[cod]
+/.domain_data/

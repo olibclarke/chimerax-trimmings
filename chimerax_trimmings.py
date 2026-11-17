@@ -3729,7 +3729,174 @@ def _register_shape_align_command(logger):
 
 _PFAM_API = "https://www.ebi.ac.uk/Tools/hmmer/api/v1"
 _PFAM_POLL_SECONDS = 5
-_DOMAIN_BROWSER_VERSION = 5
+_PFAM_CACHE_VERSION = 3
+_PFAM_TENTATIVE_EVALUE = 0.01
+_PFAM_TENTATIVE_OVERLAP = 0.5
+_DOMAIN_BROWSER_VERSION = 21
+_DOMAIN_BROWSER_IMPLEMENTATION = object()
+_DOMAIN_INFO_RENDER_VERSION = 3
+_DOMAIN_EXEMPLAR_MODULE = None
+_DOMAIN_INFO_ENRICH_VERSION = 2
+_INTERPRO_CACHE_VERSION = 2
+
+
+def _sequence_feature_kind(hit):
+    kind = hit.get("feature_kind")
+    if kind:
+        return kind
+    kind = hit.get("type", "").lower().replace("-", "_").replace(" ", "_")
+    return kind if kind in {"motif", "disordered", "coiled_coil", "low_complexity",
+                            "active_site", "binding_site", "conserved_site", "ptm", "site"} else None
+
+
+def _sequence_feature_backend():
+    import importlib.util
+    from pathlib import Path
+
+    path = Path(__file__).with_name("sequence_features.py")
+    stamp = (str(path), path.stat().st_mtime_ns)
+    cached = globals().get("_SEQUENCE_FEATURE_MODULE_CACHE")
+    if cached is None or cached[0] != stamp:
+        spec = importlib.util.spec_from_file_location("trimmings_sequence_features", path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        globals()["_SEQUENCE_FEATURE_MODULE_CACHE"] = stamp, module
+    else:
+        module = cached[1]
+    return module
+
+
+def _start_domain_features(entries, options, timeout, cancel, report):
+    """Scan immutable sequences alongside domain work; never touch models here."""
+    from concurrent.futures import Future
+    from pathlib import Path
+    from threading import Event, Thread
+    from types import SimpleNamespace
+
+    if options is None:
+        return None
+    sequences = list(dict.fromkeys(entry["sequence"] for entry in entries))
+    future, stopped = Future(), Event()
+    combined_cancel = SimpleNamespace(is_set=lambda: cancel.is_set() or stopped.is_set())
+
+    def scan():
+        try:
+            module = _sequence_feature_backend()
+            value = module.search(sequences, Path(__file__).parent / ".domain_data" / "sequence-features",
+                                  timeout, combined_cancel, report, **options)
+        except Exception as error:
+            value = None, ["Sequence features unavailable; domain results retained: " + str(error)]
+        future.set_result(value)
+
+    Thread(target=scan, name="ChimeraX automatic sequence features", daemon=True).start()
+    return SimpleNamespace(future=future, stopped=stopped, cancel=cancel)
+
+
+def _await_domain_features(task, report):
+    from concurrent.futures import TimeoutError as FutureTimeout
+    from time import monotonic
+
+    if task is None:
+        return None, []
+    next_report = monotonic() + 1
+    while not task.future.done():
+        if task.cancel.is_set():
+            raise InterruptedError("Domain and feature lookup cancelled.")
+        try:
+            return task.future.result(timeout=.1)
+        except FutureTimeout:
+            pass
+        if monotonic() >= next_report:
+            report("waiting for sequence features")
+            next_report = monotonic() + 1
+    return task.future.result()
+
+
+def _domain_completion_counts(records):
+    features = sum(bool(_sequence_feature_kind(record)) for record in records)
+    return f"{len(records) - features} matches" + (f"; {features} sequence features" if features else "")
+
+
+def _pfam_local_backend(database=None, library=None):
+    import importlib.util
+    from pathlib import Path
+
+    path = Path(__file__).with_name("domain_pfam.py")
+    if not path.is_file():
+        if database:
+            raise ValueError("Put domain_pfam.py beside chimerax_trimmings.py for local Pfam searches.")
+        return None
+    stamp = (str(path), path.stat().st_mtime_ns)
+    cached = globals().get("_PFAM_MODULE_CACHE")
+    if cached is None or cached[0] != stamp:
+        spec = importlib.util.spec_from_file_location("trimmings_domain_pfam", path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        globals()["_PFAM_MODULE_CACHE"] = stamp, module
+    else:
+        module = cached[1]
+    backend = module.discover(path.parent, database, library)
+    return {**backend, "module": module} if backend else None
+
+
+def _pfam_backend(mode="auto", database=None, library=None):
+    online = {"kind": "online", "identity": "online-v1", "requested": mode}
+    if mode == "online":
+        if database is not None:
+            raise ValueError("pfam_database cannot be combined with pfam_backend online.")
+        return online
+    try:
+        local = _pfam_local_backend(database, library)
+    except (OSError, ValueError, KeyError) as error:
+        if mode == "local":
+            raise
+        return {**online, "note": "Local Pfam unavailable; using the online service: " + str(error)}
+    if local is None:
+        if mode == "local":
+            raise ValueError("No compatible local Pfam bundle and hmmscan installation were found.")
+        return online
+    return {**local, "requested": mode}
+
+
+def _pfam_cached(session, backend):
+    if (getattr(session, "_trimmings_pfam_cache_version", None) != _PFAM_CACHE_VERSION
+            or getattr(session, "_trimmings_pfam_cache_backend", "online-v1") != backend["identity"]):
+        return {}
+    return getattr(session, "_trimmings_pfam_cache", {})
+
+
+def _pfam_cache_results(session, results, backend):
+    cache = dict(_pfam_cached(session, backend))
+    cache.update(results)
+    session._trimmings_pfam_cache = cache
+    session._trimmings_pfam_cache_version = _PFAM_CACHE_VERSION
+    session._trimmings_pfam_cache_backend = backend["identity"]
+
+
+def _pfam_lookup(sequences, timeout, cancel, report, backend, all_sequences=None):
+    """Use local profiles when available, with one deadline and coherent fallback."""
+    from time import monotonic
+
+    started = monotonic()
+    if backend["kind"] == "online":
+        return _pfam_search(sequences, timeout, cancel, report), backend, backend.get("note")
+    try:
+        budget = min(60, timeout / 2) if backend["requested"] == "auto" else timeout
+        results = backend["module"].search(sequences, backend, budget, cancel, report)
+        return results, backend, None
+    except Exception as error:
+        if cancel.is_set() or isinstance(error, InterruptedError) or backend["requested"] == "local":
+            raise
+        remaining = timeout - (monotonic() - started)
+        if remaining <= 0:
+            raise TimeoutError("Pfam lookup timed out.") from None
+        note = "Local Pfam failed; using the online service: " + (str(error) or type(error).__name__)
+        report(note)
+        online = {"kind": "online", "identity": "online-v1", "requested": "auto"}
+        # If some local results were cached, refetch those sequences as well;
+        # one response must not mix profile releases or backends.
+        results = _pfam_search(all_sequences or sequences, remaining, cancel, report)
+        return results, online, note
 
 
 def _pfam_request(path, timeout, payload=None):
@@ -3767,8 +3934,6 @@ def _pfam_parse_hits(payload, sequence):
             if not isinstance(accession, str) or not re.fullmatch(r"PF\d{5,}", accession):
                 raise ValueError()
             for domain in hit["domains"]:
-                if not domain["significant"]:
-                    continue
                 alignment = domain["alignment_display"]
                 start, end = alignment["sqfrom"], alignment["sqto"]
                 if (type(start) is not int or type(end) is not int
@@ -3779,12 +3944,21 @@ def _pfam_parse_hits(payload, sequence):
                     raise ValueError()
                 if not isinstance(metadata["identifier"], str) or not isinstance(metadata["type"], str):
                     raise ValueError()
+                tentative = not domain["significant"]
+                if tentative and evalue > _PFAM_TENTATIVE_EVALUE:
+                    continue
+                cutoff = metadata.get("dom_ga")
+                if cutoff is not None:
+                    cutoff = float(cutoff)
+                    if not math.isfinite(cutoff):
+                        raise ValueError()
                 results.append({
                     "type": metadata["type"], "start": start, "end": end,
                     "evalue": evalue, "bitscore": score,
                     "accession": accession, "name": metadata["identifier"],
                     "description": metadata.get("description", ""),
                     "outcompeted": bool(domain["outcompeted"]),
+                    "tentative": tentative, "gathering_cutoff": cutoff,
                 })
         return results
     except (KeyError, TypeError, ValueError, OverflowError):
@@ -3870,7 +4044,9 @@ def _interpro_parse_matches(matches, sequence):
     import re
     from urllib.parse import quote
 
-    accepted_types = {"domain", "repeat", "homologous_superfamily", "family"}
+    accepted_types = {"domain", "repeat", "homologous_superfamily", "family",
+                      "active_site", "binding_site", "conserved_site", "ptm", "site",
+                      "motif", "disordered", "coiled_coil", "low_complexity"}
     results = []
     try:
         if not isinstance(matches, list):
@@ -3882,8 +4058,10 @@ def _interpro_parse_matches(matches, sequence):
             if provider == "InterPro-N":
                 continue
             entry = signature.get("entry") or {}
-            entry_type = entry.get("type") or signature.get("type") or ""
-            if entry_type.lower() not in accepted_types:
+            signature_type = signature.get("type") or ""
+            entry_type = (signature_type if _sequence_feature_kind({"type": signature_type})
+                          else entry.get("type") or signature_type)
+            if entry_type.lower().replace("-", "_").replace(" ", "_") not in accepted_types:
                 continue
             accession = signature["accession"]
             if not isinstance(accession, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,100}", accession):
@@ -3911,7 +4089,7 @@ def _interpro_parse_matches(matches, sequence):
                         raise ValueError()
                 if evalue is not None and float(evalue) < 0:
                     raise ValueError()
-                results.append({
+                hit = {
                     "origin": "interpro", "source": provider, "database": database,
                     "accession": accession, "name": name, "type": entry_type,
                     "description": signature.get("description") or entry.get("description") or "",
@@ -3921,7 +4099,28 @@ def _interpro_parse_matches(matches, sequence):
                     "integrated": integrated, "color_accession": integrated or accession,
                     "entry_url": f"https://www.ebi.ac.uk/interpro/entry/{database}/{quote(accession, safe='')}/",
                     "outcompeted": False,
-                })
+                }
+                results.append(hit)
+                # Some providers attach conserved/catalytic sites to a domain
+                # location instead of returning a separate site signature.
+                for site in location.get("sites") or []:
+                    pieces = site["siteLocations"]
+                    site_segments = sorted(set((piece["start"], piece["end"]) for piece in pieces))
+                    if (not site_segments or any(type(a) is not int or type(b) is not int
+                                                or not start <= a <= b <= end for a, b in site_segments)):
+                        raise ValueError()
+                    description = site.get("description") or "Conserved site"
+                    if not isinstance(description, str):
+                        raise ValueError()
+                    results.append({**hit, "feature_kind": "conserved_site", "type": "Conserved site",
+                                    "name": description, "description": description,
+                                    "evalue": None, "score": None,
+                                    "parent_signature_name": name, "parent_evalue": hit["evalue"],
+                                    "parent_score": hit["score"],
+                                    "start": site_segments[0][0], "end": max(b for a, b in site_segments),
+                                    "segments": site_segments,
+                                    "evidence": "Member-database site prediction reported by InterPro; "
+                                                "inspect the supporting family annotation."})
         return results
     except (KeyError, TypeError, ValueError, AttributeError):
         raise ValueError("Malformed InterPro matches or invalid sequence coordinates; no annotations were applied.") from None
@@ -3963,6 +4162,8 @@ def _interpro_search(sequences, timeout, cancel, report):
 
 
 def _domain_hit_sort_key(hit):
+    if hit.get("origin") == "foldseek":
+        return (False, 0, -hit["bitscore"], hit["accession"], hit["start"], hit["end"])
     if hit.get("origin") == "interpro":
         # Scores from different member databases cannot be compared numerically.
         # Prefer structural superfamily coverage, then domain/repeat matches, then families.
@@ -3970,7 +4171,109 @@ def _domain_hit_sort_key(hit):
         if hit["type"].lower() == "family":
             rank = 3
         return (False, rank, -sum(b - a + 1 for a, b in hit["segments"]), hit["accession"], hit["start"], hit["end"])
-    return (hit["outcompeted"], 0, -hit["bitscore"], hit["accession"], hit["start"], hit["end"])
+    return (hit.get("tentative", False), hit["outcompeted"], -hit["bitscore"],
+            hit["accession"], hit["start"], hit["end"])
+
+
+def _domain_display_name(hit):
+    return hit["name"] + (" (tentative)" if hit.get("tentative") else "")
+
+
+def _domain_filter_hits(hits, include_overlaps, include_tentative):
+    # Sequence features may legitimately lie inside a domain. Competition and
+    # structural grouping only arbitrate domain assignments, never feature rows.
+    features = [h for h in hits if _sequence_feature_kind(h)
+                and (include_tentative or not h.get("tentative", False))]
+    hits = [h for h in hits if not _sequence_feature_kind(h)]
+    hits = [h for h in hits if (include_overlaps or not h["outcompeted"])
+            and (include_tentative or not h.get("tentative", False))]
+    if any(h.get("origin") == "foldseek" for h in hits):
+        hits = _domain_collapse_structural_hits(hits)
+    if not any(h.get("tentative") for h in hits):
+        return hits + features
+
+    def footprint(hit):
+        return {position for a, b in hit.get("segments", [(hit["start"], hit["end"])])
+                for position in range(a, b + 1)}
+
+    # Compare full sequence footprints, independently of selected or modeled residues.
+    curated = set()
+    for hit in hits:
+        if not hit.get("tentative"):
+            curated.update(footprint(hit))
+    visible = []
+    for hit in hits:
+        if hit.get("tentative"):
+            positions = footprint(hit)
+            if len(positions & curated) >= _PFAM_TENTATIVE_OVERLAP * len(positions):
+                continue
+        visible.append(hit)
+    return visible + features
+
+
+def _domain_collapse_structural_hits(hits):
+    """One primary structural assignment per placement, retaining alternatives."""
+    selected, footprints, families = [], [], []
+
+    def family_keys(hit):
+        match = hit.get("structural_match", {})
+        reference = match.get("reference", {})
+        accepted = (_foldseek_reference_annotation(match).get('pfam_accessions', [])
+                    if reference.get('catalog') == 'ECOD' else [])
+        # Cross-references may help group nearly identical placements; that is
+        # weaker evidence than attaching a family name or functional description.
+        keys = {('pfam', accession) for accession in reference.get('pfam_accessions', [])}
+        keys.update(('pfam_clan', m['clan']) for m in reference.get('pfam_mappings', [])
+                    if m.get('method') == 'hmmer' and m.get('accession') in accepted and m.get('clan'))
+        ecod = reference.get("catalog_accession", hit["accession"])
+        if ecod.startswith("ECOD:"):
+            levels = ecod[5:].split(".")
+            if len(levels) == 4 and all(level.isdigit() for level in levels):
+                keys.add(("ecod_homology", ".".join(levels[:2])))
+        if hit.get("database") == "pfam":
+            keys.add(("pfam", hit["accession"]))
+        return keys
+
+    others = [hit for hit in hits if hit.get("origin") != "foldseek"]
+    structural = sorted((hit for hit in hits if hit.get("origin") == "foldseek"),
+                        key=lambda hit: (hit["evalue"], -hit["bitscore"], hit["accession"], hit["start"], hit["end"]))
+    for hit in structural:
+        keys = family_keys(hit)
+        positions = {p for a, b in hit.get("aligned_segments", hit.get("segments", [(hit["start"], hit["end"])]))
+                     for p in range(a, b + 1)}
+        # Gaps in two alignments of the same domain can differ. Require actual
+        # shared residues as well as comparable spans before grouping that case;
+        # broad envelopes alone must not swallow inserted domains or repeats.
+        overlaps = []
+        for index, previous in enumerate(footprints):
+            shared = len(positions & previous)
+            overlap = shared / max(len(positions), len(previous))
+            span_overlap = max(0, min(max(positions), max(previous)) - max(min(positions), min(previous)) + 1)
+            mutual_span = span_overlap / max(max(positions) - min(positions) + 1, max(previous) - min(previous) + 1)
+            # A weaker partial alignment may be completely contained yet fail
+            # every mutual-overlap cutoff. Require real paired-residue support,
+            # similar scale (or explicit shared family), and little extension.
+            # Always compare against the primary, never an alternative's union.
+            contained = (shared >= .9 * len(positions)
+                         and span_overlap >= .9 * (max(positions) - min(positions) + 1)
+                         and (len(positions) >= .5 * len(previous)
+                              or bool(keys & families[index])))
+            if overlap >= .7 or (overlap >= .5 and mutual_span >= .8) or contained:
+                overlaps.append((overlap, index))
+        if overlaps:
+            _, index = max(overlaps)
+            primary = selected[index]
+            # Repeated queries/representatives of the same family are duplicates,
+            # rather than additional family assignments in the details.
+            for alternative in [hit, *hit.get("alternatives", [])]:
+                if alternative["accession"] != primary["accession"] and not any(
+                        previous["accession"] == alternative["accession"] for previous in primary["alternatives"]):
+                    primary["alternatives"].append({key: value for key, value in alternative.items() if key != "alternatives"})
+        else:
+            selected.append({**hit, "alternatives": list(hit.get("alternatives", []))})
+            footprints.append(positions)
+            families.append(keys)
+    return others + selected
 
 
 def _domain_number(value):
@@ -4018,6 +4321,118 @@ def _domain_color(accession):
     return (*hsv_to_rgb(hue, 0.65, 0.95), 1)
 
 
+def _domain_groups(records):
+    """Group by actual signature, across chains/models; sites retain their names."""
+    groups = {}
+    for record in records:
+        feature = _sequence_feature_kind(record)
+        key = (feature or "domain", record.get("database", "pfam"), record["accession"],
+               record["name"] if feature else "")
+        groups.setdefault(key, []).append(record)
+    return groups
+
+
+def _domain_color_distance(a, b):
+    """Perceptual separation in OKLab, plus circular hue separation."""
+    from colorsys import rgb_to_hsv
+    from math import sqrt
+    def lab(color):
+        r, g, b = (c / 12.92 if c <= .04045 else ((c + .055) / 1.055) ** 2.4 for c in color[:3])
+        l = (.4122214708*r + .5363325363*g + .0514459929*b) ** (1/3)
+        m = (.2119034982*r + .6806995451*g + .1073969566*b) ** (1/3)
+        s = (.0883024619*r + .2817188376*g + .6299787005*b) ** (1/3)
+        return (.2104542553*l + .793617785*m - .0040720468*s,
+                1.9779984951*l - 2.428592205*m + .4505937099*s,
+                .0259040371*l + .7827717662*m - .808675766*s)
+    delta = abs(rgb_to_hsv(*a[:3])[0] - rgb_to_hsv(*b[:3])[0])
+    return sqrt(sum((x-y)**2 for x,y in zip(lab(a),lab(b)))), min(delta, 1-delta)
+
+
+def _domain_palette(records, previous):
+    """Keep family colors consistent and separate sequence/spatial neighbors."""
+    from colorsys import hsv_to_rgb
+    from functools import lru_cache
+    import numpy as np
+    from chimerax.geometry import find_close_points
+
+    chains, structures, neighbors = {}, {}, {}
+    for record in records:
+        if not _sequence_feature_kind(record):
+            key = record["accession"]
+            neighbors.setdefault(key, set())
+            chains.setdefault(record["chain"], []).append(record)
+            if 'residues' in record:
+                atoms = record['residues'].atoms
+                coords = atoms.filter(atoms.names == 'CA').coords
+                if len(coords):
+                    structures.setdefault(record['chain'].structure, []).append(
+                        (key, coords, coords.min(axis=0), coords.max(axis=0)))
+    for chain_records in chains.values():
+        ordered = sorted(chain_records, key=lambda r: (r["start"], r["end"]))
+        for first, second in zip(ordered, ordered[1:]):
+            a, b = first["accession"], second["accession"]
+            if a != b:
+                neighbors[a].add(b)
+                neighbors[b].add(a)
+    # Domains can touch in 3D without being consecutive in the sequence.
+    for domains in structures.values():
+        for index, (a, xyz, lo, hi) in enumerate(domains):
+            for b, other, other_lo, other_hi in domains[index+1:]:
+                if a == b or b in neighbors[a]:
+                    continue
+                gap = np.maximum(0, np.maximum(lo-other_hi, other_lo-hi))
+                if np.dot(gap, gap) > 64:
+                    continue
+                first, second = find_close_points(xyz, other, 8)
+                if min(len(first), len(second)) >= 2:
+                    neighbors[a].add(b)
+                    neighbors[b].add(a)
+    palette = dict(previous)
+    candidates = [(*hsv_to_rgb(h / 36, saturation, value), 1)
+                  for h in range(36) for saturation in (.55, .8) for value in (.82, .98)]
+    @lru_cache(maxsize=None)
+    def distance(a, b):
+        return _domain_color_distance(a, b)
+    def contrast(a, b):
+        perceived, hue = distance(a, b)
+        return min(perceived / .16, hue / .10)
+    for key in sorted(neighbors, key=lambda k: (-len(neighbors[k]), k)):
+        adjacent = [palette[n] for n in sorted(neighbors[key]) if n in palette]
+        if key in palette and all(contrast(palette[key], other) >= 1 for other in adjacent):
+            continue
+        used = [palette[k] for k in neighbors if k in palette and k != key]
+        preferred = _domain_color(key)
+        available = [c for c in candidates if all(contrast(c, other) >= 1 for other in adjacent)] or candidates
+        distinct = [c for c in available if all(distance(c, other)[0] >= .075 for other in used)]
+        available = distinct or available
+        palette[key] = max(available, key=lambda c: (
+            min((contrast(c, other) for other in adjacent), default=0),
+            min((distance(c, other)[0] for other in used), default=0),
+            -distance(c, preferred)[0])) if used else preferred
+    return palette
+
+
+def _domain_record_color(session, record):
+    if record.get("origin") == "tmsegments":
+        return tuple(channel / 255 for channel in _TM_COLORS[record["tm_label"]])
+    if not _sequence_feature_kind(record) and 'residues' in record:
+        import numpy as np
+        owned = np.fromiter((getattr(r, 'domain_accession', None) == record['accession']
+                             for r in record['residues']), dtype=bool)
+        if not owned.any():
+            return None  # An overlapping alternative has no independently colored footprint.
+        colors, counts = np.unique(record['residues'].ribbon_colors[owned], axis=0, return_counts=True)
+        return tuple(float(c)/255 for c in colors[counts.argmax()])
+    return getattr(session, "_trimmings_domain_palette", {}).get(record["accession"], _domain_color(record["accession"]))
+
+
+def _set_domain_palette(session, value):
+    session._trimmings_domain_palette = value
+    tool = getattr(session, "_trimmings_domain_browser", None)
+    if tool is not None and not tool._closed:
+        tool.refresh()
+
+
 def _domain_model_snapshots(session):
     snapshots = getattr(session, "_trimmings_domain_models", None)
     if snapshots is None:
@@ -4037,7 +4452,7 @@ def _set_domain_records(session, records, snapshots=None):
         snapshots = _domain_model_snapshots(session)
     session._trimmings_domain_models = snapshots
     tool = getattr(session, "_trimmings_domain_browser", None)
-    if tool is not None and not tool._closed and getattr(tool, "_domain_browser_version", 0) != _DOMAIN_BROWSER_VERSION:
+    if tool is not None and not tool._closed and not _domain_browser_is_current(tool):
         tool.delete()
         tool = None
     if tool is not None and not tool._closed:
@@ -4057,13 +4472,29 @@ def _domain_analyzed_models(session):
                   key=lambda model: model.id)
 
 
+def _domain_record_is_current(record):
+    return (record.get("origin", "pfam") in ("pfam", "interpro", "foldseek", "prosite", "sequence", "tmsegments")
+            and bool(len(record["residues"])) and _domain_chain_is_current(
+                record["chain"], record["sequence"], record["sequence_residues"]))
+
+
 def _live_domain_records(session):
-    return [record for record in getattr(session, "_trimmings_domains", [])
-            if len(record["residues"]) and _domain_chain_is_current(
-                record["chain"], record["sequence"], record["sequence_residues"])]
+    # Records on one chain share a sequence snapshot. Validate it once per scan,
+    # rather than rebuilding a potentially very long residue tuple for every hit.
+    checked, live = {}, []
+    for record in getattr(session, "_trimmings_domains", []):
+        if record.get("origin", "pfam") not in ("pfam", "interpro", "foldseek", "prosite", "sequence", "tmsegments") or not len(record["residues"]):
+            continue
+        key = record["chain"], record["sequence"], id(record["sequence_residues"])
+        if key not in checked:
+            checked[key] = _domain_chain_is_current(record["chain"], record["sequence"], record["sequence_residues"])
+        if checked[key]:
+            live.append(record)
+    return live
 
 
-def _apply_domain_results(session, entries, results, color, include_overlaps, gui=True, source="pfam"):
+def _apply_domain_results(session, entries, results, color, include_overlaps, gui=True, source="pfam",
+                          include_tentative=False, feature_results=None):
     from html import escape
     from types import SimpleNamespace
     from urllib.parse import quote
@@ -4073,11 +4504,17 @@ def _apply_domain_results(session, entries, results, color, include_overlaps, gu
     from chimerax.core.undo import UndoState
     from chimerax.std_commands.color import color as color_objects
 
-    # One primary assignment controls display; retain all overlapping hits as text.
-    attributes = ("domain_name", "domain_accession", "domain_names", "domain_accessions")
-    for name in attributes:
+    # One primary assignment controls display; structural alternatives stay in details.
+    attributes = ("domain_name", "domain_accession", "domain_names", "domain_accessions", "domain_tentative")
+    for name in attributes[:-1]:
         Residue.register_attr(session, name, "Trimmings domains", attr_type=str)
+    Residue.register_attr(session, "domain_tentative", "Trimmings domains", attr_type=bool)
+    feature_attributes = ("sequence_feature_names", "sequence_feature_accessions")
+    for name in feature_attributes:
+        Residue.register_attr(session, name, "Trimmings sequence features", attr_type=str)
+    feature_only = source in ("features", "tmsegments")
     rows, records, count, updated_chains = [], [], 0, set()
+    color_groups = {}
     previous_records = getattr(session, "_trimmings_domains", [])
     previous_models = _domain_model_snapshots(session)
     snapshots = {model: dict(chains) for model, chains in previous_models.items()}
@@ -4093,16 +4530,28 @@ def _apply_domain_results(session, entries, results, color, include_overlaps, gu
                 continue
             updated_chains.add(chain)
             snapshots.setdefault(chain.structure, {})[chain] = (entry["sequence"], entry["residues"])
-            hits = [h for h in results[entry["sequence"]]
-                    if include_overlaps or not h["outcompeted"]]
-            hits.sort(key=_domain_hit_sort_key)
+            raw_hits = results[entry.get("lookup_key", entry["sequence"])]
+            if feature_results is not None:
+                # Keep raw domain caches independent of optional sequence features.
+                raw_hits = [*raw_hits, *feature_results[entry["sequence"]]]
+            display_hits = [_foldseek_display_hit(hit, entry) if hit.get("origin") == "foldseek" else hit
+                            for hit in raw_hits]
+            if entry.get("structural_representative") != entry["spec"] and entry.get("structural_representative"):
+                display_hits = [{**hit, "structural_representative": entry["structural_representative"]}
+                                for hit in display_hits]
+            hits = _domain_filter_hits(display_hits, include_overlaps, include_tentative)
+            hits = _domain_structural_display_boundaries(entry, hits)
+            hits.sort(key=lambda hit: (bool(_sequence_feature_kind(hit)),
+                                      (hit["start"], hit["end"], hit["accession"]) if _sequence_feature_kind(hit)
+                                      else _domain_hit_sort_key(hit)))
             membership = {r: [] for r in entry["targets"]}
             for hit in hits:
                 members = list(dict.fromkeys(
                     r for a, b in hit.get("segments", [(hit["start"], hit["end"])])
                     for r in entry["residues"][a - 1:b] if r in membership))
-                for residue in members:
-                    membership[residue].append(hit)
+                if not _sequence_feature_kind(hit):
+                    for residue in members:
+                        membership[residue].append(hit)
                 if members:
                     records.append({**hit, "structure": chain.structure, "chain": chain,
                                     "chain_spec": entry["spec"], "sequence": entry["sequence"],
@@ -4113,7 +4562,7 @@ def _apply_domain_results(session, entries, results, color, include_overlaps, gu
                         spec = f"#{chain.structure.id_string}" + spec
                     rows.append(
                         f'<tr><td>{escape(entry["spec"])}</td>'
-                        f'<td><a href="cxcmd:{quote("select " + spec, safe="")}">{escape(hit["name"])}</a></td>'
+                        f'<td><a href="cxcmd:{quote("select " + spec, safe="")}">{escape(_domain_display_name(hit))}</a></td>'
                         f'<td><a href="{_domain_entry_url(hit)}">'
                         f'{hit["accession"]}</a></td><td>{escape(hit["type"])}</td>'
                         f'<td>{hit["start"]}&ndash;{hit["end"]}</td><td>{escape(spec)}</td>'
@@ -4121,38 +4570,90 @@ def _apply_domain_results(session, entries, results, color, include_overlaps, gu
                     )
             groups = {}
             for residue, matches in membership.items():
+                if feature_only:
+                    continue
                 primary = matches[0] if matches else None
                 values = (
                     primary["name"] if primary else "", primary["accession"] if primary else "",
                     " | ".join(dict.fromkeys(h["name"] for h in matches)),
                     " | ".join(dict.fromkeys(h["accession"] for h in matches)),
+                    bool(primary and primary.get("tentative")),
                 )
                 for name, value in zip(attributes, values):
                     # None is ChimeraX's unset attribute value and is undoable.
                     undo.add(residue, name, getattr(residue, name, None), value)
                     setattr(residue, name, value)
-                groups.setdefault(primary.get("color_accession", values[1]) if primary else "", []).append(residue)
+                groups.setdefault(values[1] if primary else "", []).append(residue)
                 count += bool(primary)
-            if color:
+            if color and not feature_only:
                 for accession, members in groups.items():
-                    color_objects(session, Objects(atoms=Residues(members).atoms), Color(_domain_color(accession)), target="ac")
+                    color_groups.setdefault(accession, []).extend(members)
         records.sort(key=lambda r: (r["structure"].id, r["chain"].chain_id, r["start"], r["end"], r["accession"]))
-        combined = [record for record in _live_domain_records(session) if record["chain"] not in updated_chains] + records
+        refreshed_features = {(record["chain"], record.get("origin", "pfam")) for record in records
+                              if _sequence_feature_kind(record)}
+        def preserve(record):
+            if record["chain"] not in updated_chains:
+                return True
+            if source == "features":
+                return record.get("origin", "pfam") not in ("sequence", "prosite")
+            if source == "tmsegments":
+                return record.get("origin", "pfam") != "tmsegments"
+            if feature_results is not None and record.get("origin") in ("sequence", "prosite"):
+                return False
+            return (bool(_sequence_feature_kind(record)) and record.get("origin", "pfam") != source
+                    and (record["chain"], record.get("origin", "pfam")) not in refreshed_features)
+        combined = [record for record in _live_domain_records(session) if preserve(record)] + records
         combined.sort(key=lambda r: (r["structure"].id, r["chain"].chain_id, r["start"], r["end"], r["accession"]))
+        if color and not feature_only:
+            previous_palette = dict(getattr(session, "_trimmings_domain_palette", {}))
+            palette = _domain_palette(combined, previous_palette)
+            # Updating a family color must update its older copies too, so the
+            # same annotation remains consistent across every analyzed model.
+            for record in combined:
+                key = record["accession"]
+                if (_sequence_feature_kind(record) or record["chain"] in updated_chains
+                        or palette.get(key) == previous_palette.get(key, _domain_color(key))):
+                    continue
+                color_groups.setdefault(key, []).extend(r for r in record["residues"]
+                                                        if getattr(r, "domain_accession", None) == key)
+            palette_state = SimpleNamespace(set_palette=lambda value: _set_domain_palette(session, value))
+            undo.add(palette_state, "set_palette", previous_palette, palette, option="M")
+            session._trimmings_domain_palette = palette
+            for accession, members in color_groups.items():
+                rgba = palette.get(accession, _domain_color(accession))
+                color_objects(session, Objects(atoms=Residues(list(dict.fromkeys(members))).atoms), Color(rgba), target="ac")
+        feature_membership = {residue: [] for entry in entries if entry["chain"] in updated_chains
+                              for residue in entry["targets"]}
+        for record in combined:
+            if _sequence_feature_kind(record) and record["chain"] in updated_chains:
+                for residue in record["residues"]:
+                    if residue in feature_membership:
+                        feature_membership[residue].append(record)
+        for residue, matches in feature_membership.items():
+            for name, key in zip(feature_attributes, ("name", "accession")):
+                value = " | ".join(dict.fromkeys(hit[key] for hit in matches))
+                undo.add(residue, name, getattr(residue, name, None), value)
+                setattr(residue, name, value)
         # Keep the browser's results in step with annotation Undo/Redo.
         state = SimpleNamespace(set_records=lambda value: _set_domain_records(session, *value))
         undo.add(state, "set_records", (previous_records, previous_models), (combined, snapshots), option="M")
         state.set_records((combined, snapshots))
         session.undo.register(undo)
+    source_name = {"pfam": "Pfam", "interpro": "InterPro", "foldseek": "Foldseek", "features": "Sequence features",
+                   "tmsegments": "DeepTMHMM features"}[source]
     if rows:
         session.logger.info(
-            f'<b>{"InterPro" if source == "interpro" else "Pfam"} domain annotations</b> (click a name to select its footprint)'
-            '<table border="1" cellpadding="3"><tr><th>Chain</th><th>Domain</th><th>Accession</th>'
+            f'<b>{source_name} annotations</b> (click a name to select its footprint)'
+            '<table border="1" cellpadding="3"><tr><th>Chain</th><th>Annotation</th><th>Accession</th>'
             '<th>Hit type</th><th>Query positions</th><th>Structure residues</th><th>E-value</th><th>Source</th></tr>'
             + "".join(rows) + "</table>", is_html=True,
         )
-    session.logger.info(f"{'InterPro' if source == 'interpro' else 'Pfam'}: {len(records)} annotation matches; "
-                        f"annotated {count} target residues. Unassigned residues have empty domain_name/domain_accession.")
+    tentative_count = sum(bool(r.get("tentative")) for r in records)
+    confidence = f"{tentative_count} tentative; " if tentative_count else ""
+    session.logger.info(f"{source_name}: {len(records)} annotation matches; {confidence}"
+                        + ("domain annotations retained." if source == "tmsegments" else
+                           "domain colors and attributes retained." if feature_only else
+                           f"annotated {count} target residues. Unassigned residues have empty domain_name/domain_accession."))
     if gui and session.ui.is_gui:
         domain_browser(session)
     return records
@@ -4204,7 +4705,67 @@ def _domain_plain_text(markup):
     parser = Text()
     parser.feed(markup if isinstance(markup, str) else "")
     text = " ".join("".join(parser.parts).split())
-    return re.sub(r"\[+cite:[^\]]+\]+", "", text).strip()
+    citation = r"\[+cite:[^\[\]]+\]+"
+    text = re.sub(citation + r"(?:\s*[,;]\s*" + citation + r")*", "", text)
+    # Also repair separators left in previously cached plain-text descriptions.
+    text = re.sub(r"\s+[,;](?:\s*[,;])+(?=\s|[.!?]|$)", "", text)
+    text = re.sub(r"[,;]\s*(?=[.!?])", "", text)
+    text = re.sub(r"\s+([,.;:!?])", r"\1", text)
+    return " ".join(text.split()).strip()
+
+
+def _domain_structure_match(item, pdb, database, accession, representative=False):
+    """Require a family match on the crystallized chain, not its parent protein."""
+    import re
+
+    metadata = item.get('metadata', {})
+    if str(metadata.get('accession', '')).lower() != pdb.lower():
+        return None
+    locations, regions = [], []
+    for entry in item.get('entries', []):
+        identity = str(entry.get('accession', '')).casefold() == accession.casefold()
+        if database == 'interpro':
+            identity |= str(entry.get('entry_integrated', '')).casefold() == accession.casefold()
+        if not identity or not entry.get('chain'):
+            continue
+        for location in entry.get('entry_structure_locations', []):
+            segments = []
+            for fragment in location.get('fragments', []):
+                a, b = fragment.get('start'), fragment.get('end')
+                if (not isinstance(a, int) or not isinstance(b, int) or not 1 <= a <= b):
+                    continue
+                locations.append({'chain': entry['chain'], 'start': a, 'end': b,
+                                  'author_start': fragment.get('auth_start'), 'author_end': fragment.get('auth_end')})
+                segments.append({'start': a, 'end': b, 'author_start': fragment.get('auth_start'),
+                                 'author_end': fragment.get('auth_end')})
+            if segments:
+                regions.append({'chain': entry['chain'], 'segments': segments})
+    if not locations or not re.fullmatch(r'[A-Za-z0-9]{4}|pdb_[A-Za-z0-9]+', pdb):
+        return None
+    return {'accession': pdb, 'name': metadata.get('name', ''), 'representative': representative,
+            'resolution': metadata.get('resolution'), 'method': metadata.get('experiment_type'),
+            'chains': sorted({p['chain'] for p in locations}),
+            'domain_match': {'database': database, 'accession': accession, 'locations': locations, 'regions': regions}}
+
+
+def _domain_family_structures(info, key):
+    """Keep only exemplars explicitly mapped to the requested database entry."""
+    return [s for s in info.get('structures', [])
+            if s.get('domain_match', {}).get('database') == key[0]
+            and str(s['domain_match'].get('accession', '')).casefold() == key[1].casefold()
+            and s['domain_match'].get('locations')]
+
+
+def _domain_structure_refresh_needed(info, key):
+    return key[0] != 'pdb' and (len(_domain_family_structures(info, key)) != len(info.get('structures', []))
+        or any(not s.get('domain_match', {}).get('regions') for s in info.get('structures', [])))
+
+
+def _domain_checked_info(info, key):
+    if not _domain_structure_refresh_needed(info, key):
+        return info
+    return {**{k: v for k, v in info.items() if not k.startswith('_')},
+            'structures': _domain_family_structures(info, key)}
 
 
 def _domain_descriptions(metadata):
@@ -4220,6 +4781,8 @@ def _fetch_domain_info(accession, database="pfam", integrated_hint=None):
     import re
     from urllib.parse import quote
 
+    if database == "pdb":
+        return _fetch_structure_publication(accession)
     if database not in set(_INTERPRO_DATABASES.values()) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,100}", accession):
         raise ValueError("Invalid domain database or accession.")
     encoded_accession = quote(accession, safe="")
@@ -4234,14 +4797,18 @@ def _fetch_domain_info(accession, database="pfam", integrated_hint=None):
 
     source_entry = fetch(f"/entry/{database}/{encoded_accession}/", "Member database description")
     metadata = source_entry.get("metadata", {}) if isinstance(source_entry, dict) else {}
+    if metadata.get('accession') and metadata['accession'].casefold() != accession.casefold():
+        raise ValueError('InterPro returned a different member accession than requested.')
     info["descriptions"] = [{**d, "source": accession, "database": database} for d in _domain_descriptions(metadata)]
     name = metadata.get("name") or {}
     info["name"] = name.get("name", "") if isinstance(name, dict) else str(name)
-    integrated = metadata.get("integrated") or integrated_hint
+    integrated = metadata.get('integrated') if 'integrated' in metadata else integrated_hint
     if isinstance(integrated, str) and re.fullmatch(r"IPR\d+", integrated):
         info["integrated"] = integrated
         entry = fetch(f"/entry/interpro/{integrated}/", "InterPro description")
         ipr = entry.get("metadata", {}) if isinstance(entry, dict) else {}
+        if ipr.get('accession') and ipr['accession'] != integrated:
+            raise ValueError('InterPro returned a different integrated accession than requested.')
         info["descriptions"].extend({**d, "source": integrated} for d in _domain_descriptions(ipr))
         info["go_terms"] = [term for term in ipr.get("go_terms") or []
                             if isinstance(term, dict) and re.fullmatch(r"GO:\d+", term.get("identifier", ""))]
@@ -4249,63 +4816,274 @@ def _fetch_domain_info(accession, database="pfam", integrated_hint=None):
     representative = metadata.get("representative_structure") or {}
     pdb = representative.get("accession", "") if isinstance(representative, dict) else ""
     if re.fullmatch(r"[A-Za-z0-9]{4}|pdb_[A-Za-z0-9]+", pdb):
-        structure = {"accession": pdb, "name": representative.get("name", ""), "representative": True}
         details = fetch(f"/structure/pdb/{pdb}/entry/{database}/{encoded_accession}/", "Representative structure details")
         if isinstance(details, dict):
-            data = details.get("metadata", {})
-            structure.update({"resolution": data.get("resolution"), "method": data.get("experiment_type"),
-                              "chains": sorted({e["chain"] for e in details.get("entries", []) if e.get("chain")})})
-        info["structures"].append(structure)
-    else:
+            structure = _domain_structure_match(details, pdb, database, accession, representative=True)
+            if structure:
+                if not structure['name']:
+                    structure['name'] = representative.get('name', '')
+                info['structures'].append(structure)
+    if not info['structures']:
         examples = fetch(f"/structure/pdb/entry/{database}/{encoded_accession}/?page_size=3", "Example structures")
         if isinstance(examples, dict):
             for item in examples.get("results", [])[:3]:
                 data = item.get("metadata", {})
                 pdb = data.get("accession", "")
                 if re.fullmatch(r"[A-Za-z0-9]{4}|pdb_[A-Za-z0-9]+", pdb):
-                    info["structures"].append({
-                        "accession": pdb, "name": data.get("name", ""), "representative": False,
-                        "resolution": data.get("resolution"), "method": data.get("experiment_type"),
-                        "chains": sorted({e["chain"] for e in item.get("entries", []) if e.get("chain")}),
-                    })
+                    structure = _domain_structure_match(item, pdb, database, accession)
+                    if structure:
+                        info['structures'].append(structure)
     return info
+
+
+def _fetch_structure_publication(pdb):
+    """Fetch the deposited primary structure citation, without searching by name."""
+    import json
+    import re
+    from urllib.error import HTTPError
+    from urllib.request import Request, urlopen
+
+    if not isinstance(pdb, str) or not re.fullmatch(r"[A-Za-z0-9]{4}|pdb_[A-Za-z0-9]+", pdb):
+        raise ValueError("Invalid PDB accession for publication lookup.")
+    request = Request(f"https://data.rcsb.org/rest/v1/core/entry/{pdb.lower()}",
+                      headers={"Accept": "application/json", "User-Agent": "ChimeraX-Trimmings/1.0"})
+    try:
+        with urlopen(request, timeout=15) as response:
+            data = json.load(response)
+    except HTTPError as error:
+        if error.code == 404:
+            return {"publications": {}}
+        raise
+    citation = data.get("rcsb_primary_citation") or {}
+    doi = citation.get("pdbx_database_id_DOI") or ""
+    doi = doi.strip() if isinstance(doi, str) else ""
+    if not re.fullmatch(r"10\.\d{4,9}/\S+", doi):
+        doi = ""
+    pubmed = str(citation.get("pdbx_database_id_PubMed") or "")
+    if not pubmed.isdigit() or int(pubmed) < 1:
+        pubmed = ""
+    if not doi and not pubmed:
+        return {"publications": {}}
+    return {"publications": {pdb.lower(): {"title": citation.get("title") or "Structure publication",
+            "doi": doi, "pubmed": pubmed, "year": citation.get("year"),
+            "journal": citation.get("journal_abbrev") or ""}}}
+
+
+def _domain_structure_pdb(structure, record=None):
+    import re
+
+    pdb = structure.get("pdb") or structure.get("accession")
+    if isinstance(pdb, str) and re.fullmatch(r"[A-Za-z0-9]{4}|pdb_[A-Za-z0-9]+", pdb):
+        return pdb.lower()
+    if record is not None:
+        reference = record.get("structural_match", {}).get("reference", {})
+        if structure.get("url") and structure["url"] == reference.get("structure_url"):
+            return _domain_structure_pdb({"accession": reference.get("pdb")})
+    return None
 
 
 def _domain_details_html(session, record, info=None, loading=False):
     from html import escape
     from chimerax.atomic import concise_residue_spec
 
+    if _sequence_feature_kind(record):
+        return _sequence_feature_details_html(session, record, info, loading)
+
+    if record.get('origin') == 'foldseek':
+        record = _foldseek_annotation_identity(record)
+        # Caller-provided enrichment may have been assembled for an old label.
+        info = _domain_info_for_record(session, record)
+
     accession = record["accession"]
     database = record.get("database", "pfam")
     score_text = (f'{escape(record["source"])} score {_domain_number(record.get("score"))}'
                   if record.get("origin") == "interpro" else f'bit score {_domain_number(record.get("bitscore"))}')
-    parts = [f'<h3>{escape(record["name"])} ({escape(accession)})</h3>',
+    structures_url = record.get("structures_url", f'https://www.ebi.ac.uk/interpro/structure/pdb/entry/{database}/{accession}/')
+    structure_link = f' | <a href="{escape(structures_url, quote=True)}">All matching structures</a>' if structures_url else ""
+    parts = [f'<h3>{escape(_domain_display_name(record))} ({escape(accession)})</h3>',
              f'<p>{escape(concise_residue_spec(session, record["residues"]))}<br>'
              f'Query positions {record["start"]}&ndash;{record["end"]}; {len(record["residues"])} modeled residues<br>'
              f'{escape(record["type"])}; E-value {_domain_number(record.get("evalue"))}; {score_text}</p>',
-             f'<p><a href="{_domain_entry_url(record)}">{escape(record.get("source", "Pfam"))} entry</a> | '
-             f'<a href="https://www.ebi.ac.uk/interpro/structure/pdb/entry/{database}/{accession}/">All matching structures</a></p>']
+             f'<p><a href="{_domain_entry_url(record)}">{escape(record.get("source", "Pfam"))} entry</a>{structure_link}</p>']
+    if record.get("tentative"):
+        parts.append('<p><b>Tentative Pfam match:</b> below curated gathering thresholds. '
+                     'This is a candidate assignment requiring supporting evidence.</p>')
+    if record.get("structural_representative"):
+        parts.append('<p>Structural results transferred from sequence-identical representative '
+                     f'{escape(record["structural_representative"])} with the same modeled positions. '
+                     'Use deduplicate false to search each copy separately.</p>')
+    if record.get("structural_support"):
+        parts.append('<p><b>Foldseek evidence for this region</b></p><ul>')
+        for hit in record["structural_support"]:
+            match = hit["structural_match"]
+            parts.append(f'<li><a href="{escape(_domain_entry_url(hit), quote=True)}">'
+                         f'{escape(hit["name"])} ({escape(hit["accession"])})</a>; '
+                         f'positions {hit["start"]}–{hit["end"]}; '
+                         f'E-value {_domain_number(hit["evalue"])}; '
+                         f'alignment TM-score {match["alntmscore"]:.3f}</li>')
+        parts.append('</ul>')
+    if record.get("gathering_cutoff") is not None:
+        parts.append(f'<p>Pfam domain gathering cutoff: {_domain_number(record["gathering_cutoff"])} bits.</p>')
+    if record.get("pfam_backend") == "local":
+        parts.append(f'<p>Local Pfam release: {escape(record["pfam_release"])}; '
+                     f'profile coverage: {record["profile_coverage"]:.1%}; '
+                     f'composition-bias score: {_domain_number(record["composition_bias"])} bits.</p>')
+        if record["query_region"] != [1, len(record["sequence"])]:
+            a, b = record["query_region"]
+            parts.append(f'<p>Padded sequence retry: positions {a}&ndash;{b}; '
+                         'curated gathering cutoffs are unchanged.</p>')
+    if record.get("origin") == "foldseek":
+        match = record["structural_match"]
+        if match.get("search_round", 1) > 1 or match.get("search_strategy") == "pfam_guided":
+            first, last = match["search_region"]
+            label = "Pfam-guided search" if match.get("search_strategy") == "pfam_guided" else "Repeat search"
+            parts.append(f'<p>{label}: query positions {first}&ndash;{last} '
+                         f'({match["qlen"]} modeled residues). '
+                         'Query coverage and query TM-score below refer to this searched segment.</p>')
+        parts.append(f'<p><b>Structural match candidate</b><br>'
+                     f'Query coverage: {match["qcov"]:.1%}; reference coverage: {match["tcov"]:.1%}<br>'
+                     f'TM-scores: query {match["qtmscore"]:.3f}, reference {match["ttmscore"]:.3f}, '
+                     f'alignment {match["alntmscore"]:.3f}<br>'
+                     f'Matched reference: {escape(match["target"])}<br>'
+                     'The name describes the reference family. Structural similarity alone does not establish '
+                     'the query\'s family membership or specific function.</p>')
+        if "aligned_positions" in match:
+            parts.append(f'<p>Structural alignment: {len(match["aligned_positions"])} paired residues.</p>')
+        if record.get("display_boundary"):
+            a, b = record["display_boundary"]["original_range"]
+            parts.append(f'<p>Display boundary reconciled with neighboring structural domains. '
+                         f'The scoring alignment is unchanged (original query span {a}&ndash;{b}).</p>')
+        if match.get("alntmscore_raw") is not None:
+            parts.append(f'<p>Alignment TM-score corrected for a Foldseek normalization error '
+                         f'(reported value {match["alntmscore_raw"]:.4g}).</p>')
+        if record.get("pilot"):
+            parts.append('<p><b>Pilot library:</b> incomplete family coverage; scores depend on this reference collection.</p>')
+        mapping = record.get("pfam_assignment")
+        if mapping:
+            parts.append(f'<p>Reference Pfam mapping: {escape(mapping["evidence"])}.<br>'
+                         f'Original classification: <a href="{escape(mapping["entry_url"], quote=True)}">'
+                         f'{escape(mapping["accession"])}</a> ({escape(mapping["name"])}).</p>')
+            if record.get('pfam_mapping_status') == 'conflicting':
+                parts.append('<p>The localized sequence match disagrees with an upstream family-wide cross-reference. '
+                             'Descriptions use the sequence-supported reference family.</p>')
+        elif record.get("pfam_mapping_status"):
+            label = record["pfam_mapping_status"].replace("_", " ")
+            parts.append(f'<p>Pfam mapping: {escape(label)}; the ECOD classification is retained.</p>')
+            parts.append('<p>This is a fold-level classification. No Pfam functional description is assigned '
+                         'without a supported signature in the matched reference region.</p>')
+        if record.get("pfam_candidate_accessions"):
+            parts.append('<p>ECOD family-level Pfam cross-references (not established for this matched region): ' + ', '.join(
+                f'<a href="https://www.ebi.ac.uk/interpro/entry/pfam/{escape(a, quote=True)}/">{escape(a)}</a>'
+                for a in record["pfam_candidate_accessions"]) + '</p>')
+        reference = match.get("reference", {})
+        if reference.get("structure_source") in ("alphafold", "prediction"):
+            label = "AlphaFold" if reference["structure_source"] == "alphafold" else "Predicted"
+            parts.append(f'<p>{label} reference; mean domain pLDDT {_domain_number(reference.get("mean_plddt"))}. '
+                         f'{escape(reference.get("evidence", ""))}</p>')
+        if info is None:
+            info = _domain_info_for_record(session, record)
     if len(record.get("segments", [])) > 1:
         parts.append('<p>Segments: ' + ', '.join(f'{a}–{b}' for a, b in record["segments"]) + '</p>')
     if record.get("description"):
         parts.append(f'<p>{escape(_domain_plain_text(record["description"]))}</p>')
+    if record.get("alternatives"):
+        parts.append('<p><b>Alternative structural assignments for this region</b><br>'
+                     'These overlap or are contained within the stronger primary match; '
+                     'alignments can differ in gaps and domain boundaries.</p><ul>')
+        for alternative in record["alternatives"]:
+            parts.append(f'<li><a href="{escape(_domain_entry_url(alternative), quote=True)}">'
+                         f'{escape(alternative["name"])} ({escape(alternative["accession"])})</a>; '
+                         f'positions {alternative["start"]}–{alternative["end"]}; '
+                         f'E-value {_domain_number(alternative.get("evalue"))}; '
+                         f'bit score {_domain_number(alternative.get("bitscore"))}</li>')
+        parts.append('</ul>')
     if info is None:
         parts.append("<p>Loading descriptions and structure links&hellip;</p>" if loading
                      else "<p>Details have not been fetched yet.</p>")
         return "".join(parts)
-    if info.get("integrated"):
-        ipr = info["integrated"]
+    parts.append(_domain_info_html(info))
+    if record.get("origin") == "foldseek" and any(
+            key[0] != "pdb" and _cached_domain_info(session, key[1], key[0], key[2]) is None
+            for key in _domain_info_keys(record, session)):
+        parts.append("<p>Loading mapped InterPro/Pfam descriptions and example structures&hellip;</p>")
+    return "".join(parts)
+
+
+def _sequence_feature_details_html(session, record, info=None, loading=False):
+    from html import escape
+    from chimerax.atomic import concise_residue_spec
+
+    parts = [f'<h3>{escape(record["name"])} ({escape(record["accession"])})</h3>',
+             f'<p>{escape(concise_residue_spec(session, record["residues"]))}<br>'
+             f'Query positions {record["start"]}&ndash;{record["end"]}; {len(record["residues"])} modeled residues<br>'
+             f'{escape(record["type"])}; source: {escape(record.get("source", "Pfam"))}</p>']
+    if record.get("evalue") is not None:
+        parts.append(f'<p>E-value {_domain_number(record["evalue"])}; '
+                     f'score {_domain_number(record.get("bitscore") if record.get("bitscore") is not None else record.get("score"))}</p>')
+    elif record.get("score") is not None:
+        parts.append(f'<p>Profile score {_domain_number(record["score"])}</p>')
+    if record.get("parent_signature_name"):
+        parts.append(f'<p>Supporting family: {escape(record["parent_signature_name"])}; '
+                     f'family E-value {_domain_number(record.get("parent_evalue"))}; '
+                     f'family score {_domain_number(record.get("parent_score"))}. '
+                     'These scores describe the family match, not a separate site assessment.</p>')
+    for key, label in (("pattern", "Pattern"), ("matched_sequence", "Matched sequence"),
+                       ("prosite_release", "Local PROSITE definitions")):
+        if record.get(key):
+            parts.append(f'<p>{label}: <code>{escape(record[key])}</code></p>')
+    if record.get("origin") == "tmsegments":
+        parts.append(f'<p>TM segment number within chain: {record["tm_segment_number"]}.</p>')
+    if record.get("evidence"):
+        parts.append(f'<p>{escape(record["evidence"])}</p>')
+    if record.get("tentative"):
+        parts.append('<p>Tentative Pfam match below the curated gathering threshold.</p>')
+    if record.get("common"):
+        parts.append('<p>PROSITE marks this signature as common or nonspecific (SKIP-FLAG). '
+                     'It is shown because prosite_common is enabled.</p>')
+    if record.get("description"):
+        parts.append(f'<p>{escape(_domain_plain_text(record["description"]))}</p>')
+    if len(record.get("segments", [])) > 1:
+        parts.append('<p>Annotated site pieces: ' + ', '.join(
+            str(a) if a == b else f'{a}–{b}' for a, b in record["segments"]) + '</p>')
+    parts.append(f'<p><a href="{escape(_domain_entry_url(record), quote=True)}">Database documentation</a></p>')
+    if record.get("feature_kind") == "motif" and record.get("origin") == "prosite":
+        overlaps = [other for other in _live_domain_records(session)
+                    if other["chain"] is record["chain"] and not _sequence_feature_kind(other)
+                    and len(other["residues"].intersect(record["residues"]))]
+        if overlaps:
+            parts.append('<p>Overlapping domain annotations (context, not confirmation): '
+                         + "; ".join(escape(other["name"]) for other in overlaps) + '</p>')
+    if info is not None:
+        parts.append(_domain_info_html(info))
+    elif loading and record.get("origin") not in ("sequence", "tmsegments"):
+        parts.append('<p>Loading descriptions and structure links&hellip;</p>')
+    return "".join(parts)
+
+
+def _domain_info_html(info):
+    """Render plain metadata without touching molecular models or Qt widgets."""
+    from html import escape
+
+    if info.get('_rendered_html_version') == _DOMAIN_INFO_RENDER_VERSION and '_rendered_html' in info:
+        return info["_rendered_html"]
+    parts = []
+    if info.get("mapped_entries"):
+        parts.append('<p><b>Family details from InterPro/Pfam</b><br>Validated reference Pfam assignments: ' + ', '.join(
+            f'<a href="https://www.ebi.ac.uk/interpro/entry/pfam/{accession}/">{accession}</a>'
+            for accession in info["mapped_entries"]) + '</p>')
+    for ipr in info.get("integrated_entries", [info["integrated"]] if info.get("integrated") else []):
         parts.append(f'<p>Integrated InterPro entry: '
                      f'<a href="https://www.ebi.ac.uk/interpro/entry/interpro/{ipr}/">{escape(ipr)}</a></p>')
     for description in info.get("descriptions", []):
         source = description["source"]
         description_database = description.get("database", "pfam" if source.startswith("PF") else "interpro")
         label = " (AI-generated database text)" if description.get("generated") else ""
-        text = description["text"]
+        text = _domain_plain_text(description['text'])
         if len(text) > 1400:
             text = text[:1400].rsplit(" ", 1)[0] + "…"
+        description_url = description.get("entry_url", f"https://www.ebi.ac.uk/interpro/entry/{description_database}/{source}/")
         parts.append(f'<p><b>{escape(source)} description{label}</b><br>{escape(text)} '
-                     f'<a href="https://www.ebi.ac.uk/interpro/entry/{description_database}/{source}/">Full entry</a></p>')
+                     f'<a href="{escape(description_url, quote=True)}">Full entry</a></p>')
     terms = info.get("go_terms", [])
     if terms:
         parts.append("<p><b>Associated GO annotations</b><br>" + "<br>".join(
@@ -4314,81 +5092,508 @@ def _domain_details_html(session, record, info=None, loading=False):
     structures = info.get("structures", [])
     if structures:
         parts.append("<p><b>Structures</b></p><ul>")
-        for structure in structures:
+        for structure_index, structure in enumerate(structures):
             pdb = structure["accession"]
-            label = "Database representative" if structure["representative"] else "Example match"
+            label = structure.get("label", "Database representative" if structure["representative"] else "Example match")
             details = [str(structure["method"])] if structure.get("method") else []
             if structure.get("resolution") is not None:
                 details.append(f'{structure["resolution"]} Å')
             if structure.get("chains"):
                 details.append("chains " + ", ".join(structure["chains"]))
+            match = structure.get('domain_match')
+            if match:
+                details.append('Matched ' + match['accession'])
+                for location in match['locations']:
+                    author = location.get('author_start') is not None and location.get('author_end') is not None
+                    a, b = (location['author_start'], location['author_end']) if author else (location['start'], location['end'])
+                    details.append(f"{location['chain']}: {a}–{b}" + (' (author residues)' if author else ' (structure sequence positions)'))
             name = structure.get("name", "")
             if isinstance(name, dict):
                 name = name.get("name", "")
-            parts.append(f'<li>{label}: <a href="https://www.rcsb.org/structure/{pdb}">{pdb.upper()}</a> '
-                         f'(<a href="https://www.ebi.ac.uk/pdbe/entry/pdb/{pdb}">PDBe</a>)<br>'
-                         f'{escape(name)}<br>{escape("; ".join(details))}</li>')
+            url = structure.get("url", f"https://www.rcsb.org/structure/{pdb}")
+            alternate = (f' (<a href="https://www.ebi.ac.uk/pdbe/entry/pdb/{pdb}">PDBe</a>)'
+                         if "url" not in structure else "")
+            parts.append(f'<li>{label}: <a href="{escape(url, quote=True)}">{pdb.upper()}</a>{alternate}<br>'
+                         f'{escape(name)}<br>{escape("; ".join(details))}')
+            parts.append(f'<!--trimmings-structure-actions:{structure_index}-->')
+            publication = structure.get("publication")
+            if publication:
+                from urllib.parse import quote
+                links = []
+                if publication.get("doi"):
+                    links.append(f'<a href="https://doi.org/{escape(quote(publication["doi"], safe="/"), quote=True)}">Paper / DOI</a>')
+                if publication.get("pubmed"):
+                    links.append(f'<a href="https://pubmed.ncbi.nlm.nih.gov/{escape(publication["pubmed"], quote=True)}/">PubMed</a>')
+                parts.append('<br><b>Primary structure publication:</b> ' + escape(publication["title"]) +
+                             '<br>' + ' | '.join(links))
+            parts.append('</li>')
         parts.append("</ul>")
     elif not info.get("errors"):
-        parts.append("<p>No experimental structure links are available for this entry.</p>")
+        parts.append("<p>No verified experimental structure links are available for this entry.</p>")
     if not info.get("descriptions"):
         parts.append("<p>No additional functional description is available.</p>")
     if info.get("errors"):
         parts.append("<p>Some details could not be retrieved: " + escape("; ".join(info["errors"])) +
                      ". Use Reload details to retry.</p>")
     parts.append("<p><i>Annotations describe the domain family; exact function can differ between members.</i></p>")
-    return "".join(parts)
+    info["_rendered_html"] = "".join(parts)
+    info['_rendered_html_version'] = _DOMAIN_INFO_RENDER_VERSION
+    return info["_rendered_html"]
 
 
-def _ensure_domain_info(session, accession, database="pfam", integrated=None):
+def _domain_info_key(accession, database="pfam", integrated=None):
+    return database, accession, integrated or ""
+
+
+def _domain_info_keys(record, session=None):
+    """Use explicit database cross-references, never family-name guesses."""
+    import re
+
+    if record.get("origin") in ("sequence", "tmsegments"):
+        return []
+
+    if record.get("origin") != "foldseek":
+        keys = [_domain_info_key(record["accession"], record.get("database", "pfam"), record.get("integrated"))]
+    else:
+        reference = record.get("structural_match", {}).get("reference", {})
+        # A family-wide cross-reference or old cached accession is insufficient
+        # to attach function text to this particular matched domain.
+        if reference.get('catalog') == 'ECOD' and reference.get('name'):
+            accepted = _foldseek_reference_annotation(record['structural_match']).get('pfam_accessions', [])
+            keys = [_domain_info_key(accession) for accession in accepted]
+        elif reference.get('catalog') == 'ECOD' or reference.get('pfam_accessions'):
+            keys = []
+        else:
+            database, accession = reference.get('database', record.get('database')), reference.get('accession', record.get('accession'))
+            keys = [_domain_info_key(accession, database)] if database in _INTERPRO_DATABASES.values() and accession else []
+    structures = list(record.get("local_info", {}).get("structures", []))
+    if session is not None:
+        for key in keys:
+            info = _cached_domain_info(session, key[1], key[0], key[2])
+            if info is not None:
+                structures.extend(_domain_family_structures(info, key))
+    for structure in structures:
+        pdb = _domain_structure_pdb(structure, record)
+        if pdb:
+            keys.append(_domain_info_key(pdb, "pdb"))
+    return list(dict.fromkeys(keys))
+
+
+def _domain_info_for_record(session, record):
+    if record.get('origin') == 'foldseek':
+        record = _foldseek_annotation_identity(record)
+    keys = _domain_info_keys(record, session)
+    if not keys and record.get("origin") != "foldseek":
+        return None
+    remote = tuple(_cached_domain_info(session, key[1], key[0], key[2]) for key in keys)
+    structural = record.get("origin") == "foldseek"
+    local = record["local_info"] if structural else (_domain_checked_info(remote[0], keys[0]) if remote[0] is not None else None)
+    if local is None:
+        return None
+    previous = record.get("_enriched_info")
+    if (previous is not None and len(previous) == 4
+            and previous[3] == (_DOMAIN_INFO_ENRICH_VERSION, tuple(keys))
+            and previous[0] is local and len(previous[1]) == len(remote)
+            and all(old is new for old, new in zip(previous[1], remote))):
+        return previous[2]
+    available = [_domain_checked_info(info, key) for key, info in zip(keys, remote) if key[0] != "pdb" and info is not None]
+    publications = {pdb: publication for key, info in zip(keys, remote) if key[0] == "pdb" and info is not None
+                    for pdb, publication in info.get("publications", {}).items()}
+    if not publications and (not structural or not available):
+        return local
+    descriptions = [d for info in available for d in info.get("descriptions", [])]
+    structures, seen = [], set()
+    for info in [*available, local]:
+        for structure in info.get("structures", []):
+            identifier = structure["accession"]
+            key = structure.get("url", f"https://www.rcsb.org/structure/{identifier.lower()}")
+            if key not in seen:
+                seen.add(key)
+                publication = publications.get(_domain_structure_pdb(structure, record))
+                if publication:
+                    structure = {**structure, "publication": publication}
+                structures.append(structure)
+    terms = {term["identifier"]: term for info in available for term in info.get("go_terms", [])}
+    combined = {"descriptions": descriptions or local.get("descriptions", []), "structures": structures,
+                "integrated_entries": list(dict.fromkeys(info["integrated"] for info in available if info.get("integrated"))),
+                "go_terms": list(terms.values()), "errors": [error for info in available for error in info.get("errors", [])]}
+    if descriptions or any(info.get("structures") for info in available):
+        combined["mapped_entries"] = [key[1] for key in keys if key[0] == "pfam"
+                                      and key[1] in record.get('pfam_accessions', [])]
+    record["_enriched_info"] = local, remote, combined, (_DOMAIN_INFO_ENRICH_VERSION, tuple(keys))
+    return combined
+
+
+def _cached_domain_info(session, accession, database="pfam", integrated=None):
+    cache = getattr(session, "_trimmings_domain_info", {})
+    key = _domain_info_key(accession, database, integrated)
+    if key in cache:
+        return cache[key]
+    # Accept entries created before database-specific cache keys were introduced.
+    if not any(isinstance(k, tuple) and len(k) == 3 and k[1] == accession for k in cache):
+        return cache.get(accession)
+    return None
+
+
+def _domain_info_cache_dir():
+    from pathlib import Path
+
+    return Path(__file__).parent / ".domain_data" / "domain-descriptions"
+
+
+def _domain_info_disk_path(key):
+    from hashlib import sha256
+    import json
+
+    return _domain_info_cache_dir() / (sha256(json.dumps(key).encode()).hexdigest() + ".json")
+
+
+def _read_domain_info(key):
+    import json
+    from time import time
+
+    try:
+        with _domain_info_disk_path(key).open(encoding="utf-8") as stream:
+            text = stream.read(1_000_001)
+        if len(text) > 1_000_000:
+            return None
+        data = json.loads(text)
+        if (not isinstance(data, dict) or data.get("schema") != 1 or data.get("key") != list(key)
+                or not 0 <= time() - data["fetched"] < 14 * 86400 or not isinstance(data.get("info"), dict)):
+            return None
+        return {k: v for k, v in data["info"].items() if not k.startswith("_")}
+    except (OSError, ValueError, KeyError, TypeError):
+        return None
+
+
+def _write_domain_info(key, info, fetched):
+    import json
+    from pathlib import Path
+    import tempfile
+
+    if info.get("errors"):
+        return
+    temporary = None
+    try:
+        path = _domain_info_disk_path(key)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        # An older request must not replace a newer forced refresh on disk.
+        if path.is_file():
+            try:
+                previous = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                previous = {}
+            if isinstance(previous, dict) and isinstance(previous.get("fetched"), (int, float)) and previous["fetched"] > fetched:
+                return
+        payload = {"schema": 1, "key": list(key), "fetched": fetched,
+                   "info": {k: v for k, v in info.items() if not k.startswith("_")}}
+        with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=path.parent, delete=False) as stream:
+            temporary = Path(stream.name)
+            json.dump(payload, stream)
+        temporary.replace(path)
+    except (OSError, ValueError, TypeError):
+        pass  # A read-only cache directory must not prevent description display.
+    finally:
+        if temporary is not None:
+            try:
+                temporary.unlink(missing_ok=True)
+            except OSError:
+                pass
+
+
+def _domain_info_state(session):
+    from collections import OrderedDict
+    from threading import Lock
+    from types import SimpleNamespace
+
+    state = getattr(session, "_trimmings_domain_info_state", None)
+    if state is None:
+        state = SimpleNamespace(queue=OrderedDict(), active={}, jobs={}, disk_lock=Lock())
+        session._trimmings_domain_info_state = state
+        session._trimmings_domain_info_pending = None  # Invalidate an older script's request.
+    return state
+
+
+def _pump_domain_info(session):
     from threading import Thread
 
-    cache = getattr(session, "_trimmings_domain_info", {})
-    if accession in cache or getattr(session, "_trimmings_domain_info_pending", None) is not None:
+    state = _domain_info_state(session)
+    while state.queue and len(state.active) < 3:
+        key = next(iter(state.queue))
+        job = state.queue[key]
+        # Keep a slot available for an entry selected during background prefetch.
+        if not job["priority"] and len(state.active) >= 2:
+            break
+        state.queue.pop(key)
+        state.active[job["token"]] = job
+
+        def finish(job, info):
+            state.active.pop(job["token"], None)
+            key = job["key"]
+            if state.jobs.get(key) is job:
+                state.jobs.pop(key)
+                cache = getattr(session, "_trimmings_domain_info", {})
+                cache[key] = info
+                session._trimmings_domain_info = cache
+                tool = getattr(session, "_trimmings_domain_browser", None)
+                if tool is not None and not tool._closed:
+                    current = tool.current()
+                    if current is not None and key in _domain_info_keys(current, session):
+                        tool.show_current()
+                for structure in _domain_family_structures(info, key):
+                    pdb = _domain_structure_pdb(structure)
+                    if pdb:
+                        _ensure_domain_info(session, pdb, "pdb", priority=False)
+            _pump_domain_info(session)
+
+        def lookup(job=job, finish=finish):
+            key = job["key"]
+            info = None if job["refresh"] else _read_domain_info(key)
+            if info is not None and _domain_structure_refresh_needed(info, key):
+                info = None
+            if info is not None:
+                try:
+                    _domain_info_html(info)
+                except (KeyError, TypeError, ValueError, AttributeError):
+                    info = None
+            if info is None:
+                try:
+                    info = _fetch_domain_info(key[1], key[0], key[2] or None)
+                    _domain_info_html(info)
+                except Exception as error:
+                    info = {"errors": [str(error)]}
+                    _domain_info_html(info)
+                with state.disk_lock:
+                    if state.jobs.get(key) is job:
+                        _write_domain_info(key, info, job["created"])
+            session.ui.thread_safe(finish, job, info)
+
+        Thread(target=lookup, name="ChimeraX domain details", daemon=True).start()
+
+
+def _ensure_domain_info(session, accession, database="pfam", integrated=None, *, refresh=False, priority=True):
+    from time import time
+
+    cached = _cached_domain_info(session, accession, database, integrated)
+    if not refresh and cached is not None and not _domain_structure_refresh_needed(cached, _domain_info_key(accession, database, integrated)):
         return
-    token = object()
-    session._trimmings_domain_info_pending = token
+    state = _domain_info_state(session)
+    key = _domain_info_key(accession, database, integrated)
+    if key in state.jobs and not refresh:
+        if priority and key in state.queue:
+            state.queue[key]["priority"] = True
+            state.queue.move_to_end(key, last=False)
+    else:
+        job = {"key": key, "token": object(), "refresh": refresh, "priority": priority, "created": time()}
+        state.jobs[key] = state.queue[key] = job
+        if priority:
+            state.queue.move_to_end(key, last=False)
+    _pump_domain_info(session)
 
-    def finish(info):
-        if getattr(session, "_trimmings_domain_info_pending", None) is not token:
+
+def _prefetch_domain_info(session, records):
+    from threading import Thread
+
+    pending = getattr(session, "_trimmings_domain_local_info_pending", None)
+    if pending is None:
+        pending = session._trimmings_domain_local_info_pending = set()
+    local = {}
+    for record in records:
+        for key in _domain_info_keys(record, session):
+            _ensure_domain_info(session, key[1], key[0], key[2], priority=False)
+        if record.get("origin") == "foldseek":
+            info = record["local_info"]
+            if info.get('_rendered_html_version') != _DOMAIN_INFO_RENDER_VERSION and id(info) not in pending:
+                local[id(info)] = info
+    if local:
+        pending.update(local)
+        def render():
+            try:
+                for info in local.values():
+                    _domain_info_html(info)
+            finally:
+                pending.difference_update(local)
+        Thread(target=render, name="ChimeraX local domain descriptions", daemon=True).start()
+
+
+def _domain_exemplar_module():
+    global _DOMAIN_EXEMPLAR_MODULE
+    if _DOMAIN_EXEMPLAR_MODULE is None:
+        import importlib.util
+        from pathlib import Path
+        path = Path(__file__).with_name('domain_exemplars.py')
+        if not path.is_file():
+            raise ValueError('Place domain_exemplars.py beside chimerax_trimmings.py to fetch aligned exemplars.')
+        spec = importlib.util.spec_from_file_location('trimmings_domain_exemplars', path)
+        _DOMAIN_EXEMPLAR_MODULE = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(_DOMAIN_EXEMPLAR_MODULE)
+    return _DOMAIN_EXEMPLAR_MODULE
+
+
+def _domain_exemplar_state(session):
+    from types import SimpleNamespace
+    from threading import Semaphore
+    state = getattr(session, '_trimmings_domain_exemplars', None)
+    if state is None:
+        state = session._trimmings_domain_exemplars = SimpleNamespace(pairs={}, jobs={}, locks={}, network=Semaphore(2))
+    return state
+
+
+def _domain_exemplar_key(record, spec):
+    import json
+    source = ({k: spec[k] for k in ('provider','id','database','accession','mapped')} if spec.get('mapped') else spec)
+    return record['chain'], tuple(record['residues']), json.dumps(source, sort_keys=True)
+
+
+def _domain_exemplar_pair(session, record, spec):
+    pair = _domain_exemplar_state(session).pairs.get(_domain_exemplar_key(record, spec))
+    if pair is not None and not any(m.deleted or m.id is None for m in (pair.group, pair.domain, pair.full) if m is not None):
+        return pair
+    return None
+
+
+def _load_domain_exemplar(session, record, structure, *, context=False, notify=None):
+    from pathlib import Path
+    from threading import Thread, Lock
+    from time import monotonic
+
+    module = _domain_exemplar_module()
+    spec = module.source_spec(record, structure)
+    if spec is None or not _domain_record_is_current(record):
+        raise ValueError('This domain or its structure mapping is no longer available.')
+    key, state = _domain_exemplar_key(record, spec), _domain_exemplar_state(session)
+    def report(message):
+        session.logger.status(message, blank_after=0)
+        if notify:
+            notify(message)
+    pair = _domain_exemplar_pair(session, record, spec)
+    if pair is not None:
+        if context:
+            module.show_context(pair, pair.full is not None and not pair.full.display)
+        else:
+            module.realign_pair(session, record, pair)
+        pair.group.display = True
+        module.focus_pair(session, pair)
+        report(f"{spec['id'].upper()}: {pair.count} residues aligned; RMSD {pair.rmsd:.2f} Å.")
+        return pair
+    if key in state.jobs:
+        report(f"{spec['id'].upper()} is already loading.")
+        return None
+    token, started = object(), monotonic()
+    state.jobs[key] = token
+    report(f"Fetching {spec['id'].upper()} domain" + (" (0s)..." if spec.get('domain_only') else " and full context (0s)..."))
+    def progress(phase):
+        def show():
+            if state.jobs.get(key) is token:
+                report(f"{spec['id'].upper()}: {phase}; {monotonic()-started:.0f}s elapsed...")
+        session.ui.thread_safe(show)
+    def finish(path, resolved, error):
+        if state.jobs.get(key) is not token:
             return
-        session._trimmings_domain_info_pending = None
-        cache = getattr(session, "_trimmings_domain_info", {})
-        cache[accession] = info
-        session._trimmings_domain_info = cache
-        tool = getattr(session, "_trimmings_domain_browser", None)
-        if tool is not None and not tool._closed:
-            current = tool.current()
-            if current is not None and (current["accession"] == accession or current["accession"] not in cache):
-                tool.show_current()
-
-    def lookup():
+        state.jobs.pop(key)
+        if error is None and not _domain_record_is_current(record):
+            error = ValueError('The query domain changed or closed while the structure was loading.')
+        if error is None:
+            try:
+                report(f"Opening and aligning {spec['id'].upper()}...")
+                pair = module.open_aligned(session, record, resolved, path)
+                state.pairs[key] = pair
+                if context:
+                    module.show_context(pair, True)
+                module.focus_pair(session, pair)
+                message = (f"{spec['id'].upper()} aligned: {pair.count} residues, RMSD {pair.rmsd:.2f} Å; "
+                           + ('full source structure not identified.' if pair.full is None else
+                              'full context shown.' if context else 'full context loaded and hidden.'))
+                report(message)
+                session.logger.info(message)
+            except Exception as failure:
+                error = failure
+        if error is not None:
+            message = f"Could not align {spec['id'].upper()}: {error}"
+            report(message)
+            session.logger.warning(message)
+    def worker():
+        path, resolved, error = None, spec, None
         try:
-            info = _fetch_domain_info(accession, database, integrated)
-        except Exception as error:
-            info = {"errors": [str(error)]}
-        session.ui.thread_safe(finish, info)
-
-    Thread(target=lookup, name="ChimeraX domain details", daemon=True).start()
+            with state.network, state.locks.setdefault((spec['provider'],spec['id']), Lock()):
+                if spec.get('mapped') and not spec['regions']:
+                    data = _interpro_request(f"/structure/pdb/{spec['id']}/entry/{spec['database']}/{spec['accession']}/")
+                    checked = _domain_structure_match(data or {}, spec['id'], spec['database'], spec['accession'])
+                    if checked is None:
+                        raise ValueError('No current structure-region mapping was returned.')
+                    resolved = module.source_spec(record, checked)
+                path, resolved = module.fetch_source(resolved, Path(__file__).parent / '.domain_data/domain-structures', progress)
+        except Exception as failure:
+            error = failure
+        session.ui.thread_safe(finish, path, resolved, error)
+    Thread(target=worker, name='ChimeraX domain exemplar', daemon=True).start()
+    return None
 
 
 def _create_domain_browser(session):
-    from Qt.QtGui import QColor, QIcon, QPixmap
-    from Qt.QtWidgets import QCheckBox, QComboBox, QHBoxLayout, QLabel, QListWidget, QListWidgetItem, QPushButton, QTextBrowser, QVBoxLayout
-    from chimerax.core.models import REMOVE_MODELS
+    from Qt.QtCore import QTimer, Signal
+    from Qt.QtGui import QColor, QIcon, QPainter, QPixmap
+    from Qt.QtWidgets import QCheckBox, QComboBox, QDoubleSpinBox, QHeaderView, QHBoxLayout, QLabel, QPushButton, QTabBar, QTextBrowser, QTreeWidget, QTreeWidgetItem, QVBoxLayout, QWidget
+    from chimerax.core.models import ADD_MODELS, MODEL_DISPLAY_CHANGED, MODEL_ID_CHANGED, MODEL_NAME_CHANGED, MODEL_POSITION_CHANGED, REMOVE_MODELS
+    from chimerax.core.selection import SELECTION_CHANGED
     from chimerax.core.tools import ToolInstance
     from chimerax.std_commands.view import NamedView
     from chimerax.ui import MainToolWindow
+
+    class OccurrenceItem(QTreeWidgetItem):
+        def text(self, column=0):
+            return super().text(column)
+
+    class OccurrenceTree(QTreeWidget):
+        # Flat occurrence navigation remains independent of group expansion.
+        currentRowChanged = Signal(int)
+
+        def __init__(self):
+            super().__init__()
+            self.setColumnCount(2)
+            self.setHeaderLabels(("Domain / feature", "Copies"))
+            self.header().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+            self.header().setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
+            self._leaves = []
+            self.currentItemChanged.connect(lambda *_: self.currentRowChanged.emit(self.currentRow()))
+
+        def clear(self):
+            self._leaves = []
+            super().clear()
+
+        def count(self):
+            return len(self._leaves)
+
+        def item(self, index):
+            return self._leaves[index]
+
+        def currentRow(self):
+            item = self.currentItem()
+            return item.indices[0] if item is not None else -1
+
+        def setCurrentRow(self, index):
+            item = self._leaves[index] if 0 <= index < len(self._leaves) else None
+            if item is not None:
+                item.parent().setExpanded(True)
+            self.setCurrentItem(item)
 
     class DomainBrowser(ToolInstance):
         SESSION_SAVE = False
         SESSION_ENDURING = False
         _domain_browser_version = _DOMAIN_BROWSER_VERSION
+        _domain_browser_implementation = _DOMAIN_BROWSER_IMPLEMENTATION
 
         def __init__(self):
             super().__init__(session, "Protein Domains")
             self._closed, self._rows = False, []
+            self._last_details_html = None
+            self._last_details_record = None
+            self._row_activation = None
+            self._scope, self._nearby_index, self._last_cofr_key = 0, None, None
+            self._kind = 0
+            self._context_values = {}
             self._model_filter, self._remembered_domains = None, {}
+            self._remembered_groups = {}
             view = session.main_view
             self._starting_view = NamedView(view, view.center_of_rotation.copy(), [])
             self._starting_cofr = view.center_of_rotation.copy()
@@ -4400,7 +5605,7 @@ def _create_domain_browser(session):
             self.previous_model_button, self.next_model_button = QPushButton("<"), QPushButton(">")
             for button, label in ((self.previous_model_button, "Previous model"), (self.next_model_button, "Next model")):
                 button.setFixedWidth(30)
-                button.setToolTip(label)
+                button.setToolTip(label + ": show only this model")
                 button.setAccessibleName(label)
             self.previous_model_button.clicked.connect(lambda _checked=False: self.step_model(-1))
             self.next_model_button.clicked.connect(lambda _checked=False: self.step_model(1))
@@ -4416,13 +5621,40 @@ def _create_domain_browser(session):
             )
             self.show_only_model_button.clicked.connect(lambda _checked=False: self.show_only_model())
             root.addWidget(self.show_only_model_button)
+            self.kind_menu = QComboBox()
+            self.kind_menu.addItems(("Domains", "Sequence features", "All annotations"))
+            self.kind_menu.currentIndexChanged.connect(self._kind_changed)
+            root.addWidget(self.kind_menu)
+            self.scope_tabs = QTabBar()
+            for label in ("All domains", "Nearby", "Selected"):
+                self.scope_tabs.addTab(label)
+            self.scope_tabs.currentChanged.connect(self._scope_changed)
+            root.addWidget(self.scope_tabs)
+            self.nearby_controls = QWidget()
+            radius_row = QHBoxLayout(self.nearby_controls)
+            radius_row.setContentsMargins(0, 0, 0, 0)
+            radius_row.addWidget(QLabel("Within"))
+            self.nearby_radius = QDoubleSpinBox()
+            self.nearby_radius.setRange(1, 100)
+            self.nearby_radius.setDecimals(1)
+            self.nearby_radius.setSingleStep(.5)
+            self.nearby_radius.setSuffix(" Å")
+            self.nearby_radius.setValue(6)
+            self.nearby_radius.setToolTip("Minimum distance from any annotated atom to the center of rotation, in visible models.")
+            self.nearby_radius.valueChanged.connect(lambda *_args: self.refresh())
+            radius_row.addWidget(self.nearby_radius)
+            radius_row.addWidget(QLabel("of center of rotation"))
+            radius_row.addStretch(1)
+            self.nearby_controls.hide()
+            root.addWidget(self.nearby_controls)
             self.summary = QLabel()
             root.addWidget(self.summary)
-            self.domain_list = QListWidget()
+            self.domain_list = OccurrenceTree()
             self.domain_list.setAlternatingRowColors(True)
+            self.domain_list.setUniformRowHeights(True)
             self.domain_list.setMinimumWidth(360)
-            self.domain_list.currentRowChanged.connect(self._activate_current)
-            self.domain_list.itemClicked.connect(self._activate_current)
+            self.domain_list.currentRowChanged.connect(self._row_changed)
+            self.domain_list.itemClicked.connect(self._item_clicked)
             root.addWidget(self.domain_list, 1)
             navigation = QHBoxLayout()
             self.previous_button, self.next_button = QPushButton("< Previous"), QPushButton("Next >")
@@ -4435,7 +5667,10 @@ def _create_domain_browser(session):
             self.auto_center.setChecked(True)
             root.addWidget(self.auto_center)
             self.details = QTextBrowser()
-            self.details.setOpenExternalLinks(True)
+            self.details.setOpenExternalLinks(False)
+            self.details.setOpenLinks(False)
+            self.details.anchorClicked.connect(self._structure_link_clicked)
+            self._structure_actions = {}
             self.details.setMinimumHeight(220)
             root.addWidget(self.details, 2)
             actions = QHBoxLayout()
@@ -4451,7 +5686,22 @@ def _create_domain_browser(session):
             self.status = QLabel("Click a domain to select it. Details load from InterPro/Pfam.")
             self.status.setWordWrap(True)
             root.addWidget(self.status)
-            self._removed_handler = session.triggers.add_handler(REMOVE_MODELS, self._models_removed)
+            self._context_timer = QTimer(self.tool_window.ui_area)
+            self._context_timer.setSingleShot(True)
+            self._context_timer.setInterval(100)
+            self._context_timer.timeout.connect(self._refresh_context)
+            from chimerax.atomic import get_triggers
+            self._handlers = [
+                session.triggers.add_handler(REMOVE_MODELS, self._models_removed),
+                session.triggers.add_handler(ADD_MODELS, self._model_labels_changed),
+                session.triggers.add_handler(MODEL_ID_CHANGED, self._model_labels_changed),
+                session.triggers.add_handler(MODEL_NAME_CHANGED, self._model_labels_changed),
+                session.triggers.add_handler(MODEL_POSITION_CHANGED, self._model_geometry_changed),
+                session.triggers.add_handler(MODEL_DISPLAY_CHANGED, self._model_geometry_changed),
+                session.triggers.add_handler(SELECTION_CHANGED, self._selection_changed),
+                session.triggers.add_handler("new frame", self._new_frame),
+                get_triggers().add_handler("changes", self._atomic_changes),
+            ]
             self.tool_window.manage("side")
             self.refresh()
 
@@ -4459,8 +5709,24 @@ def _create_domain_browser(session):
             row = self.domain_list.currentRow()
             return self._rows[row] if 0 <= row < len(self._rows) else None
 
+        def current_copies(self):
+            item = self.domain_list.currentItem()
+            return item.copies if item is not None else []
+
+        def _current_is_live(self):
+            checked = set()
+            for record in self.current_copies():
+                key = record["chain"], id(record["sequence_residues"])
+                if key not in checked:
+                    if not _domain_record_is_current(record):
+                        return False
+                    checked.add(key)
+            return True
+
         def browser_model(self):
             record = self.current()
+            if self._model_filter is None and len({r["structure"] for r in self.current_copies()}) > 1:
+                return None
             model = self._model_filter if self._model_filter is not None else record["structure"] if record else None
             return model if model is not None and not model.deleted and model.id is not None else None
 
@@ -4488,12 +5754,114 @@ def _create_domain_browser(session):
             self.status.setText(f"Showing only #{model.id_string} {model.name}. Undo restores prior model visibility.")
 
         def _record_key(self, record):
-            return (record["chain"], record["accession"], record["start"], record["end"])
+            return (record["chain"], record["accession"], record["start"], record["end"], record["name"])
 
         def _remember_current(self):
             current = self.current()
             if current is not None:
-                self._remembered_domains[self._model_filter] = self._record_key(current)
+                key = self._model_filter, self._scope, self._kind
+                self._remembered_domains[key] = self._record_key(current)
+                self._remembered_groups[key] = self.domain_list.currentItem().parent() is None
+
+        def _kind_changed(self, *_args):
+            self._remember_current()
+            self._kind = self.kind_menu.currentIndex()
+            self.scope_tabs.setTabText(0, ("All domains", "All features", "All annotations")[self._kind])
+            label = ("domain", "feature", "annotation")[self._kind]
+            self.auto_center.setText("Auto-center on " + label)
+            self.focus_button.setText("Focus " + label)
+            self.refresh(remember=False)
+
+        def _scope_changed(self, *_args):
+            self._remember_current()
+            self._scope = self.scope_tabs.currentIndex()
+            self.nearby_controls.setVisible(self._scope == 1)
+            self.refresh(remember=False)
+
+        def _cofr(self):
+            import numpy as np
+            center = np.asarray(session.main_view.center_of_rotation, dtype=float)
+            return center if center.shape == (3,) and np.isfinite(center).all() else None
+
+        def _schedule_context(self):
+            if not self._closed and self.tool_window.shown and not self._context_timer.isActive():
+                self._context_timer.start()
+
+        def _refresh_context(self):
+            if not self._closed and self.tool_window.shown:
+                self.refresh()
+
+        def _selection_changed(self, *_args):
+            if self._scope == 2:
+                self._schedule_context()
+
+        def _new_frame(self, *_args):
+            if self._scope != 1 or self._closed or not self.tool_window.shown:
+                return
+            center = self._cofr()
+            key = tuple(center.round(2)) if center is not None else None
+            if key != self._last_cofr_key:
+                self._schedule_context()
+
+        def _model_labels_changed(self, *_args):
+            self._schedule_context()
+
+        def _model_geometry_changed(self, *_args):
+            if self._scope == 1:
+                self._schedule_context()
+
+        def _atomic_changes(self, _trigger, changes):
+            # Selection/color-only changes do not invalidate the geometry index.
+            if (changes.num_deleted_atoms() or len(changes.created_atoms()) or changes.residue_reasons()
+                    or changes.chain_reasons() or {"coord changed", "coordset changed"} & set(changes.atom_reasons())):
+                self._nearby_index = None
+                self._schedule_context()
+
+        def _context_rows(self, records):
+            from chimerax.atomic import concatenate, selected_atoms
+            import numpy as np
+            from types import SimpleNamespace
+
+            self._context_values = {}
+            if self._scope == 0:
+                return records
+            if self._scope == 2:
+                selected = selected_atoms(session).unique_residues
+                rows = []
+                for record in records:
+                    count = len(record["residues"].intersect(selected))
+                    if count:
+                        self._context_values[id(record)] = count
+                        rows.append(record)
+                return rows
+            center = self._cofr()
+            self._last_cofr_key = tuple(center.round(2)) if center is not None else None
+            if center is None or not records:
+                return []
+            index = self._nearby_index
+            models = list(dict.fromkeys(r["structure"] for r in records))
+            counts = [(model.num_atoms, model.num_residues) for model in models]
+            if (index is None or len(index.records) != len(records) or index.counts != counts
+                    or any(a is not b for a, b in zip(index.records, records))):
+                residues = concatenate([r["residues"] for r in records], remove_duplicates=True)
+                atoms = residues.atoms
+                index = self._nearby_index = SimpleNamespace(
+                    records=tuple(records), counts=counts, atoms=atoms, atom_residues=residues.indices(atoms.residues),
+                    domain_residues=[residues.indices(r["residues"]) for r in records], residue_count=len(residues))
+            delta = index.atoms.scene_coords - center
+            squared = np.einsum("ij,ij->i", delta, delta)
+            distances = np.full(index.residue_count, np.inf)
+            valid = np.isfinite(squared)
+            np.minimum.at(distances, index.atom_residues[valid], squared[valid])
+            rows = []
+            for record, positions in zip(records, index.domain_residues):
+                if not record["structure"].visible:
+                    continue
+                distance = float(np.sqrt(distances[positions].min()))
+                if distance <= self.nearby_radius.value():
+                    self._context_values[id(record)] = distance
+                    rows.append(record)
+            return sorted(rows, key=lambda record: self._context_values[id(record)])
 
         def _model_changed(self, *_args):
             self._remember_current()
@@ -4517,8 +5885,11 @@ def _create_domain_browser(session):
             else:
                 index = 1 + (current - 1 + direction) % count
             self.model_menu.setCurrentIndex(index)
+            self.show_only_model()
 
         def refresh(self, remember=True):
+            self._context_timer.stop()
+            self._row_activation = None
             if remember:
                 self._remember_current()
             models = _domain_analyzed_models(session)
@@ -4536,37 +5907,109 @@ def _create_domain_browser(session):
             self.model_menu.blockSignals(False)
             self.previous_model_button.setEnabled(bool(models))
             self.next_model_button.setEnabled(bool(models))
-            self._rows = [record for record in _live_domain_records(session)
-                          if self._model_filter is None or record["structure"] is self._model_filter]
+            all_records = _live_domain_records(session)
+            kind = self.kind_menu.currentIndex()
+            self._rows = self._context_rows([record for record in all_records
+                          if (self._model_filter is None or record["structure"] is self._model_filter)
+                          and (kind == 2 or bool(_sequence_feature_kind(record)) == (kind == 1))])
+            groups = _domain_groups(self._rows)
+            if self._scope != 1:
+                groups = dict(sorted(groups.items(), key=lambda item: (item[1][0]["name"].casefold(), item[0])))
+            groups = {key: sorted(copies, key=lambda r: (r["structure"].id, r["chain"].chain_id, r["start"], r["end"]))
+                      for key, copies in groups.items()}
+            self._rows = [record for copies in groups.values() for record in copies]
+            expanded = {self.domain_list.topLevelItem(i).group_key for i in range(self.domain_list.topLevelItemCount())
+                        if self.domain_list.topLevelItem(i).isExpanded()}
+            collapsed = {self.domain_list.topLevelItem(i).group_key for i in range(self.domain_list.topLevelItemCount())} - expanded
             self.domain_list.blockSignals(True)
             self.domain_list.clear()
             selected = 0 if self._rows else -1
-            remembered = self._remembered_domains.get(self._model_filter)
+            remembered = self._remembered_domains.get((self._model_filter, self._scope, kind))
+            parents = {}
+            for key, copies in groups.items():
+                representative = min(copies, key=lambda r: bool(r.get("tentative")))
+                label = f'{representative["name"]} ({representative["accession"]})'
+                count_label = f'{len(copies)} ' + ("copy" if len(copies) == 1 else "copies")
+                locations = f'{count_label} in {len({r["structure"] for r in copies})} model(s), {len({r["chain"] for r in copies})} chain(s)'
+                parent = OccurrenceItem([label, count_label])
+                parent.setToolTip(0, label + "; " + locations)
+                parent.setToolTip(1, locations)
+                parent.group_key, parent.copies, parent.indices = key, copies, []
+                self.domain_list.addTopLevelItem(parent)
+                parent.setExpanded(key in expanded)
+                parents[key] = parent
             for index, record in enumerate(self._rows):
                 if self._record_key(record) == remembered:
                     selected = index
                 chain_spec = record["chain"].atomspec
                 if not chain_spec.startswith("#"):
                     chain_spec = f'#{record["structure"].id_string}' + chain_spec
-                text = (f'{chain_spec} | {record["name"]} ({record["accession"]}) | '
+                text = (f'{chain_spec} | {_domain_display_name(record)} ({record["accession"]}) | '
                         f'{record["start"]}–{record["end"]}')
-                if record.get("origin") == "interpro":
+                if record.get("origin") in ("interpro", "foldseek", "prosite", "sequence", "tmsegments"):
                     text += f' | {record["source"]}'
+                if record.get("alternatives"):
+                    text += f' | +{len(record["alternatives"])} alternatives'
+                if self._scope == 1:
+                    text += f' | {self._context_values[id(record)]:.1f} Å'
+                elif self._scope == 2:
+                    count = self._context_values[id(record)]
+                    text += f' | {count} selected residue' + ("s" if count != 1 else "")
                 swatch = QPixmap(12, 12)
-                swatch.fill(QColor.fromRgbF(*_domain_color(record.get("color_accession", record["accession"]))))
-                item = QListWidgetItem(QIcon(swatch), text)
-                self.domain_list.addItem(item)
-            self.domain_list.setCurrentRow(selected)
+                rgba = _domain_record_color(session, record)
+                if rgba is None:
+                    text += ' | overlapping alternative (no separate color)'
+                    swatch.fill(QColor('transparent'))
+                    painter = QPainter(swatch)
+                    painter.setPen(QColor('gray'))
+                    painter.drawRect(1, 1, 9, 9)
+                    painter.drawLine(1, 10, 10, 1)
+                    painter.end()
+                else:
+                    swatch.fill(QColor.fromRgbF(*rgba))
+                key = next(iter(_domain_groups([record])))
+                parent = parents[key]
+                item = OccurrenceItem([text])
+                item.setToolTip(0, text)
+                item.setIcon(0, QIcon(swatch))
+                item.indices, item.copies = [index], [record]
+                parent.addChild(item)
+                parent.indices.append(index)
+                if parent.childCount() == 1 or (rgba is not None and not getattr(parent, '_colored', False)):
+                    parent.setIcon(0, QIcon(swatch))
+                parent._colored = getattr(parent, '_colored', False) or rgba is not None
+                self.domain_list._leaves.append(item)
+            for parent in parents.values():
+                if not getattr(parent, '_colored', False):
+                    parent.setText(0, parent.text(0) + ' (overlapping alternative)')
+            item = self.domain_list.item(selected) if selected >= 0 else None
+            if item is not None and self._remembered_groups.get((self._model_filter, self._scope, kind)):
+                item = item.parent()
+            self.domain_list.setCurrentItem(item)
+            if item is not None and item.parent() is not None and item.parent().group_key not in collapsed:
+                item.parent().setExpanded(True)
             self.domain_list.blockSignals(False)
             scope = (f"{len(models)} analyzed model(s)" if self._model_filter is None
                      else f"#{self._model_filter.id_string} {self._model_filter.name}")
-            self.summary.setText(f"{len(self._rows)} annotation matches in {scope}")
+            tentative = sum(bool(r.get("tentative")) for r in self._rows)
+            confidence = f" ({tentative} tentative)" if tentative else ""
+            context = ("", f" within {self.nearby_radius.value():g} Å of center of rotation", " overlapping selected residues")[self._scope]
+            self.summary.setText(f"{len(groups)} groups; {len(self._rows)} annotation matches{confidence} in {scope}{context}")
+            self.summary.setWordWrap(True)
             for button in (self.previous_button, self.next_button, self.focus_button, self.reload_button):
                 button.setEnabled(bool(self._rows))
-            self.status.setText("Click a domain to select it. Details load from InterPro/Pfam.")
+            self.status.setText("Click an annotation to select it. Feature selection preserves domain colors."
+                                if kind else "Click a domain to select it. Details load from InterPro/Pfam.")
             self.show_current()
+            _prefetch_domain_info(session, all_records)
 
         def step(self, direction):
+            item = self.domain_list.currentItem()
+            if item is not None and item.parent() is None:
+                index = (self.domain_list.indexOfTopLevelItem(item) + direction) % self.domain_list.topLevelItemCount()
+                self.domain_list.setCurrentItem(self.domain_list.topLevelItem(index))
+                self.domain_list.scrollToItem(self.domain_list.currentItem())
+                return
             if self._rows:
                 index = (self.domain_list.currentRow() + direction) % len(self._rows)
                 if index == self.domain_list.currentRow():
@@ -4575,54 +6018,144 @@ def _create_domain_browser(session):
                     self.domain_list.setCurrentRow(index)
                     self.domain_list.scrollToItem(self.domain_list.currentItem())
 
+        def _row_changed(self, *_args):
+            self._row_activation = self.current()
+            self._activate_current()
+            QTimer.singleShot(0, self._clear_row_activation)
+
+        def _clear_row_activation(self):
+            self._row_activation = None
+
+        def _item_clicked(self, *_args):
+            # A mouse click on a different row also emits currentRowChanged.
+            # Handle it once; clicking the current row again still reselects/focuses.
+            if self._row_activation is not None and self._row_activation is self.current():
+                self._row_activation = None
+                return
+            self._activate_current()
+
         def show_current(self):
+            self._structure_actions = {}
             self.show_only_model_button.setEnabled(self.browser_model() is not None)
             record = self.current()
-            if record is not None and not any(record is r for r in _live_domain_records(session)):
+            if record is not None and not self._current_is_live():
                 self.refresh()
                 return
             if record is None:
-                self.details.setHtml("<p>No domain matches were found in the analyzed chains of this model.</p>"
+                self._last_details_html = None
+                self._last_details_record = None
+                if self._kind:
+                    self.details.setHtml("<p>No sequence features match this view. Run "
+                                         "<b>domains #1 source features</b> for local SEG and PROSITE analysis; "
+                                         "Pfam/InterPro features also appear here when available.</p>")
+                    return
+                self.details.setHtml("<p>No annotated domains overlap the selected residues. Select residues in an analyzed model.</p>"
+                                     if self._scope == 2 else
+                                     f"<p>No annotated domains within {self.nearby_radius.value():g} Å of the center of rotation in visible models.</p>"
+                                     if self._scope == 1 else
+                                     "<p>No domain matches were found in the analyzed chains of this model.</p>"
                                      if self._model_filter is not None else
                                      "<p>No live domain matches. Run <b>domains #1</b> to annotate a structure.</p>")
                 return
-            cache = getattr(session, "_trimmings_domain_info", {})
-            info = cache.get(record["accession"])
-            self.details.setHtml(_domain_details_html(session, record, info, loading=info is None))
-            self.details.verticalScrollBar().setValue(0)
-            if info is None:
-                _ensure_domain_info(session, record["accession"], record.get("database", "pfam"), record.get("integrated"))
+            info = _domain_info_for_record(session, record)
+            html = _domain_details_html(session, record, info, loading=info is None)
+            if _domain_record_color(session, record) is None:
+                html = ('<p><b>Overlapping alternative:</b> this annotation has no separately colored residues. '
+                        'Higher-priority matches control the colors of this region.</p>' + html)
+            self._structure_actions = {}
+            if info is not None and not _sequence_feature_kind(record):
+                import hashlib, json
+                for index, structure in enumerate(info.get('structures', [])):
+                    try:
+                        spec = _domain_exemplar_module().source_spec(record, structure)
+                    except ValueError:
+                        spec = None
+                    if spec is None:
+                        continue
+                    token = str(id(record)) + '_' + hashlib.sha256(json.dumps(spec,sort_keys=True).encode()).hexdigest()[:16]
+                    self._structure_actions[token] = record, structure
+                    pair = _domain_exemplar_pair(session, record, spec)
+                    align_label = 'Realign domain' if pair else 'Fetch &amp; align domain'
+                    context_label = 'Hide context' if pair and pair.full is not None and pair.full.display else 'Show full context'
+                    context_control = (f'<td bgcolor="#dddddd"><a href="trimmings-domain:context:{token}">{context_label}</a></td>'
+                                       if not spec.get('domain_only') else '<td>Full source unavailable</td>')
+                    controls = ('<br><table cellspacing="3"><tr>'
+                        f'<td bgcolor="#dddddd"><a href="trimmings-domain:align:{token}">{align_label}</a></td>'
+                        + context_control + '</tr></table>')
+                    html = html.replace(f'<!--trimmings-structure-actions:{index}-->', controls)
+            copies = self.current_copies()
+            if len(copies) > 1:
+                from html import escape
+                from chimerax.atomic import concise_residue_spec
+                html = (f'<h3>{len(copies)} copies</h3><p>Select this group to select every listed copy; '
+                        'expand it to inspect individual occurrences.</p><ul>' + ''.join(
+                            f'<li>#{r["structure"].id_string} {escape(r["structure"].name)}: '
+                            f'{escape(concise_residue_spec(session, r["residues"]))}</li>' for r in copies)
+                        + '</ul><p><b>Example copy — individual scores below apply to this copy:</b></p>' + html)
+            if html != self._last_details_html:
+                scroll = self.details.verticalScrollBar()
+                position = scroll.value() if self._last_details_record is record else 0
+                self.details.setHtml(html)
+                scroll.setValue(position)
+                self._last_details_html = html
+                self._last_details_record = record
+            for key in _domain_info_keys(record, session):
+                _ensure_domain_info(session, key[1], key[0], key[2])
+            return record
+
+        def _structure_link_clicked(self, url):
+            if url.scheme().lower() in ('http','https'):
+                from Qt.QtGui import QDesktopServices
+                QDesktopServices.openUrl(url)
+                return
+            if url.scheme() != 'trimmings-domain':
+                return
+            action, separator, token = url.path().partition(':')
+            target = self._structure_actions.get(token)
+            if not separator or action not in ('align','context') or target is None:
+                return
+            def notify(message):
+                if not self._closed:
+                    self.status.setText(message)
+                    self.show_current()
+            try:
+                _load_domain_exemplar(session, *target, context=(action=='context'), notify=notify)
+            except Exception as error:
+                self.status.setText(str(error))
+                session.logger.warning(str(error))
 
         def _activate_current(self, *_args):
-            from chimerax.atomic import selected_atoms
+            from chimerax.atomic import selected_atoms, concatenate
             from chimerax.core.objects import Objects
             from chimerax.std_commands.select import select
 
-            record = self.current()
+            record = self.show_current()
             if record is None:
                 return
-            if not any(record is r for r in _live_domain_records(session)):
-                self.refresh()
-                return
-            atoms = record["residues"].atoms
-            if set(selected_atoms(session)) != set(atoms):
+            atoms = concatenate([r["residues"].atoms for r in self.current_copies()], remove_duplicates=True)
+            selected = selected_atoms(session)
+            if len(selected) != len(atoms) or len(selected.intersect(atoms)) != len(atoms):
                 select(session, Objects(atoms=atoms, bonds=atoms.intra_bonds))
-            self.show_current()
             if self.auto_center.isChecked():
-                self.focus_current()
+                self._focus_record(record, self.current_copies())
 
         def focus_current(self):
             record = self.current()
             if record is None:
                 return
-            if not any(record is r for r in _live_domain_records(session)):
+            if not self._current_is_live():
                 self.refresh()
                 return
+            self._focus_record(record, self.current_copies())
+
+        def _focus_record(self, record, copies=None):
+            from chimerax.atomic import concatenate
             model = record["structure"]
-            if not model.visible:
-                self.status.setText(f"Model #{model.id_string} is hidden; show it to inspect this domain.")
+            if not any(r["structure"].visible for r in copies or [record]):
+                self.status.setText(f"Model #{model.id_string} is hidden; show it to inspect this annotation.")
                 return
-            bounds = record["residues"].atoms.scene_bounds
+            atoms = [r["residues"].atoms for r in copies or [record] if r["structure"].visible]
+            bounds = concatenate(atoms, remove_duplicates=True).scene_bounds if atoms else None
             if bounds is None:
                 return
             view, center = session.main_view, bounds.center()
@@ -4631,7 +6164,8 @@ def _create_domain_browser(session):
             view.clip_planes.set_clip_position("near", center - depth * normal, view)
             view.clip_planes.set_clip_position("far", center + depth * normal, view)
             view.center_of_rotation = center
-            self.status.setText("Centered on domain. Restore view returns to the starting camera and clipping.")
+            label = "feature" if _sequence_feature_kind(record) else "domain"
+            self.status.setText(f"Centered on {label}. Restore view returns to the starting camera and clipping.")
 
         def restore_view(self):
             view = session.main_view
@@ -4642,7 +6176,11 @@ def _create_domain_browser(session):
         def reload_details(self):
             record = self.current()
             if record is not None:
-                getattr(session, "_trimmings_domain_info", {}).pop(record["accession"], None)
+                if record.get("origin") == "foldseek":
+                    record["local_info"].pop("_rendered_html", None)
+                    record.pop("_enriched_info", None)
+                for key in _domain_info_keys(record, session):
+                    _ensure_domain_info(session, key[1], key[0], key[2], refresh=True)
                 self.show_current()
 
         def _models_removed(self, *_args):
@@ -4652,12 +6190,20 @@ def _create_domain_browser(session):
             if self._closed:
                 return
             self._closed = True
-            self._removed_handler.remove()
+            self._context_timer.stop()
+            for handler in self._handlers:
+                handler.remove()
+            self._handlers = []
             if getattr(session, "_trimmings_domain_browser", None) is self:
                 session._trimmings_domain_browser = None
             super().delete()
 
     return DomainBrowser()
+
+
+def _domain_browser_is_current(tool):
+    return (getattr(tool, '_domain_browser_version', 0) == _DOMAIN_BROWSER_VERSION
+            and getattr(tool, '_domain_browser_implementation', None) is _DOMAIN_BROWSER_IMPLEMENTATION)
 
 
 def domain_browser(session, models=None):
@@ -4671,7 +6217,7 @@ def domain_browser(session, models=None):
     if models is not None and (len(models) != 1 or models[0] not in _domain_analyzed_models(session)):
         raise UserError("Specify one analyzed atomic model, or omit the model to reopen the browser.")
     tool = getattr(session, "_trimmings_domain_browser", None)
-    if tool is not None and not tool._closed and getattr(tool, "_domain_browser_version", 0) != _DOMAIN_BROWSER_VERSION:
+    if tool is not None and not tool._closed and not _domain_browser_is_current(tool):
         # A script reload can leave an older browser instance alive.
         tool.delete()
         tool = None
@@ -4691,38 +6237,744 @@ def domains_cancel(session):
     if job is not None:
         job.set()
         session._trimmings_domain_job = None
-        session.logger.info("Cancelled the Pfam lookup locally; EMBL-EBI may finish its submitted search.")
+        if getattr(session, "_trimmings_tm_job", None) is job:
+            session._trimmings_tm_job = None
+        session.logger.status("Domain lookup cancelled.")
+        session.logger.info("Cancelled the domain lookup locally; submitted remote searches may still finish.")
     else:
-        session.logger.info("No Pfam lookup is running.")
+        session.logger.info("No domain lookup is running.")
+
+
+def _foldseek_module():
+    import importlib.util
+    from pathlib import Path
+
+    path = Path(__file__).with_name("domain_foldseek.py")
+    if not path.is_file():
+        raise ValueError("Place domain_foldseek.py beside chimerax_trimmings.py to enable local structural searches.")
+    spec = importlib.util.spec_from_file_location("trimmings_domain_foldseek", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def _foldseek_segments(positions):
+    segments = []
+    for position in sorted(set(positions)):
+        if segments and position == segments[-1][1] + 1:
+            segments[-1] = (segments[-1][0], position)
+        else:
+            segments.append((position, position))
+    return segments
+
+
+def _foldseek_display_hit(hit, entry):
+    """Fill alignment gaps for display, preserving scoring and explicit query pieces."""
+    hit = _foldseek_annotation_identity(hit)
+    match = hit.get("structural_match", {})
+    paired = (_foldseek_segments(match["aligned_positions"]) if "aligned_positions" in match
+              else hit.get("aligned_segments", hit.get("segments", [(hit["start"], hit["end"])])))
+    pieces = hit.get("query_segments")
+    if pieces is None:
+        # Upgrade cached annotations produced before display ranges were stored.
+        occurrence = match.get("query", "").rsplit("_domain", 1)
+        regions = entry.get("structural_query_regions", [])
+        if len(occurrence) == 2 and occurrence[1].isdigit() and int(occurrence[1]) < len(regions):
+            pieces = regions[int(occurrence[1])]
+        else:
+            pieces = [(hit["start"], hit["end"])]
+    segments = [(max(a, hit["start"]), min(b, hit["end"])) for a, b in pieces
+                if max(a, hit["start"]) <= min(b, hit["end"])]
+    return {**hit, "segments": segments, "aligned_segments": paired, "display_query_segments": pieces}
+
+
+def _domain_contact_boundary(positions, coordinates, residues, low, high, default):
+    """Choose a well-supported loop cut in a local C-alpha contact graph."""
+    import numpy as np
+
+    first, last = int(positions[0]), int(positions[-1])
+    delta = np.zeros(last - first + 2, dtype=np.int32)
+    # A contact contributes to every possible sequence cut between its endpoints.
+    # Ignore local backbone neighbors; use blocks to bound temporary memory.
+    for start in range(0, len(positions), 128):
+        vector = coordinates[start:start + 128, None, :] - coordinates[None, :, :]
+        distance = np.einsum("ijk,ijk->ij", vector, vector)
+        a, b = np.nonzero((distance <= 64.) & (positions[None, :] - positions[start:start + 128, None] > 3))
+        np.add.at(delta, positions[start + a] - first, 1)
+        np.add.at(delta, positions[b] - first, -1)
+    costs = np.cumsum(delta)
+
+    def splits_structure(cut):
+        left, right = residues[cut - 1:cut + 1]
+        return (left is not None and right is not None
+                and getattr(left, "ss_type", 0) in (1, 2)
+                and left.ss_type == getattr(right, "ss_type", 0)
+                and getattr(left, "ss_id", 0) == getattr(right, "ss_id", -1))
+    choices = [p for p in range(low, high + 1) if not splits_structure(p)]
+    if not choices:
+        return default, "overlap priority"
+    best = min(choices, key=lambda p: (costs[p - first], abs(p - default), p))
+    improvement = int(costs[default - first] - costs[best - first])
+    if improvement >= max(3, .2 * costs[default - first]):
+        return best, "local structural contacts"
+    # Preserve the existing score-based decision when contacts are inconclusive.
+    # A nearby loop may still prevent an otherwise arbitrary split through an SSE.
+    if splits_structure(default):
+        best = min(choices, key=lambda p: (abs(p - default), costs[p - first], p))
+        return best, "secondary-structure continuity"
+    return default, "overlap priority"
+
+
+def _domain_structural_display_boundaries(entry, hits):
+    """Reconcile adjacent structural footprints without altering search evidence.
+
+    Only crossing/adjacent contiguous assignments compete. Inserted domains,
+    explicit discontinuous pieces, sequence annotations and features stay intact.
+    """
+    import numpy as np
+
+    selected = [dict(hit) for hit in hits]
+    structural = sorted((h for h in selected if h.get("origin") == "foldseek" and len(h["segments"]) == 1),
+                        key=lambda h: (h["start"], h["end"]))
+    if len(structural) < 2:
+        return hits
+    residues = entry["residues"]
+    atoms = {i: r.find_atom("CA") for i, r in enumerate(residues, 1) if r is not None}
+    atoms = {i: a for i, a in atoms.items() if a is not None}
+
+    def allowed(hit):
+        return next(((a, b) for a, b in hit.get("display_query_segments", hit.get("query_segments", hit["segments"]))
+                     if a <= hit["start"] <= hit["end"] <= b), hit["segments"][0])
+
+    def update(hit, start, end, reason):
+        if (start, end) == (hit["start"], hit["end"]):
+            return
+        hit.setdefault("display_boundary", {"original_range": [hit["start"], hit["end"]]})
+        hit["display_boundary"] = {**hit["display_boundary"], "method": reason}
+        hit.update(start=start, end=end, segments=[(start, end)])
+
+    for left, right in zip(structural, structural[1:]):
+        if not (left["start"] < right["start"] <= left["end"] + 1 and left["end"] < right["end"]):
+            continue
+        # Bound changes to a local boundary neighborhood, keeping substantial
+        # seed cores on both sides and respecting the original query pieces.
+        padding = min(30, max(6, int(.2 * min(left["end"] - left["start"] + 1,
+                                             right["end"] - right["start"] + 1))))
+        low = max(left["start"] + 19, min(left["end"], right["start"] - 1) - padding, allowed(right)[0] - 1)
+        high = min(right["end"] - 20, max(left["end"], right["start"] - 1) + padding, allowed(left)[1])
+        if low > high:
+            continue
+        positions = np.array([p for p in range(left["start"], right["end"] + 1) if p in atoms], dtype=np.int32)
+        if len(positions) < 40:
+            continue
+        # Missing coordinates narrow the permitted window, rather than making
+        # sequence-index counts stand in for modeled core residues.
+        low, high = max(low, int(positions[19])), min(high, int(positions[-21]))
+        if low > high:
+            continue
+        default = left["end"] if _domain_hit_sort_key(left) <= _domain_hit_sort_key(right) else right["start"] - 1
+        default = max(low, min(high, default))
+        coordinates = np.array([atoms[int(p)].coord for p in positions], dtype=np.float64)
+        cut, reason = _domain_contact_boundary(positions, coordinates, residues, low, high, default)
+        update(left, left["start"], cut, reason)
+        update(right, cut + 1, right["end"], reason)
+    return selected
+
+
+def _foldseek_default_library():
+    from pathlib import Path
+    import json
+
+    root = Path(__file__).parent / ".domain_data"
+    settings = root / "default-library.json"
+    if not settings.is_file():
+        return root / "cdd-pilot"
+    data = json.loads(settings.read_text())
+    relative = data.get("library") if isinstance(data, dict) else None
+    if not isinstance(relative, str) or not relative or Path(relative).is_absolute():
+        raise ValueError("The configured structural library must be a relative directory in .domain_data.")
+    library = (root / relative).resolve()
+    if not library.is_relative_to(root.resolve()) or not (library / "manifest.json").is_file():
+        raise ValueError("The configured structural library is missing or outside .domain_data.")
+    return library
+
+
+def _foldseek_group_entries(entries, deduplicate):
+    """Share one search across identical sequences with identical query index maps."""
+    import json
+
+    groups = {}
+    for entry in entries:
+        key = (entry["sequence"], json.dumps(entry["structural_query_regions"]),
+               tuple(tuple(snapshot[0]) for snapshot in entry["structural_queries"]))
+        representative = groups.setdefault(key if deduplicate else entry["lookup_key"], entry)
+        entry["lookup_key"] = representative["lookup_key"]
+        entry["structural_representative"] = representative["spec"]
+    return {entry["lookup_key"]: entry for entry in groups.values()}
+
+
+def _foldseek_merge_pfam(structural, pfam):
+    """Prefer curated sequence assignments; retain overlapping structural evidence."""
+    curated = [{**hit, "origin": "pfam", "source": hit.get("source", "Pfam"), "database": "pfam",
+                "structural_support": []} for hit in pfam
+               if not _sequence_feature_kind(hit) and not hit.get("tentative") and not hit["outcompeted"]]
+    features = [{**hit, "origin": "pfam", "source": hit.get("source", "Pfam"), "database": "pfam"}
+                for hit in pfam if _sequence_feature_kind(hit) and not hit.get("tentative")]
+    remaining = []
+    for hit in _domain_collapse_structural_hits(structural):
+        positions = {p for a, b in hit.get("segments", [(hit["start"], hit["end"])]) for p in range(a, b + 1)}
+        candidates = []
+        for i, other in enumerate(curated):
+            overlap = max(0, min(hit["end"], other["end"]) - max(hit["start"], other["start"]) + 1)
+            span = overlap / max(hit["end"] - hit["start"] + 1, other["end"] - other["start"] + 1)
+            paired = sum(other["start"] <= p <= other["end"] for p in positions) / max(
+                len(positions), other["end"] - other["start"] + 1)
+            if span >= .7 and paired >= .5:
+                candidates.append((span, i))
+        if candidates:
+            _, i = max(candidates)
+            curated[i]["structural_support"].extend([hit, *hit.get("alternatives", [])])
+        else:
+            remaining.append(hit)
+    return curated + remaining + features
+
+
+def _foldseek_reference_annotation(match):
+    """Promote a supported Pfam identity while preserving the ECOD search hit."""
+    import re
+
+    reference = match["reference"]
+    if reference.get("catalog") != "ECOD":
+        return {}
+    mappings = [m for m in reference.get("pfam_mappings", [
+        {"accession": a, "method": "ecod"} for a in reference.get("pfam_accessions", [])])
+                if isinstance(m.get("accession"), str) and re.fullmatch(r"PF\d+", m["accession"])]
+    status = reference.get("pfam_mapping_status", "unresolved")
+    validated = [m for m in mappings if m.get("method") == "hmmer" and .8 <= m.get("profile_coverage", 0) <= 1]
+    candidates = []
+    # ECOD family names and their Pfam links can refer to the source protein,
+    # rather than this structural domain. Use the fold classification until a
+    # localized sequence signature supports the part that actually aligned.
+    classification = dict(piece.split(": ", 1) for piece in reference.get("description", "").split("; ") if ": " in piece)
+    structural_name = (reference.get("ecod_topology_name") or classification.get("Topology")
+                       or classification.get("Homology group") or classification.get("Architecture")
+                       or reference["name"])
+    fallback = {"name": structural_name + " (structural match)",
+                "pfam_mapping_status": ("conflicting" if status == "conflicting" else "partial" if validated
+                                        else "ambiguous" if len({m["accession"] for m in mappings}) > 1
+                                        else "unverified" if mappings else "unresolved"),
+                "pfam_accessions": [],
+                "pfam_candidate_accessions": list(dict.fromkeys(m["accession"] for m in mappings))}
+    if validated:
+        paired, position = set(), match.get("tstart", 1)
+        for query, target in zip(match.get("qaln", ""), match.get("taln", "")):
+            if query != "-" and target != "-":
+                paired.add(position)
+            position += target != "-"
+        families = {}
+        for mapping in validated:
+            families.setdefault(mapping["accession"], []).append(mapping)
+        for family_mappings in families.values():
+            footprint = {p for m in family_mappings for a, b in m.get("segments", []) for p in range(a, b + 1)}
+            overlap = len(paired & footprint)
+            # A complete family signature can identify a larger structural
+            # domain containing insertions/extensions. It must account for
+            # a majority of the actual alignment, rather than a small motif.
+            if overlap > .5 * len(paired) and overlap >= .5 * len(footprint):
+                candidates.extend(family_mappings)
+    accessions = {m["accession"] for m in candidates}
+    if len(accessions) > 1:
+        # Competing signatures from the same curated Pfam clan can describe the
+        # same fold. Resolve only mutually overlapping alternatives, not domains
+        # at distinct positions or signatures from unrelated clans.
+        groups = {a: [m for m in candidates if m['accession'] == a] for a in accessions}
+        clans = {m.get('clan') for m in candidates}
+        footprints = {a: {p for m in group for x, y in m['segments'] for p in range(x, y + 1)} for a, group in groups.items()}
+        winner = min(accessions, key=lambda a: (-sum(m.get('bitscore', 0) for m in groups[a]),
+                                               min(m.get('evalue', 1) for m in groups[a]), a))
+        if len(clans) == 1 and None not in clans and '' not in clans and all(
+                len(footprints[winner] & footprints[a]) >= .7 * min(len(footprints[winner]), len(footprints[a]))
+                for a in accessions if a != winner):
+            candidates, accessions = groups[winner], {winner}
+    if len(accessions) != 1:
+        if len(accessions) > 1:
+            fallback["pfam_mapping_status"] = "ambiguous"
+        return fallback
+    mapping = min(candidates, key=lambda m: m.get("evalue", 0))
+    accession = mapping["accession"]
+    return {"database": "pfam", "accession": accession, "color_accession": accession,
+            "name": mapping["name"] + " (structural match)", "source": "Foldseek / ECOD → Pfam",
+            "entry_url": f"https://www.ebi.ac.uk/interpro/entry/pfam/{accession}/",
+            "structures_url": f"https://www.ebi.ac.uk/interpro/structure/pdb/entry/pfam/{accession}/",
+            "pfam_accessions": [accession], "pfam_mapping_status": status,
+            "pfam_assignment": {"evidence": mapping["evidence"], "accession": reference["accession"],
+                                "name": reference["name"], "entry_url": reference["entry_url"]},
+            "mapped_description": {"source": accession, "database": "pfam", "text": mapping.get("description", "")}}
+
+
+def _foldseek_annotation_identity(hit):
+    """Derive labels and description identity from the actual matched reference.
+
+    Cached display fields are never evidence. Rebuild them together so a stale
+    Pfam accession or local description cannot survive a changed assignment.
+    """
+    match = hit.get('structural_match', {})
+    reference = match.get('reference', {})
+    if hit.get('origin') != 'foldseek' or not all(k in reference for k in ('accession', 'name', 'database', 'entry_url')):
+        return hit
+    result = {k: v for k, v in hit.items() if k not in ('pfam_assignment', 'pfam_accessions', 'pfam_candidate_accessions',
+              'pfam_mapping_status', 'integrated', '_enriched_info', 'description')}
+    result.update(database=reference['database'], accession=reference['accession'], name=reference['name'] + ' (structural match)',
+                  color_accession=reference['accession'], source='Foldseek / ' + reference.get('catalog', 'CDD'),
+                  entry_url=reference['entry_url'], structures_url=reference.get('structures_url'), description='', annotation_identity_version=3)
+    local = hit.get('local_info', {})
+    identifiers = {str(reference.get(k, '')).lower() for k in ('id', 'pdb', 'ecod_domain', 'uniprot') if reference.get(k)}
+    structures = [s for s in local.get('structures', []) if not s.get('representative') and (
+        (s.get('url') and s['url'] == (reference.get('structure_url') or reference.get('entry_url')))
+        or str(s.get('accession', '')).lower() in identifiers)]
+    result['local_info'] = {'structures': structures, 'descriptions': [
+        {'source': reference.get('catalog_accession', reference.get('cdd_accession', reference['accession'])),
+         'text': reference.get('description', ''), 'entry_url': reference['entry_url']}]}
+    annotation = _foldseek_reference_annotation(match)
+    description = annotation.pop('mapped_description', None)
+    result.update(annotation)
+    if description and description.get('text'):
+        result['local_info']['descriptions'].insert(0, description)
+    if hit.get('annotation_identity_version') == 3 and all(hit.get(k) == result.get(k) for k in (
+            'database', 'accession', 'name', 'pfam_accessions', 'pfam_assignment', 'pfam_mapping_status', 'pfam_candidate_accessions',
+            'description', 'color_accession', 'source', 'entry_url', 'structures_url', 'integrated')) \
+            and local.get('descriptions') == result['local_info']['descriptions'] and local.get('structures') == structures:
+        return hit
+    return result
+
+
+def _foldseek_search_entries(entries, library, module, timeout, cancel, executable, progress=None, pfam_results=None):
+    from pathlib import Path
+    import tempfile
+
+    results = {entry["lookup_key"]: [] for entry in entries}
+    with tempfile.TemporaryDirectory(prefix="trimmings-domains-") as directory:
+        queries, owners, guidance = {}, {}, {}
+        for index, entry in enumerate(entries):
+            for occurrence, snapshot in enumerate(entry["structural_queries"]):
+                identifier = f"chain{index}_domain{occurrence}"
+                positions, names, coords = snapshot
+                lines = [f'ATOM  {i:5d}  CA  {name:>3s} A{i:4d}    '
+                         f'{x:8.3f}{y:8.3f}{z:8.3f}{1.:6.2f}{0.:6.2f}           C\n'
+                         for i, (name, (x, y, z)) in enumerate(zip(names, coords), 1)]
+                (Path(directory) / (identifier + ".pdb")).write_text("".join(lines) + "TER\nEND\n")
+                queries[identifier] = {"positions": positions, "label": entry["spec"] + f" query region {occurrence + 1}"}
+                if "structural_query_regions" in entry:
+                    queries[identifier]["segments"] = entry["structural_query_regions"][occurrence]
+                owners[identifier] = entry["lookup_key"]
+                if pfam_results is not None:
+                    guidance[identifier] = [(h["start"], h["end"]) for h in pfam_results[entry["sequence"]]
+                                            if not _sequence_feature_kind(h) and not h.get("tentative") and not h["outcompeted"]]
+        options = {"guidance": guidance} if pfam_results is not None else {}
+        result = module.run_search(directory, queries, library, timeout, cancel, executable, 4, progress, **options)
+    if progress is not None:
+        progress("preparing domain annotations")
+    for match in module.select_matches(result["hits"]):
+        reference = match["reference"]
+        if reference.get("structure_source") == "alphafold":
+            structure = {"accession": reference["uniprot"], "name": reference["structure_title"],
+                         "representative": False, "chains": [reference["chain"]],
+                         "url": reference["structure_url"], "label": "Matched AlphaFold reference"}
+        elif reference.get("catalog") == "ECOD":
+            structure = {"accession": reference["ecod_domain"] or match["target"], "name": reference["structure_title"],
+                         "pdb": reference.get("pdb"),
+                         "representative": False, "chains": [reference["chain"]],
+                         "url": reference["structure_url"], "label": "Matched ECOD domain"}
+        elif reference.get("structure_source") in ("prediction", "reused") and not reference.get("pdb"):
+            structure = {"accession": reference["id"], "name": reference["structure_title"],
+                         "representative": False, "chains": [reference.get("chain", "A")],
+                         "url": reference.get("structure_url") or reference["entry_url"],
+                         "label": "Matched predicted reference" if reference["structure_source"] == "prediction" else "Matched structural reference"}
+        else:
+            structure = {"accession": reference["pdb"], "name": reference["structure_title"],
+                         "representative": False, "chains": [reference["chain"]]}
+        segments = _foldseek_segments(match["aligned_positions"])
+        accession = reference["accession"]
+        hit = {
+            "origin": "foldseek", "source": "Foldseek / " + reference.get("catalog", "CDD"), "database": reference["database"],
+            "accession": accession, "name": reference["name"] + " (structural match)",
+            "description": "", "type": "Structural match candidate", "outcompeted": False,
+            "start": segments[0][0], "end": segments[-1][1], "segments": segments,
+            **({"query_segments": queries[match["query"]]["segments"]}
+               if "segments" in queries[match["query"]] else {}),
+            "evalue": match["evalue"], "bitscore": match["bits"], "color_accession": accession,
+            "entry_url": reference["entry_url"], "structural_match": match, "pilot": result["pilot"],
+            **({"structures_url": reference["structures_url"]} if "structures_url" in reference else {}),
+            "local_info": {"descriptions": [{"source": reference.get("catalog_accession", reference.get("cdd_accession", accession)),
+                            "text": reference["description"], "entry_url": reference["entry_url"]}],
+                           "structures": [structure]},
+        }
+        mapped = _foldseek_reference_annotation(match)
+        description = mapped.pop("mapped_description", None)
+        hit.update(mapped)
+        if description is not None:
+            hit["local_info"]["descriptions"].insert(0, description)
+        results[owners[match["query"]]].append(hit)
+    if pfam_results is not None:
+        results = {entry["lookup_key"]: _foldseek_merge_pfam(results[entry["lookup_key"]], pfam_results[entry["sequence"]])
+                   for entry in entries}
+    return results, result
+
+
+def _annotate_foldseek(session, atoms, library, regions, color, refresh, timeout, wait, gui, pfam_guided=False, deduplicate=True,
+                       pfam_backend="auto", pfam_database=None, feature_options=None):
+    from hashlib import sha256
+    import json
+    from pathlib import Path
+    import shutil
+    from threading import Event, Thread
+    from time import monotonic
+    import numpy as np
+    from chimerax.core.errors import UserError
+
+    try:
+        module = _foldseek_module()
+        library = Path(library).expanduser().resolve() if library else _foldseek_default_library()
+        manifest_text = (library / "manifest.json").read_text()
+        manifest = json.loads(manifest_text)
+        guidance_backend = _pfam_backend(pfam_backend, pfam_database, library) if pfam_guided else None
+        pieces = module.parse_segments(regions) if regions is not None else None
+        executable = shutil.which("foldseek") or next((str(p) for p in (
+            Path("/opt/homebrew/bin/foldseek"), Path("/usr/local/bin/foldseek")) if p.is_file()), None)
+        if executable is None:
+            raise ValueError("Install Foldseek and make its executable available on PATH.")
+        entries = _domain_chain_inputs(atoms)
+        unique, geometry = {}, []
+        for entry in entries:
+            domains = pieces or [[(1, len(entry["sequence"]))]]
+            if any(b > len(entry["sequence"]) for domain in domains for a, b in domain):
+                raise ValueError(f"Domain regions exceed the sequence length of {entry['spec']}.")
+            snapshots, targeted = [], set()
+            for domain in domains:
+                selected = [(i, residue, residue.find_atom("CA")) for i, residue in enumerate(entry["residues"], 1)
+                            if residue is not None and residue in entry["targets"] and any(a <= i <= b for a, b in domain)]
+                selected = [(i, residue, atom) for i, residue, atom in selected if atom is not None]
+                if not 20 <= len(selected) <= 9999:
+                    raise ValueError(f"Each query region in {entry['spec']} needs 20 to 9,999 modeled C-alpha atoms.")
+                coords = np.array([atom.coord for _, _, atom in selected], dtype=np.float64)
+                if not np.isfinite(coords).all() or (coords < -999).any() or (coords > 9999).any():
+                    raise ValueError("Coordinates cannot be exported safely for Foldseek.")
+                names = [r.name if len(r.name) <= 3 else "UNK" for _, r, _ in selected]
+                snapshots.append(([i for i, _, _ in selected], names, coords.tolist()))
+                geometry.extend((atom, np.array(atom.coord, copy=True)) for _, _, atom in selected)
+                targeted.update(r for _, r, _ in selected)
+            entry["targets"] = targeted
+            entry["structural_queries"] = snapshots
+            entry["structural_query_regions"] = domains
+            entry["lookup_key"] = sha256((str(module.SEARCH_VERSION) + manifest_text + entry["sequence"]
+                                           + json.dumps(snapshots) + json.dumps(domains) + "pfam-reference-labels-v3"
+                                           + ("pfam-guided-v3" + guidance_backend["identity"] if pfam_guided else "")
+                                           + ("separate:" + entry["spec"] if not deduplicate else "")).encode()).hexdigest()
+        unique = _foldseek_group_entries(entries, deduplicate)
+    except (OSError, ValueError, KeyError) as error:
+        raise UserError(f"Cannot prepare Foldseek search: {error}") from None
+    cache = getattr(session, "_trimmings_foldseek_cache", {})
+    cached = {key: cache[key] for key in unique if not refresh and key in cache}
+    missing = [entry for key, entry in unique.items() if key not in cached]
+    model_count = len({entry["chain"].structure for entry in entries})
+    if not missing and feature_options is None:
+        records = _apply_domain_results(session, entries, cached, color, False, gui, source="foldseek")
+        message = f"Foldseek complete (cached): {len(records)} matches across {model_count} model(s)."
+        session.logger.status(message)
+        session.logger.info(message)
+        return
+    cancel = Event()
+    started = monotonic()
+    session._trimmings_domain_job = cancel
+    reference_count = manifest["reference_count"] if manifest.get("schema") == 2 else len(manifest["records"])
+    session.logger.info((f"Searching {reference_count} local structural references with Foldseek. " if missing else
+                         "Reusing cached Foldseek domain results; checking sequence features. ")
+                        + ("Pilot library: coverage is limited. " if manifest.get("pilot") else "")
+                        + f"{len(entries)} chain(s), {len(unique)} representative search(es). "
+                        + "Use 'domains cancel' to stop waiting.")
+
+    def update_status(phase):
+        # Queued progress must not overwrite completion, cancellation, or a newer search.
+        if getattr(session, "_trimmings_domain_job", None) is cancel and not cancel.is_set():
+            seconds = int(monotonic() - started)
+            session.logger.status(f"Foldseek running: {model_count} model(s), {seconds}s elapsed; {phase}...",
+                                  blank_after=0)
+
+    def progress(phase):
+        if wait or not session.ui.is_gui:
+            update_status(phase)
+        else:
+            session.ui.thread_safe(update_status, phase)
+
+    update_status("preparing structure queries" if missing else "cached domains; checking sequence features")
+
+    def finish(results, result, error):
+        if getattr(session, "_trimmings_domain_job", None) is not cancel:
+            return
+        session._trimmings_domain_job = None
+        if cancel.is_set():
+            return
+        if error is None and any(atom.deleted or not np.array_equal(atom.coord, xyz) for atom, xyz in geometry):
+            error = ValueError("The query coordinates changed during the search; no annotations were applied.")
+        if error is not None:
+            state = "timed out" if isinstance(error, TimeoutError) else "failed"
+            session.logger.status(f"Foldseek {state} after {monotonic() - started:.1f}s; see Log for details.")
+            if wait or not session.ui.is_gui:
+                raise UserError(f"Foldseek search failed: {error}")
+            session.logger.error(f"Foldseek search failed: {error}")
+            return
+        cache = getattr(session, "_trimmings_foldseek_cache", {})
+        if not result.get("guidance_error") and result.get("guidance_cacheable", True):
+            cache.update(results)
+        session._trimmings_foldseek_cache = cache
+        if result.get("pfam_results") is not None:
+            _pfam_cache_results(session, result["pfam_results"], result["pfam_backend"])
+        if result.get("guidance_note"):
+            session.logger.warning(result["guidance_note"])
+        if result.get("guidance_error"):
+            session.logger.warning("Pfam guidance unavailable; used the full local search: " + result["guidance_error"])
+        for warning in result.get("feature_warnings", []):
+            session.logger.warning(warning)
+        records = _apply_domain_results(session, entries, {**cached, **results}, color, False, gui, source="foldseek",
+                                        feature_results=result.get("feature_results"))
+        duration = f"in {monotonic() - started:.1f}s" if missing else "(cached)"
+        message = f"Foldseek complete {duration}: {_domain_completion_counts(records)} across {model_count} model(s)."
+        session.logger.status(message)
+        session.logger.info(message + " Names describe structurally matched reference families; inspect coverage and alignments.")
+
+    def search():
+        feature_task = None
+        try:
+            feature_task = _start_domain_features(entries, feature_options, timeout, cancel, progress)
+            pfam_results, guidance_error, guidance_note = None, None, None
+            used_backend = guidance_backend
+            if pfam_guided and missing:
+                sequences = list(dict.fromkeys(entry["sequence"] for entry in missing))
+                cache = _pfam_cached(session, guidance_backend)
+                pfam_results = {seq: cache[seq] for seq in sequences if not refresh and seq in cache}
+                needed = [seq for seq in sequences if seq not in pfam_results]
+                try:
+                    if needed:
+                        fresh, used_backend, guidance_note = _pfam_lookup(
+                            needed, min(60, timeout / 3), cancel, progress, guidance_backend, all_sequences=sequences)
+                        if used_backend["identity"] != guidance_backend["identity"]:
+                            pfam_results = {}
+                        pfam_results.update(fresh)
+                except Exception as err:
+                    if cancel.is_set():
+                        raise
+                    guidance_error, pfam_results = str(err) or type(err).__name__, None
+                    progress("Pfam unavailable; starting full local search")
+            if missing:
+                remaining = timeout - (monotonic() - started)
+                results, result = _foldseek_search_entries(missing, library, module, remaining, cancel, executable, progress,
+                                                           pfam_results=pfam_results)
+            else:
+                results, result = {}, {}
+            result.update(pfam_results=pfam_results, guidance_error=guidance_error, guidance_note=guidance_note,
+                          pfam_backend=used_backend, guidance_cacheable=(not pfam_guided or
+                          used_backend["identity"] == guidance_backend["identity"]))
+            result["feature_results"], result["feature_warnings"] = _await_domain_features(feature_task, progress)
+            error = None
+        except Exception as err:
+            if feature_task is not None:
+                feature_task.stopped.set()
+            results, result, error = None, None, err
+        if wait or not session.ui.is_gui:
+            finish(results, result, error)
+        else:
+            session.ui.thread_safe(finish, results, result, error)
+
+    if wait or not session.ui.is_gui:
+        search()
+    else:
+        Thread(target=search, name="ChimeraX Foldseek domains", daemon=True).start()
+
+
+def _annotate_sequence_features(session, atoms, refresh, timeout, wait, gui,
+                                prosite_profiles, prosite_common, prosite_database):
+    from pathlib import Path
+    from threading import Event, Thread
+    from time import monotonic
+    from types import SimpleNamespace
+    from chimerax.core.errors import UserError
+
+    entries = _domain_chain_inputs(atoms)
+    sequences = list(dict.fromkeys(entry["sequence"] for entry in entries))
+    try:
+        module = _sequence_feature_backend()
+        if prosite_database is not None and not Path(prosite_database).expanduser().is_file():
+            raise ValueError("prosite_database must name a readable prosite.dat file.")
+    except (OSError, ValueError) as error:
+        raise UserError("Cannot prepare sequence features: " + str(error)) from None
+    cancel, stopped = Event(), Event()
+    started, phase = monotonic(), SimpleNamespace(text="preparing local scans")
+    session._trimmings_domain_job = cancel
+    session.logger.info(f"Sequence features: {len(sequences)} distinct sequence(s). "
+                        + ("Online profile enrichment sends sequences to ScanProsite. " if prosite_profiles else
+                           "SEG and PROSITE patterns run locally; only public definitions may be downloaded. ")
+                        + "Use 'domains cancel' to stop waiting.")
+    for entry in entries:
+        if not entry["chain"].full_sequence_known:
+            session.logger.warning(f"{entry['spec']}: features use the inferred chain sequence; "
+                                   "missing sequence can affect motifs and low-complexity boundaries, "
+                                   "and terminal matches may refer to fragment ends.")
+
+    def update_status():
+        if getattr(session, "_trimmings_domain_job", None) is cancel and not cancel.is_set():
+            session.logger.status(f"Sequence features running: {int(monotonic() - started)}s elapsed; {phase.text}...",
+                                  blank_after=0)
+
+    def report(message):
+        phase.text = message
+        if wait or not session.ui.is_gui:
+            update_status()
+        else:
+            session.ui.thread_safe(update_status)
+
+    def heartbeat():
+        while not stopped.wait(1) and not cancel.is_set():
+            session.ui.thread_safe(update_status)
+
+    def finish(results, warnings, error):
+        if getattr(session, "_trimmings_domain_job", None) is not cancel:
+            return
+        session._trimmings_domain_job = None
+        if cancel.is_set():
+            return
+        if error is not None:
+            session.logger.status("Sequence-feature lookup failed.")
+            if wait or not session.ui.is_gui:
+                raise UserError("Sequence-feature lookup failed: " + str(error)) from None
+            session.logger.error("Sequence-feature lookup failed: " + str(error))
+            return
+        for warning in warnings:
+            session.logger.warning(warning)
+        records = _apply_domain_results(session, entries, results, False, True, gui=gui, source="features",
+                                        include_tentative=True)
+        if gui and session.ui.is_gui:
+            session._trimmings_domain_browser.kind_menu.setCurrentIndex(1)
+        message = f"Sequence features complete in {monotonic() - started:.1f}s: {len(records)} matches across {len(entries)} chain(s)."
+        session.logger.status(message)
+        session.logger.info(message)
+
+    def lookup():
+        if session.ui.is_gui and not wait:
+            Thread(target=heartbeat, name="ChimeraX feature progress", daemon=True).start()
+        try:
+            results, warnings = module.search(sequences, Path(__file__).parent / ".domain_data" / "sequence-features",
+                                              timeout, cancel, report, database=prosite_database,
+                                              common=prosite_common, profiles=prosite_profiles, refresh=refresh)
+            error = None
+        except Exception as err:
+            results, warnings, error = None, [], err
+        finally:
+            stopped.set()
+        if wait or not session.ui.is_gui:
+            finish(results, warnings, error)
+        else:
+            session.ui.thread_safe(finish, results, warnings, error)
+
+    update_status()
+    if wait or not session.ui.is_gui:
+        lookup()
+    else:
+        Thread(target=lookup, name="ChimeraX sequence features", daemon=True).start()
 
 
 def annotate_domains(session, atoms, color=True, include_overlaps=False,
-                     refresh=False, timeout=600, wait=False, gui=True, source="pfam"):
+                     refresh=False, timeout=None, wait=False, gui=True, source="pfam", library=None, regions=None,
+                     include_tentative=None, pfam_guided=False, deduplicate=True,
+                     pfam_backend="auto", pfam_database=None,
+                     prosite_profiles=False, prosite_common=False, prosite_database=None, features=True,
+                     results=None, python=None):
     """Look up InterPro matches or search Pfam, and annotate only requested residues."""
     from math import isfinite
     from threading import Event, Thread
+    from time import monotonic
     from chimerax.core.errors import UserError
 
+    if timeout is None:
+        timeout = 1200 if source == "tmsegments" else 600
     if not isfinite(timeout) or timeout <= 0:
         raise UserError("timeout must be finite and greater than zero (seconds).")
-    if source not in ("pfam", "interpro"):
-        raise UserError("source must be pfam or interpro.")
+    if source not in ("pfam", "interpro", "foldseek", "features", "tmsegments"):
+        raise UserError("source must be pfam, interpro, foldseek, features, or tmsegments.")
+    if (results is not None or python is not None) and source != "tmsegments":
+        raise UserError("results and python apply only to source tmsegments.")
+    if not features and (source == "features" or prosite_profiles or prosite_common or prosite_database is not None):
+        raise UserError("features false cannot be combined with source features or PROSITE scan options.")
+    if prosite_database is not None:
+        from pathlib import Path
+        if not Path(prosite_database).expanduser().is_file():
+            raise UserError("prosite_database must name a readable prosite.dat file.")
+    if pfam_backend not in ("auto", "local", "online"):
+        raise UserError("pfam_backend must be auto, local, or online.")
+    if (pfam_backend != "auto" or pfam_database is not None) and not (
+            source == "pfam" or source == "foldseek" and pfam_guided):
+        raise UserError("pfam_backend and pfam_database apply to Pfam searches or Pfam-guided Foldseek searches.")
+    if include_tentative is None:
+        include_tentative = source == "pfam"
+    if include_tentative and source != "pfam":
+        raise UserError("include_tentative applies only to source pfam.")
     if getattr(session, "_trimmings_domain_job", None) is not None:
         raise UserError("A domain lookup is already running; use 'domains cancel' before starting another.")
+    if source == "tmsegments":
+        if library is not None or regions is not None or pfam_guided or not deduplicate:
+            raise UserError("library, regions, pfam_guided and deduplicate apply only to source foldseek.")
+        if prosite_profiles or prosite_common or prosite_database is not None:
+            raise UserError("PROSITE options apply to local feature scans; use source features for those scans.")
+        return annotate_tm_segments(session, atoms, color=False, results=results, python=python,
+                                    refresh=refresh, timeout=timeout, wait=wait, gui=gui, _domain_source=True)
+    if source == "features":
+        if library is not None or regions is not None or pfam_guided or not deduplicate:
+            raise UserError("library, regions, pfam_guided and deduplicate apply only to source foldseek.")
+        return _annotate_sequence_features(session, atoms, refresh, timeout, wait, gui,
+                                          prosite_profiles, prosite_common, prosite_database)
+    if source == "foldseek":
+        return _annotate_foldseek(session, atoms, library, regions, color, refresh, timeout, wait, gui, pfam_guided, deduplicate,
+                                  pfam_backend, pfam_database,
+                                  feature_options=({"database": prosite_database, "common": prosite_common,
+                                                    "profiles": prosite_profiles, "refresh": False} if features else None))
+    if pfam_guided or not deduplicate:
+        raise UserError("pfam_guided and deduplicate apply only to source foldseek.")
+    if library is not None or regions is not None:
+        raise UserError("library and regions apply only to source foldseek.")
     entries = _domain_chain_inputs(atoms)
     sequences = list(dict.fromkeys(entry["sequence"] for entry in entries))
+    try:
+        backend = _pfam_backend(pfam_backend, pfam_database) if source == "pfam" else None
+    except (OSError, ValueError, KeyError) as error:
+        raise UserError(f"Cannot prepare Pfam lookup: {error}") from None
     cache_name = "_trimmings_interpro_cache" if source == "interpro" else "_trimmings_pfam_cache"
     cache = getattr(session, cache_name, {})
+    if source == "interpro" and getattr(session, "_trimmings_interpro_cache_version", None) != _INTERPRO_CACHE_VERSION:
+        cache = {}
+    if source == "pfam":
+        cache = _pfam_cached(session, backend)
     cached = {seq: cache[seq] for seq in sequences if not refresh and seq in cache}
     missing = [seq for seq in sequences if seq not in cached]
-    if not missing:
-        _apply_domain_results(session, entries, cached, color, include_overlaps, gui=gui, source=source)
+    if not missing and not features:
+        _apply_domain_results(session, entries, cached, color, include_overlaps, gui=gui, source=source,
+                              include_tentative=include_tentative)
+        if source == "pfam":
+            session.logger.info("Pfam results reused from cache (" + backend["kind"] + ").")
         return
     cancel = Event()
+    started = monotonic()
+    feature_options = ({"database": prosite_database, "common": prosite_common,
+                        "profiles": prosite_profiles, "refresh": False} if features else None)
     session._trimmings_domain_job = cancel
-    description = ("Looking up exact sequence hashes in InterPro Matches" if source == "interpro"
-                   else "Searching Pfam at EMBL-EBI HMMER (curated gathering thresholds)")
-    session.logger.info(f"{description}: {len(missing)} distinct sequence(s). Use 'domains cancel' to stop waiting.")
+    if not missing:
+        description = f"Reusing cached {source} domains and checking sequence features"
+    elif source == "interpro":
+        description = "Looking up exact sequence hashes in InterPro Matches"
+    elif backend["kind"] == "local":
+        description = "Searching local Pfam " + backend["release"]
+    else:
+        description = "Searching Pfam at EMBL-EBI HMMER (curated gathering thresholds)"
+    sequence_count = len(missing) if missing else len(sequences)
+    session.logger.info(f"{description}: {sequence_count} distinct sequence(s). Use 'domains cancel' to stop waiting.")
     for entry in entries:
         if not entry["chain"].full_sequence_known:
             session.logger.warning(
@@ -4730,7 +6982,7 @@ def annotate_domains(session, atoms, color=True, include_overlaps=False,
                 "Missing regions may prevent an exact InterPro lookup or reduce Pfam detection."
             )
 
-    def finish(results, error):
+    def finish(results, error, used_backend=None, note=None, feature_results=None, feature_warnings=()):
         # Cancellation/new requests invalidate queued callbacks as well as polling.
         if getattr(session, "_trimmings_domain_job", None) is not cancel:
             return
@@ -4742,23 +6994,62 @@ def annotate_domains(session, atoms, color=True, include_overlaps=False,
                 raise UserError(f"Domain lookup failed: {error}")
             session.logger.error(f"Domain lookup failed: {error}")
             return
+        if note:
+            session.logger.warning(note)
+        for warning in feature_warnings:
+            session.logger.warning(warning)
         cache = getattr(session, cache_name, {})
-        cache.update(results)
-        setattr(session, cache_name, cache)
-        _apply_domain_results(session, entries, {**cached, **results}, color, include_overlaps, gui=gui, source=source)
+        if source == "pfam":
+            _pfam_cache_results(session, results, used_backend)
+            effective_cache = cached if used_backend["identity"] == backend["identity"] else {}
+        else:
+            cache = dict(cache) if getattr(session, "_trimmings_interpro_cache_version", None) == _INTERPRO_CACHE_VERSION else {}
+            cache.update(results)
+            setattr(session, cache_name, cache)
+            session._trimmings_interpro_cache_version = _INTERPRO_CACHE_VERSION
+            effective_cache = cached
+        records = _apply_domain_results(session, entries, {**effective_cache, **results}, color, include_overlaps, gui=gui, source=source,
+                                        include_tentative=include_tentative, feature_results=feature_results)
+        if source == "pfam":
+            label = "local " + used_backend["release"] if used_backend["kind"] == "local" else "online"
+            session.logger.info("Pfam complete (" + label + ").")
+        name = "Pfam" if source == "pfam" else "InterPro"
+        cached_note = " (cached domains)" if not missing else ""
+        message = f"{name} complete{cached_note} in {monotonic() - started:.1f}s: {_domain_completion_counts(records)}."
+        session.logger.status(message)
+        session.logger.info(message)
 
     def lookup():
+        used_backend, note, feature_task = backend, None, None
+        feature_results, feature_warnings = None, []
         try:
-            search = _interpro_search if source == "interpro" else _pfam_search
-            results = search(missing, timeout, cancel,
-                             lambda msg: session.ui.thread_safe(session.logger.status, msg))
+            def update_status(message):
+                if getattr(session, "_trimmings_domain_job", None) is cancel and not cancel.is_set():
+                    name = "Pfam" if source == "pfam" else "InterPro"
+                    session.logger.status(f"{name} running: {int(monotonic() - started)}s elapsed; {message}...", blank_after=0)
+            def report(message):
+                if wait or not session.ui.is_gui:
+                    update_status(message)
+                else:
+                    session.ui.thread_safe(update_status, message)
+            report("preparing lookups" if missing else "cached domains; checking sequence features")
+            feature_task = _start_domain_features(entries, feature_options, timeout, cancel, report)
+            if not missing:
+                results = {}
+            elif source == "pfam":
+                results, used_backend, note = _pfam_lookup(missing, timeout, cancel, report, backend, all_sequences=sequences)
+            else:
+                results = _interpro_search(missing, timeout, cancel, report)
+            feature_results, feature_warnings = _await_domain_features(feature_task, report)
             error = None
         except Exception as err:
+            if feature_task is not None:
+                feature_task.stopped.set()
             results, error = None, err
         if wait or not session.ui.is_gui:
-            finish(results, error)
+            finish(results, error, used_backend, note, feature_results, feature_warnings)
         else:
-            session.ui.thread_safe(finish, results, error)
+            session.ui.thread_safe(finish, results, error, used_backend, note, feature_results, feature_warnings)
 
     if wait or not session.ui.is_gui:
         lookup()
@@ -4812,6 +7103,23 @@ def _tm_segments(topology):
                              "number": len(segments) + 1})
         offset += length
     return segments
+
+
+def _tm_feature_hits(topology):
+    """Expose the existing M/B topology segments as ordinary sequence features."""
+    hits = []
+    for segment in _tm_segments(topology):
+        label = segment["label"]
+        kind = "helix" if label == "M" else "strand"
+        hits.append({"origin": "tmsegments", "feature_kind": "transmembrane_" + kind,
+                     "database": "deeptmhmm", "source": "DeepTMHMM", "accession": "DeepTMHMM:" + label,
+                     "name": _TM_NAMES[label], "type": "Predicted transmembrane " + kind,
+                     "start": segment["start"], "end": segment["end"],
+                     "tm_label": label, "tm_segment_number": segment["number"],
+                     "evalue": None, "bitscore": None, "outcompeted": False,
+                     "entry_url": "https://biolib.com/DTU/DeepTMHMM/", "structures_url": "",
+                     "description": "DeepTMHMM sequence-based topology prediction. Inspect the segment in its structural context."})
+    return hits
 
 
 def _tm_biolib_worker():
@@ -4902,7 +7210,7 @@ def _tm_predict(sequences, executable, timeout, cancel, status=None):
         return predictions
 
 
-def _apply_tm_results(session, entries, predictions, color=True, elapsed=None):
+def _apply_tm_results(session, entries, predictions, color=True, elapsed=None, gui=True):
     from html import escape
     from types import SimpleNamespace
     from urllib.parse import quote
@@ -4965,6 +7273,17 @@ def _apply_tm_results(session, entries, predictions, color=True, elapsed=None):
         undo.add(state, "set_records", previous, combined, option="M")
         state.set_records(combined)
         session.undo.register(undo)
+        # tmsegments targets complete chains even when the atom spec touches
+        # only one residue. Share that exact mapping with the feature browser.
+        feature_entries = [{**entry, "targets": {r for r in entry["residues"] if r is not None}}
+                           for entry in entries if entry["chain"] in updated]
+        if feature_entries:
+            feature_results = {entry["sequence"]: _tm_feature_hits(predictions[entry["sequence"]])
+                               for entry in feature_entries}
+            _apply_domain_results(session, feature_entries, feature_results, False, True, gui=gui,
+                                  source="tmsegments", include_tentative=True)
+            if gui and session.ui.is_gui:
+                session._trimmings_domain_browser.kind_menu.setCurrentIndex(1)
     helices = sum(record["label"] == "M" for record in records)
     strands = sum(record["label"] == "B" for record in records)
     session.logger.info(f"DeepTMHMM: {helices} TM helices, {strands} TM beta strands; "
@@ -4989,6 +7308,8 @@ def tm_segments_cancel(session):
     if cancel is not None:
         cancel.set()
         session._trimmings_tm_job = None
+        if getattr(session, "_trimmings_domain_job", None) is cancel:
+            session._trimmings_domain_job = None
         session.logger.status("DeepTMHMM cancelled locally; the remote job may continue.")
         session.logger.info("Cancelled DeepTMHMM locally; BioLib may finish a submitted remote job.")
     else:
@@ -4996,7 +7317,7 @@ def tm_segments_cancel(session):
 
 
 def annotate_tm_segments(session, atoms, color=True, results=None, python=None,
-                         refresh=False, timeout=1200, wait=False):
+                         refresh=False, timeout=1200, wait=False, gui=True, _domain_source=False):
     """Predict or import topology for complete protein chains touched by atoms."""
     from math import isfinite
     from pathlib import Path
@@ -5027,10 +7348,10 @@ def annotate_tm_segments(session, atoms, color=True, results=None, python=None,
         except (OSError, ValueError) as error:
             raise UserError(f"Cannot import DeepTMHMM results: {error}") from None
         # Imported predictions take precedence but do not pollute the remote cache.
-        return _apply_tm_results(session, entries, imported, color)
+        return _apply_tm_results(session, entries, imported, color, gui=gui)
     missing = [seq for seq in sequences if seq not in cached]
     if not missing:
-        return _apply_tm_results(session, entries, cached, color)
+        return _apply_tm_results(session, entries, cached, color, gui=gui)
     try:
         executable = _tm_python_executable(python)
     except ValueError as error:
@@ -5038,6 +7359,8 @@ def annotate_tm_segments(session, atoms, color=True, results=None, python=None,
     cancel = Event()
     started = monotonic()
     session._trimmings_tm_job = cancel
+    if _domain_source:
+        session._trimmings_domain_job = cancel
     session.logger.info(f"Submitting {len(missing)} distinct chain sequence(s) to {_TM_APP} on BioLib; "
                         "coordinates stay local. Use 'tmsegments cancel' to stop waiting.")
 
@@ -5059,6 +7382,8 @@ def annotate_tm_segments(session, atoms, color=True, results=None, python=None,
         if getattr(session, "_trimmings_tm_job", None) is not cancel:
             return
         session._trimmings_tm_job = None
+        if getattr(session, "_trimmings_domain_job", None) is cancel:
+            session._trimmings_domain_job = None
         if cancel.is_set():
             return
         if error is not None:
@@ -5071,7 +7396,7 @@ def annotate_tm_segments(session, atoms, color=True, results=None, python=None,
         cache = getattr(session, "_trimmings_tm_cache", {})
         cache.update(predictions)
         session._trimmings_tm_cache = cache
-        _apply_tm_results(session, entries, {**cached, **predictions}, color, elapsed=monotonic() - started)
+        _apply_tm_results(session, entries, {**cached, **predictions}, color, elapsed=monotonic() - started, gui=gui)
 
     def predict():
         try:
@@ -5098,7 +7423,7 @@ def register_command(logger):
 
     register("tmsegments", CmdDesc(required=[("atoms", AtomsArg)], keyword=[
         ("color", BoolArg), ("results", OpenFileNameArg), ("python", OpenFileNameArg),
-        ("refresh", BoolArg), ("timeout", FloatArg), ("wait", BoolArg),
+        ("refresh", BoolArg), ("timeout", FloatArg), ("wait", BoolArg), ("gui", BoolArg),
     ], synopsis="Annotate and color predicted transmembrane helices and beta strands with DeepTMHMM"),
         annotate_tm_segments, logger=logger)
     register("tmsegments cancel", CmdDesc(synopsis="Stop waiting for the current DeepTMHMM prediction"),
@@ -5107,14 +7432,19 @@ def register_command(logger):
     register(
         "domains",
         CmdDesc(required=[("atoms", AtomsArg)], keyword=[
-            ("color", BoolArg), ("include_overlaps", BoolArg),
+            ("color", BoolArg), ("include_overlaps", BoolArg), ("include_tentative", BoolArg),
             ("refresh", BoolArg), ("timeout", FloatArg), ("wait", BoolArg),
             ("gui", BoolArg),
-            ("source", EnumOf(("pfam", "interpro"))),
-        ], synopsis="Color and annotate domains using InterPro matches or a Pfam search"),
+            ("source", EnumOf(("pfam", "interpro", "foldseek", "features", "tmsegments"))),
+            ("library", StringArg), ("regions", StringArg),
+            ("pfam_guided", BoolArg), ("deduplicate", BoolArg),
+            ("pfam_backend", EnumOf(("auto", "local", "online"))), ("pfam_database", StringArg),
+            ("features", BoolArg), ("prosite_profiles", BoolArg), ("prosite_common", BoolArg), ("prosite_database", StringArg),
+            ("results", OpenFileNameArg), ("python", OpenFileNameArg),
+        ], synopsis="Annotate domains or sequence features using Pfam, InterPro, Foldseek, SEG, PROSITE and DeepTMHMM"),
         annotate_domains, logger=logger,
     )
-    register("domains cancel", CmdDesc(synopsis="Cancel the current Pfam domain lookup"),
+    register("domains cancel", CmdDesc(synopsis="Cancel the current domain or sequence-feature lookup"),
              domains_cancel, logger=logger)
     register("domainbrowser", CmdDesc(optional=[("models", ModelsArg)],
                                       synopsis="Browse domains for all analyzed models or one specified model"),
