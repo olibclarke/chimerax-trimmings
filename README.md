@@ -77,17 +77,21 @@ shapealign #2 to #1 color_fit true
 ```
 
 Aligns models or maps by shape. The first input moves; `to` stays fixed.
+
 Use `copy true` to fit a new atomic-model copy and leave the original unchanged.
+
 For small models in large maps, experimental `tiled true` runs the global
-search independently on padded submaps; `bandpass true map_resolution 2.2` ranks
-candidates using finer detail, down to the supplied map resolution in Angstroms.
-`copies N` finds up to N non-overlapping fitted copies, using confidence weights
-to reduce the influence of uncertain loops and termini. Optional point/helical
-`symmetry` fits one seed with implicit-neighbour overlap checks, then expands
-it; the default axis is map Z through the grid center. `refine_copies true`
-adds optional local fitting afterward. Multiple copies leave the original
-unchanged. Large map fits use native CPU workers automatically and show tile
+search independently on padded submaps.
+
+`copies N` finds up to N non-overlapping fitted copies, using confidence weights (pLDDT based)
+to reduce the influence of uncertain loops and termini. 
+
+Optional point/helical `symmetry` fits one seed with implicit-neighbour overlap checks, then expands
+it; the default axis is map Z through the grid center, and `refine_copies true` adds optional local fitting afterward. 
+
+Large map fits use native CPU workers automatically and show tile
 completion progress; `workers 1` selects serial execution.
+
 The GUI updates between fitting steps; single fits also allow window/Log
 interaction. Changing a fitting input cancels the pending fit.
 See [shape alignment options](SHAPE_ALIGN.md).
