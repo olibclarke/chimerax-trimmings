@@ -10556,11 +10556,57 @@ def annotate_tm_segments(session, atoms, color=True, results=None, python=None,
         Thread(target=predict, name="ChimeraX DeepTMHMM", daemon=True).start()
 
 
+def _ligand_tool_module():
+    """Load the optional browser beside this script, including runscript installs."""
+    import importlib.util
+    from pathlib import Path
+    import sys
+    from types import SimpleNamespace
+    from chimerax.core.errors import UserError
+
+    path = Path(__file__).resolve().with_name('ligand_search.py')
+    if not path.is_file():
+        raise UserError('Download ligand_search.py beside chimerax_trimmings.py to use ligandsearch.')
+    name = '_trimmings_ligand_search'
+    module = sys.modules.get(name)
+    stamp = path.stat().st_mtime_ns
+    if module is None or Path(module.__file__).resolve() != path or getattr(module, '_source_stamp', None) != stamp:
+        spec = importlib.util.spec_from_file_location(name, path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        module._source_stamp = stamp
+        sys.modules[name] = module
+    module.SHAPE = SimpleNamespace(**globals())
+    return module
+
+
+def ligand_search(session, map_model=None, resolution=2.6, level=None, radius=14., top=20,
+                  library=None, workers=0, observed=False, codes=None, frequency=True, fast=False,
+                  torsions=False, conformers=8):
+    return _ligand_tool_module().ligand_search(session, map_model, resolution, level, radius,
+                                              top, library, workers, observed, codes, frequency, fast,
+                                              torsions=torsions, conformers=conformers)
+
+
+def ligand_search_stop(session):
+    return _ligand_tool_module().ligand_stop(session)
+
+
 def register_command(logger):
     from chimerax.atomic import AtomsArg
     from chimerax.core.commands import BoolArg, CmdDesc, EnumOf, FloatArg, IntArg, ModelsArg, OpenFileNameArg, StringArg, register
 
     _register_shape_align_command(logger)
+
+    from chimerax.map import MapArg
+    register('ligandsearch', CmdDesc(optional=[('map_model', MapArg)], keyword=[
+        ('resolution', FloatArg), ('level', FloatArg), ('radius', FloatArg), ('top', IntArg),
+        ('library', StringArg), ('workers', IntArg), ('observed', BoolArg), ('codes', StringArg), ('frequency', BoolArg),
+        ('fast', BoolArg), ('torsions', BoolArg), ('conformers', IntArg),
+    ], synopsis='Browse a live top-hit CCD ligand search against a picked density blob or CoFR'),
+             ligand_search, logger=logger)
+    register('ligandsearch stop', CmdDesc(synopsis='Stop ligand screening or library update; retain completed top hits'),
+             ligand_search_stop, logger=logger)
 
     register("tmsegments", CmdDesc(required=[("atoms", AtomsArg)], keyword=[
         ("color", BoolArg), ("results", OpenFileNameArg), ("python", OpenFileNameArg),
