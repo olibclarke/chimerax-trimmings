@@ -70,7 +70,6 @@ shapealign #2 to #1
 shapealign #2-5 to #1
 shapealign #2 to #1 radius_search
 shapealign #2 to #1 radius_search copy true
-shapealign #2 to #1 tiled true bandpass true map_resolution 2.2 copy true
 shapealign #2 to #1 tiled true copies 6
 shapealign #2 to #1 tiled true copies 6 symmetry C6
 shapealign #2 to #1 color_fit true
