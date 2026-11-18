@@ -1419,7 +1419,12 @@ from contextvars import ContextVar
 from math import pi, sqrt
 
 _SHAPE_BATCH_CACHE = ContextVar("shapealign_batch_cache", default=None)
+_SHAPE_MAP_WORKERS = ContextVar("shapealign_map_workers", default=None)
+_SHAPE_TILE_PROGRESS = ContextVar("shapealign_tile_progress", default=None)
+_SHAPE_UI = ContextVar("shapealign_ui", default=None)
+_SHAPE_INPUT_GUARD = ContextVar("shapealign_input_guard", default=None)
 _SHAPE_CACHE_BYTES = 256 * 1024 ** 2  # Retained preprocessing only, not fitter scratch space.
+_SHAPE_PARALLEL_MAP_WORK = 500_000  # Amortize native-worker startup on substantial refinements.
 _SHAPE_AUTO_PARALLEL_MIN = 4
 _MAX_GRID_VOXELS = 16_000_000  # 64 MB per float32 grid, before fitter scratch space.
 _MAX_CORRELATION_VOXELS = 8_000_000  # Several moment arrays are needed at once.
@@ -1429,6 +1434,8 @@ _CHAIN_BACKUP_CORRELATION = 0.4  # Weak partial fits may have unmatched parts on
 _CHAIN_BACKUP_MIN_FRACTION = 0.2  # Ignore tiny chains and cap the extra searches below.
 _MAX_CHAIN_BACKUP_STARTS = 4
 _AUTO_FINE_LIMITS = (2.0, 8.0)  # Bound unnecessary atom-level detail and preserve helix-scale features.
+_SHAPE_MAP_BEAM = 48  # Preserve competing sites/orientations between scales.
+_SHAPE_SUBMAP_FITS = 4  # Finish several fits per submap before comparing submaps.
 
 
 class _ShapeBatchCache:
@@ -1486,6 +1493,344 @@ class _ShapeBatchCache:
         return 0
 
 
+class _ShapeUI:
+    """Service the native GUI between numerical steps, never from a worker."""
+
+    def __init__(self, session):
+        self.session, self.next_update = session, 0.
+
+    def __enter__(self):
+        from chimerax.core.errors import UserError
+
+        if getattr(self.session, '_shapealign_running', False):
+            raise UserError('shapealign is already running; wait for it to finish.')
+        self.session._shapealign_running = True
+        self.token = _SHAPE_UI.set(self)
+        return self
+
+    def __exit__(self, *args):
+        _SHAPE_UI.reset(self.token)
+        self.session._shapealign_running = False
+
+    def checkpoint(self):
+        from time import perf_counter
+
+        guard = _SHAPE_INPUT_GUARD.get()
+        if not self.session.ui.is_gui or guard is None or perf_counter() < self.next_update:
+            return
+        self.next_update = perf_counter() + .1
+        # A batch owns an open native Undo aggregate. Repaint it, but do not
+        # accept unrelated commands into its pending transaction.
+        self._process_events(allow_input=not self.session.undo._register_stack)
+        guard.validate()
+        self.next_update = perf_counter() + .1
+
+    @staticmethod
+    def _process_events(allow_input):
+        from Qt.QtCore import QCoreApplication, QEventLoop
+
+        flags = (QEventLoop.ProcessEventsFlag.AllEvents if allow_input else
+                 QEventLoop.ProcessEventsFlag.ExcludeUserInputEvents)
+        QCoreApplication.processEvents(flags, 5)
+
+
+def _shape_checkpoint():
+    ui = _SHAPE_UI.get()
+    if ui is not None:
+        ui.checkpoint()
+
+
+def _shape_map_status(logger, message):
+    progress = _SHAPE_TILE_PROGRESS.get()
+    if progress is not None:
+        message = f"{progress[0]}/{progress[1]} tiles complete | {message}"
+    logger.status(message, blank_after=0)
+    _shape_checkpoint()
+
+
+def _shape_map_fft_threads(voxels):
+    workers = _SHAPE_MAP_WORKERS.get()
+    if workers is None or workers.requested == 1 or voxels < 262_144:
+        return 1
+    cpus = _shape_available_cpus()
+    return max(1, cpus - 1) if workers.requested == 0 else min(cpus, workers.requested)
+
+
+def _shape_refine_grid_pose(points, weights, field, xyz_to_ijk, initial, denominator):
+    """One unchanged native optimization, shared by serial and worker paths."""
+    import numpy as np
+    from chimerax.map_fit.fitmap import locate_maximum, volume_values
+
+    delta, _ = locate_maximum(initial.transform_points(points), weights, field, xyz_to_ijk,
+                              max_steps=240, ijk_step_size_min=.01, ijk_step_size_max=.5, metric='sum product')
+    pose = delta * initial
+    values = volume_values(points, xyz_to_ijk * pose, field)
+    return float(np.dot(weights.astype(np.float64), values)) / denominator, pose
+
+
+def _shape_map_worker_main(directory):
+    """Native numerical worker: read-only memory maps in, score/transform out."""
+    import json
+    from pathlib import Path
+    import sys
+    import traceback
+    import numpy as np
+    from chimerax.geometry import Place
+
+    def compute(job):
+        root = Path(directory) / job['stage']
+        # These mappings die before the result is sent, so the parent can
+        # remove a completed stage's files on Windows as well as Unix.
+        points = np.load(root / 'points.npy', mmap_mode='r', allow_pickle=False)
+        weights = np.load(root / 'weights.npy', mmap_mode='r', allow_pickle=False)
+        field = np.load(root / 'field.npy', mmap_mode='r', allow_pickle=False)
+        score, pose = _shape_refine_grid_pose(points, weights, field,
+                                             Place(matrix=np.array(job['xyz_to_ijk'])),
+                                             Place(matrix=np.array(job['matrix'])), job['denominator'])
+        return dict(index=job['index'], stage=job['stage'], score=score, matrix=pose.matrix.tolist())
+
+    for line in sys.stdin:
+        job = json.loads(line)
+        try:
+            result = compute(job)
+        except Exception:
+            result = dict(index=job['index'], stage=job['stage'], error=traceback.format_exc())
+        print('SHAPE_MAP:' + json.dumps(result), flush=True)
+
+
+class _ShapeMapWorkers:
+    """Lazy command-scoped native processes; session objects never leave the GUI."""
+
+    def __init__(self, session, requested):
+        self.session, self.requested = session, requested
+        self.processes, self.threads, self.diagnostics = [], [], []
+        self.temporary = None
+        self.disabled, self.used = requested == 1, False
+
+    def __enter__(self):
+        self.token = _SHAPE_MAP_WORKERS.set(self)
+        return self
+
+    def __exit__(self, *args):
+        _SHAPE_MAP_WORKERS.reset(self.token)
+        self.close()
+
+    def close(self):
+        import subprocess
+
+        if hasattr(self, 'stop'):
+            self.stop.set()
+        for process in self.processes:
+            if process.poll() is None:
+                process.terminate()
+        for process in self.processes:
+            try:
+                process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait()
+        for thread in self.threads:
+            thread.join(timeout=5)
+        for process in self.processes:
+            process.stdin.close()
+            process.stdout.close()
+        for diagnostic in self.diagnostics:
+            diagnostic.close()
+        self.processes.clear()
+        self.threads.clear()
+        self.diagnostics.clear()
+        if self.temporary is not None:
+            self.temporary.cleanup()
+            self.temporary = None
+
+    def start(self, count):
+        import json
+        import os
+        from pathlib import Path
+        import queue
+        from shutil import copyfile
+        import subprocess
+        import sys
+        import tempfile
+        import threading
+        from chimerax.core.errors import UserError
+
+        try:
+            from chimerax.core.python_utils import chimerax_python_executable
+            executable = chimerax_python_executable()
+        except ImportError:
+            executable = ''
+        if not Path(executable).is_file():
+            executable = sys.executable if Path(sys.executable).name.lower().startswith('python') else ''
+        script = Path(__file__).resolve()
+        if not Path(executable).is_file() or not script.is_file():
+            raise UserError('Cannot locate native Python/shapealign source for workers; use workers 1.')
+        environment = os.environ.copy()
+        for name in ('OMP_NUM_THREADS', 'OPENBLAS_NUM_THREADS', 'MKL_NUM_THREADS',
+                     'VECLIB_MAXIMUM_THREADS', 'NUMEXPR_NUM_THREADS'):
+            environment[name] = '1'
+        environment.pop('PYTHONHOME', None)
+        environment['PYTHONDONTWRITEBYTECODE'] = '1'
+        self.stop = threading.Event()
+        self.waiting, self.completed = queue.Queue(), queue.Queue()
+        self.temporary = tempfile.TemporaryDirectory(prefix='shapealign_maps_')
+        self.directory = Path(self.temporary.name)
+        copyfile(script, self.directory / 'trimmings.py')
+        (self.directory / 'path.json').write_text(json.dumps([os.path.abspath(p) for p in sys.path]))
+        bootstrap = ('import json, pathlib, runpy, sys; root=pathlib.Path(sys.argv[1]); '
+                     'sys.path[:]=json.loads((root/"path.json").read_text()); '
+                     'runpy.run_path(str(root/"trimmings.py"))["_shape_map_worker_main"](root)')
+
+        def exchange(process, diagnostic):
+            try:
+                while not self.stop.is_set():
+                    try:
+                        job = self.waiting.get(timeout=.1)
+                    except queue.Empty:
+                        continue
+                    process.stdin.write(json.dumps(job) + '\n')
+                    process.stdin.flush()
+                    while True:
+                        line = process.stdout.readline()
+                        if not line:
+                            raise RuntimeError('A native map-refinement worker exited unexpectedly.')
+                        position = line.find('SHAPE_MAP:')
+                        if position >= 0:
+                            result = json.loads(line[position + len('SHAPE_MAP:'):])
+                            if result['index'] != job['index'] or result['stage'] != job['stage']:
+                                raise RuntimeError('A map-refinement worker returned an unexpected job.')
+                            self.completed.put(result)
+                            break
+            except Exception as error:
+                details = Path(diagnostic).read_text(errors='replace')[-4000:]
+                self.completed.put(dict(error=str(error) + ('\n' + details if details else '')))
+
+        for number in range(count):
+            diagnostic = (self.directory / f'worker_{number}.log').open('w+')
+            self.diagnostics.append(diagnostic)
+            process = subprocess.Popen([executable, '-u', '-c', bootstrap, str(self.directory)],
+                                       stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=diagnostic,
+                                       text=True, encoding='utf-8', env=environment,
+                                       **({'creationflags': subprocess.CREATE_NO_WINDOW} if sys.platform == 'win32' else {}))
+            self.processes.append(process)
+            thread = threading.Thread(target=exchange, args=(process, diagnostic.name), daemon=True)
+            self.threads.append(thread)
+            thread.start()
+
+    def refine(self, points, weights, field, xyz_to_ijk, candidates, denominator):
+        import queue
+        import tempfile
+        import numpy as np
+        from pathlib import Path
+        from time import perf_counter
+        from chimerax.core.errors import UserError
+        from chimerax.geometry import Place
+
+        if self.disabled or len(candidates) < 2:
+            return None
+        if self.requested == 0 and len(points) * len(candidates) < _SHAPE_PARALLEL_MAP_WORK:
+            return None
+        count = _shape_worker_count(self.requested, len(candidates))
+        if count < 2:
+            return None
+        if not self.processes:
+            try:
+                self.start(count)
+            except (OSError, UserError) as error:
+                self.close()
+                if self.requested != 0:
+                    raise
+                self.disabled = True
+                self.session.logger.warning(f'Parallel map refinement unavailable; continuing serially. {error}')
+                return None
+        self.used = True
+        with tempfile.TemporaryDirectory(prefix='stage_', dir=self.directory) as temporary:
+            directory = Path(temporary)
+            for name, value in (('points', points), ('weights', weights), ('field', field)):
+                np.save(directory / f'{name}.npy', value, allow_pickle=False)
+            results = [None] * len(candidates)
+            for index, initial in enumerate(candidates):
+                self.waiting.put(dict(index=index, stage=directory.name, matrix=initial.matrix.tolist(),
+                                      xyz_to_ijk=xyz_to_ijk.matrix.tolist(), denominator=denominator))
+            completed, next_report = 0, 0.
+            try:
+                while completed < len(candidates):
+                    if perf_counter() >= next_report:
+                        _shape_map_status(self.session.logger, f'Map refinement: {completed}/{len(candidates)} starts '
+                                           f'({len(self.processes)} workers)...')
+                        next_report = perf_counter() + .1
+                    try:
+                        result = self.completed.get(timeout=.1)
+                    except queue.Empty:
+                        continue
+                    if 'error' in result:
+                        raise UserError('Native map refinement failed; no fit was applied.\n' + result['error'])
+                    pose = Place(matrix=np.array(result['matrix'], dtype=float))
+                    if not np.isfinite(pose.matrix).all() or not np.isfinite(result['score']):
+                        raise UserError('A native map worker returned a nonfinite result; no fit was applied.')
+                    results[result['index']] = result['score'], pose, result['index']
+                    completed += 1
+            except BaseException:
+                # Stop mappings before stage cleanup, including cancellation.
+                self.close()
+                raise
+        # Preserve original index order before stable score sorting, including ties.
+        return sorted(results, key=lambda row: row[0], reverse=True)
+
+
+class _ShapeMapInputGuard:
+    """Reject stale fits if repaint-time callbacks change a numerical input."""
+
+    def __init__(self, items):
+        self.inputs, self.maps, self.changed = [], [], False
+        for model, atoms in items:
+            state = dict(model=model, scene=model.scene_position.matrix.copy(), atoms=atoms)
+            if atoms is None:
+                state['data'] = model.data
+                self.maps.append(model.data)
+            else:
+                state.update(pointers=atoms.pointers.copy(), xyz=atoms.coords.copy(), bfactors=atoms.bfactors.copy())
+            self.inputs.append(state)
+
+    def _changed(self, reason):
+        if reason in ('values changed', 'coordinates changed'):
+            self.changed = True
+
+    def __enter__(self):
+        for data in self.maps:
+            data.add_change_callback(self._changed)
+        self.token = _SHAPE_INPUT_GUARD.set(self)
+        return self
+
+    def __exit__(self, *args):
+        _SHAPE_INPUT_GUARD.reset(self.token)
+        for data in self.maps:
+            if self._changed in data.change_callbacks:
+                data.remove_change_callback(self._changed)
+
+    def validate(self):
+        import numpy as np
+        from chimerax.core.errors import UserError
+
+        invalid = self.changed
+        for state in self.inputs:
+            model, atoms = state['model'], state['atoms']
+            if model.deleted or not np.array_equal(model.scene_position.matrix, state['scene']):
+                invalid = True
+                break
+            if atoms is None:
+                invalid |= model.data is not state['data']
+            else:
+                if not np.isin(state['pointers'], model.atoms.pointers).all():
+                    invalid = True
+                    break
+                invalid |= (not np.array_equal(atoms.pointers, state['pointers']) or
+                            not np.array_equal(atoms.coords, state['xyz']) or
+                            not np.array_equal(atoms.bfactors, state['bfactors']))
+        if invalid:
+            raise UserError('A fitting model or map changed during shapealign; no fit was applied.')
+
+
 def _shape_array_key(array):
     """Exact snapshot identity, not a rounded geometric similarity test."""
     from hashlib import blake2b
@@ -1514,6 +1859,25 @@ def _shape_reference_atom_grid(xyz, resolution, weights=None):
                           None if weights is None else _shape_array_key(weights)), prepare)
 
 
+def _shape_has_plddt(model):
+    """Require explicit AlphaFold provenance, never a filename or numeric range."""
+    if getattr(getattr(model, "database", None), "database", None) == "AlphaFold":
+        return True
+    metadata = getattr(model, "metadata", {})
+    if not metadata.get("database_2") or not metadata.get("ma_qa_metric"):
+        return False
+    # AlphaFoldDB CIFs opened as local files lack the fetched-model marker.
+    # Check both database provenance and a declared local pLDDT metric.
+    from chimerax.mmcif import get_mmcif_tables_from_metadata
+
+    database, metrics = get_mmcif_tables_from_metadata(model, ("database_2", "ma_qa_metric"), metadata=metadata)
+    return (database is not None and metrics is not None
+            and any(value.casefold() == "alphafolddb" for (value,) in
+                    database.fields(("database_id",), allow_missing_fields=True))
+            and any(mode.casefold() == "local" and kind.casefold() == "plddt" for mode, kind in
+                    metrics.fields(("mode", "type"), allow_missing_fields=True)))
+
+
 def _shape_confidence_weights(atoms, mode):
     """Only interpret B-factors as pLDDT with provenance or explicit consent."""
     import numpy as np
@@ -1521,9 +1885,7 @@ def _shape_confidence_weights(atoms, mode):
 
     if mode not in ("auto", "off", "plddt"):
         raise UserError("confidence must be auto, off, or plddt.")
-    database = getattr(atoms[0].structure, "database", None) if len(atoms) else None
-    known = getattr(database, "database", None) == "AlphaFold"
-    if mode == "off" or (mode == "auto" and not known):
+    if mode == "off" or (mode == "auto" and (not len(atoms) or not _shape_has_plddt(atoms[0].structure))):
         return None
     values = atoms.bfactors.astype(np.float64)
     if not np.isfinite(values).all() or np.any((values < 0) | (values > 100)):
@@ -1601,11 +1963,11 @@ def _shape_reference_field(grid, objective):
     return _shape_cached(("field", id(grid), objective), prepare)[1:]
 
 
-def _shape_reference_fft(grid, field, fft_shape, objective, squared=False):
+def _shape_reference_fft(grid, field, fft_shape, objective, squared=False, workers=None):
     def prepare():
         from scipy.fft import rfftn
 
-        return grid, rfftn(field * field if squared else field, fft_shape)
+        return grid, rfftn(field * field if squared else field, fft_shape, workers=workers)
 
     return _shape_cached(("fft", id(grid), objective, tuple(fft_shape), squared), prepare)[1]
 
@@ -2034,6 +2396,7 @@ def _partial_shape_starts(moving, reference, resolution, extra_starts=0, status=
                  max(0, i-distance):i+distance+1] = -1
 
     for index, rotation in enumerate(rotations):
+        _shape_checkpoint()
         if status and index % 16 == 0:
             status(f"{'Gradient' if gradient else 'Partial'} shape search: orientation {index + 1}/{len(rotations)} "
                    f"at {resolution:g} A (all translations)...")
@@ -2074,6 +2437,7 @@ def _refine_shape_level(moving, reference, blur, candidates, max_points,
         denominator = sqrt(mnorm * reference_energy)
     results = []
     for seed_index, initial in enumerate(candidates):
+        _shape_checkpoint()
         placed = initial.transform_points(points)
         delta, _ = locate_maximum(
             placed, weights, rmatrix, rg.xyz_to_ijk_transform,
@@ -2404,7 +2768,7 @@ def _prepare_shape_atomic_fit(session, atoms, to, resolution=None, max_points=12
                      extra_starts=0, move=True, radius=None, correlation=False,
                      color_fit=False, correlation_resolution=8.0, correlation_window=12.0,
                      sphere_center=None, partial=None, fallback_correlation=None, objective="density",
-                     confidence="auto", confidence_moving=None, confidence_reference=None):
+                     confidence="auto", confidence_moving=None, confidence_reference=None, copy=False):
     """Validate an atomic fit and snapshot its atoms, options, and scene frames.
 
     Exclude water/hydrogens and optionally crop both fitting subsets to the
@@ -2504,7 +2868,7 @@ def _prepare_shape_atomic_fit(session, atoms, to, resolution=None, max_points=12
     options = dict(resolution=resolution, max_points=max_points, extra_starts=extra_starts,
                    move=move, radius=radius, correlation=correlation, color_fit=color_fit,
                    correlation_resolution=correlation_resolution, correlation_window=correlation_window,
-                   partial=partial, fallback_correlation=fallback_correlation, objective=objective)
+                   partial=partial, fallback_correlation=fallback_correlation, objective=objective, copy=copy)
     backup = objective == "density" and radius is None and partial is not False and fallback_correlation > 0
     return dict(model=model, reference=reference, source_atoms=source_atoms, reference_atoms=reference_atoms,
                 source_xyz=source_xyz.astype(np.float64), reference_xyz=reference_xyz.astype(np.float64),
@@ -2560,6 +2924,53 @@ def _shape_atomic_snapshot(prepared):
                 reference_regions=prepared["reference_regions"])
 
 
+class _ShapeCopyPresence:
+    """Remove/re-add the same native structure for Undo/Redo, without refitting."""
+
+    def __init__(self, session, model):
+        self.session, self.model = session, model
+        self.model_id = model.id
+
+    def restore(self, present):
+        model, models = self.model, self.session.models
+        if model.deleted:
+            return
+        if not present and models.have_model(model):
+            models.remove([model])
+        elif present and not models.have_model(model):
+            # Preserve the ID if still available; otherwise use a new free ID.
+            if not models.list(model_id=self.model_id):
+                model.id = self.model_id
+            models.add([model])
+
+
+def _shape_place_model(session, model, atoms, transform, undo, copy=False):
+    """Only create a full-model copy after numerical fitting has succeeded."""
+    if not copy:
+        old = model.position
+        parent = model.parent.scene_position
+        new = parent.inverse() * transform * parent * old
+        undo.add(model, "position", old, new)
+        model.position = new
+        return model, atoms
+
+    indices = model.atoms.indices(atoms)
+    duplicate = model.copy(name=f"{model.name} fit")
+    try:
+        # Flatten the original hierarchy into the new independent owner's pose.
+        duplicate.position = transform * model.scene_position
+        for attribute in ("database", "filename"):
+            if hasattr(model, attribute):
+                setattr(duplicate, attribute, getattr(model, attribute))
+        session.models.add([duplicate])
+        presence = _ShapeCopyPresence(session, duplicate)
+        undo.add(presence, "restore", False, True, option="M")
+        return duplicate, duplicate.atoms[indices]
+    except BaseException:
+        session.models.close([duplicate])
+        raise
+
+
 def _finish_shape_atomic_fit(session, prepared, result):
     """Apply one computed result and its optional coloring on the main thread."""
     from time import perf_counter
@@ -2591,17 +3002,17 @@ def _finish_shape_atomic_fit(session, prepared, result):
         )
         stats.update(correlation_stats)
     undo = UndoState("shape align")
+    original_model = model
     try:
         if move:
-            old = model.position
-            parent_scene = model.parent.scene_position
-            new = parent_scene.inverse() * transform * parent_scene * old
-            undo.add(model, "position", old, new)
-            model.position = new
+            model, source_atoms = _shape_place_model(
+                session, model, source_atoms, transform, undo, options.get("copy", False))
         if scores is not None:
             _assign_shape_correlations(session, model, source_atoms, scores, undo, color_fit)
     except BaseException:
         undo.undo()
+        if model is not original_model:
+            session.models.close([model])
         raise
     if undo.state:
         session.undo.register(undo)
@@ -2609,6 +3020,9 @@ def _finish_shape_atomic_fit(session, prepared, result):
         stats["correlation_grid_seconds"] = stats["correlation_seconds"]
         stats["correlation_seconds"] = perf_counter() - scoring_started
     stats.update(moving_model_id=model.id_string, reference_model_id=reference.id_string)
+    if model is not original_model:
+        stats["source_model_id"] = original_model.id_string
+        session.logger.info(f"Shape alignment: fitted copy #{model.id_string}; original #{original_model.id_string} unchanged.")
     mode = ("Local shape alignment" if radius is not None else
             "Partial shape alignment" if stats["partial"] else "Shape alignment")
     metric = ("whole-density gradient correlation" if objective == "gradient" else
@@ -2660,12 +3074,14 @@ def _shape_align_one(session, atoms, to, resolution=None, max_points=12000,
                      extra_starts=0, move=True, radius=None, correlation=False,
                      color_fit=False, correlation_resolution=8.0, correlation_window=12.0,
                      sphere_center=None, partial=None, fallback_correlation=None, objective="density",
-                     confidence="auto", confidence_moving=None, confidence_reference=None):
+                     confidence="auto", confidence_moving=None, confidence_reference=None, copy=False):
     prepared = _prepare_shape_atomic_fit(
         session, atoms, to, resolution, max_points, extra_starts, move, radius, correlation,
         color_fit, correlation_resolution, correlation_window, sphere_center, partial,
-        fallback_correlation, objective, confidence, confidence_moving, confidence_reference)
-    result = _compute_shape_atomic_fit(_shape_atomic_snapshot(prepared), session.logger)
+        fallback_correlation, objective, confidence, confidence_moving, confidence_reference, copy)
+    with _ShapeMapInputGuard((*atoms.by_structure, *to.by_structure)) as guard:
+        result = _compute_shape_atomic_fit(_shape_atomic_snapshot(prepared), session.logger)
+        guard.validate()
     return _finish_shape_atomic_fit(session, prepared, result)
 
 
@@ -2853,12 +3269,7 @@ def _shape_atomic_workers(session, prepared, workers):
             count = 0
             while count < len(prepared):
                 session.logger.status(f"Shape alignment: {count}/{len(prepared)} fits complete ({workers} workers)...")
-                if session.ui.is_gui:
-                    from Qt.QtCore import QCoreApplication, QEventLoop
-
-                    # Repaint progress without accepting reentrant user commands
-                    # while this synchronous batch owns the pending snapshots.
-                    QCoreApplication.processEvents(QEventLoop.ProcessEventsFlag.ExcludeUserInputEvents)
+                _shape_checkpoint()
                 try:
                     result = completed.get(timeout=.1)
                 except queue.Empty:
@@ -2919,7 +3330,7 @@ def _shape_align_atomic_models(session, atoms, to, resolution=None, max_points=1
                 extra_starts=0, move=True, radius=None, correlation=False,
                 color_fit=False, correlation_resolution=8.0, correlation_window=12.0,
                 partial=None, fallback_correlation=None, objective="density", workers=0,
-                confidence="auto", confidence_moving=None, confidence_reference=None):
+                confidence="auto", confidence_moving=None, confidence_reference=None, copy=False):
     """Independently fit each moving model to one fixed reference by shape.
 
     Atom specifications restrict fitting regions; each whole moving model gets
@@ -2957,7 +3368,8 @@ def _shape_align_atomic_models(session, atoms, to, resolution=None, max_points=1
                    move=move, radius=radius, correlation=correlation, color_fit=color_fit,
                    correlation_resolution=correlation_resolution, correlation_window=correlation_window,
                    partial=partial, fallback_correlation=fallback_correlation, objective=objective,
-                   confidence=confidence, confidence_moving=confidence_moving, confidence_reference=confidence_reference)
+                   confidence=confidence, confidence_moving=confidence_moving, confidence_reference=confidence_reference,
+                   copy=copy)
     if len(moving) == 1:
         return _shape_align_one(session, atoms, to, **options)
     if radius is not None:
@@ -2969,7 +3381,9 @@ def _shape_align_atomic_models(session, atoms, to, resolution=None, max_points=1
     if worker_count > 1:
         prepared = [_prepare_shape_atomic_fit(session, selected, to, **options) for _, selected in ordered]
         session.logger.info(f"Shape alignment: fitting {len(prepared)} atomic models with {worker_count} workers.")
-        computed = _shape_atomic_workers(session, prepared, worker_count)
+        with _ShapeMapInputGuard((*atoms.by_structure, *to.by_structure)) as guard:
+            computed = _shape_atomic_workers(session, prepared, worker_count)
+            guard.validate()
         for item in prepared:
             _validate_shape_atomic_snapshot(item)
     results = []
@@ -3054,6 +3468,7 @@ def _resample_shape_density(grid, origin, size, step, pose=None):
         transform = transform * pose.inverse()
     nx, ny, _ = size
     for start in range(0, matrix.size, 65536):
+        _shape_checkpoint()
         indices = np.arange(start, min(start + 65536, matrix.size))
         k, rem = np.divmod(indices, nx * ny)
         j, i = np.divmod(rem, nx)
@@ -3067,7 +3482,7 @@ def _resample_shape_density(grid, origin, size, step, pose=None):
 class _ShapeDensityInput:
     """A selected atomic density or native full map, in the owner's local frame."""
 
-    def __init__(self, model, atoms, center=None, radius=None, confidence="auto"):
+    def __init__(self, model, atoms, center=None, radius=None, confidence="auto", allow_empty=False):
         from itertools import product
         import numpy as np
         from chimerax.atomic import Residue
@@ -3135,6 +3550,9 @@ class _ShapeDensityInput:
                 raise UserError("Fitting maps must contain only finite density values.")
             peak = max(peak, float(np.max(np.abs(values))))
         if peak == 0:
+            if allow_empty:
+                self.empty = True
+                return
             raise UserError("The map fitting region has no nonzero density.")
         self.peak = peak
         mass, first, second = 0.0, np.zeros(3), np.zeros((3, 3))
@@ -3164,7 +3582,11 @@ class _ShapeDensityInput:
         covariance = affine @ (second / mass - np.outer(mean, mean)) @ affine.T
         values, axes = np.linalg.eigh(covariance)
         if values[-2] <= max(values[-1], 1) * 1e-12:
+            if allow_empty:
+                self.empty = True
+                return
             raise UserError("The map density is collinear and cannot define a rigid orientation.")
+        self.empty = False
         self.center = data.ijk_to_xyz_transform * mean
         offsets = axes * np.sqrt(3 * np.maximum(values, 0))
         self.landmarks = np.concatenate((offsets.T, -offsets.T))
@@ -3216,16 +3638,20 @@ class _ShapeDensityInput:
             work = np.pad(work.astype(np.float32), tuple((int(v), int(v)) for v in halo[::-1]))
             # Physical isotropic Gaussian filtering also handles non-orthogonal
             # cells. Padding prevents periodic wraparound in this temporary FFT.
-            from scipy.fft import rfftn, irfftn, fftfreq, rfftfreq
-            fz = fftfreq(work.shape[0])[:, None, None]
-            fy = fftfreq(work.shape[1])[None, :, None]
-            fx = rfftfreq(work.shape[2])[None, None, :]
-            covariance = sigma * sigma * inverse @ inverse.T
-            q = (covariance[0, 0] * fx * fx + covariance[1, 1] * fy * fy + covariance[2, 2] * fz * fz +
-                 2 * covariance[0, 1] * fx * fy + 2 * covariance[0, 2] * fx * fz + 2 * covariance[1, 2] * fy * fz)
-            spectrum = rfftn(work)
-            spectrum *= np.exp(-2 * pi * pi * q)
-            work = irfftn(spectrum, s=work.shape).astype(np.float32)
+            if getattr(self, "_finite_gaussian", not getattr(self, "_normalize_grid", True)):
+                work = _shape_region_gaussian(work, base_affine, sigma)
+            else:
+                from scipy.fft import rfftn, irfftn, fftfreq, rfftfreq
+                fz = fftfreq(work.shape[0])[:, None, None]
+                fy = fftfreq(work.shape[1])[None, :, None]
+                fx = rfftfreq(work.shape[2])[None, None, :]
+                covariance = sigma * sigma * inverse @ inverse.T
+                q = (covariance[0, 0] * fx * fx + covariance[1, 1] * fy * fy + covariance[2, 2] * fz * fz +
+                     2 * covariance[0, 1] * fx * fy + 2 * covariance[0, 2] * fx * fz + 2 * covariance[1, 2] * fy * fz)
+                fft_threads = _shape_map_fft_threads(work.size)
+                spectrum = rfftn(work, workers=fft_threads)
+                spectrum *= np.exp(-2 * pi * pi * q)
+                work = irfftn(spectrum, s=work.shape, workers=fft_threads).astype(np.float32)
             base_origin = self.data.ijk_to_xyz_transform * (self.lower + (factors - 1) / 2 - factors * halo)
             filtered = ArrayGridData(work, base_origin - self.center,
                                      np.asarray(self.data.step) * factors,
@@ -3237,7 +3663,8 @@ class _ShapeDensityInput:
         peak = np.max(np.abs(grid.matrix()))
         if not np.isfinite(peak) or peak == 0:
             raise UserError("No finite nonzero density remains at this fitting scale.")
-        grid.matrix()[:] /= peak
+        if getattr(self, "_normalize_grid", True):
+            grid.matrix()[:] /= peak
         if cache is not None:
             cache.put(cache_key, grid)
         else:
@@ -3256,7 +3683,7 @@ def _shape_reference_input(model, atoms, center, radius, confidence="auto"):
         return prepare()
     selection = None if atoms is None else (_shape_array_key(atoms.pointers), _shape_array_key(atoms.coords))
     confidence_key = None if atoms is None or confidence == "off" else (
-        confidence, getattr(getattr(model, "database", None), "database", None), _shape_array_key(atoms.bfactors))
+        confidence, _shape_has_plddt(model) if confidence == "auto" else True, _shape_array_key(atoms.bfactors))
     key = ("reference_input", id(model), selection,
            None if center is None else tuple(center), radius, model.scene_position.matrix.tobytes(),
            confidence_key)
@@ -3292,7 +3719,6 @@ def _shape_density_samples(grid, maximum):
 
 def _refine_density_grids(source, target, candidates, maximum, objective):
     import numpy as np
-    from chimerax.map_fit.fitmap import locate_maximum, volume_values
 
     points, weights = _shape_density_samples(source, maximum)
     field, second = _shape_reference_field(target, objective)
@@ -3301,18 +3727,22 @@ def _refine_density_grids(source, target, candidates, maximum, objective):
     else:
         first = np.einsum("ijk,ijk->", source.matrix(), source.matrix(), dtype=np.float64)
     denominator = sqrt(first * second)
+    workers = _SHAPE_MAP_WORKERS.get()
+    if workers is not None:
+        results = workers.refine(points, weights, field, target.xyz_to_ijk_transform, candidates, denominator)
+        if results is not None:
+            return results, points
     results = []
     for index, initial in enumerate(candidates):
-        delta, _ = locate_maximum(initial.transform_points(points), weights, field, target.xyz_to_ijk_transform,
-                                  max_steps=240, ijk_step_size_min=.01, ijk_step_size_max=.5, metric="sum product")
-        pose = delta * initial
-        values = volume_values(points, target.xyz_to_ijk_transform * pose, field)
-        score = float(np.dot(weights.astype(np.float64), values)) / denominator
+        _shape_checkpoint()
+        score, pose = _shape_refine_grid_pose(points, weights, field, target.xyz_to_ijk_transform,
+                                             initial, denominator)
         results.append((score, pose, index))
     return sorted(results, key=lambda item: item[0], reverse=True), points
 
 
-def _shape_map_fft_starts(source, target, source_landmarks, target_landmarks, objective, extra_starts):
+def _shape_map_fft_starts(source, target, source_landmarks, target_landmarks, objective, extra_starts,
+                          valid_pose=None, site_distance=None, peaks_per_orientation=2, _site_center=None):
     import numpy as np
     from scipy.fft import rfftn, irfftn, next_fast_len
     from chimerax.core.errors import UserError
@@ -3324,8 +3754,11 @@ def _shape_map_fft_starts(source, target, source_landmarks, target_landmarks, ob
     if target_radius < radius:
         # This only chooses the cheaper numerical template. Full-density norms
         # stay global, and inversion preserves which owner the user asked to move.
+        center = _site_center or (lambda pose: pose.origin())
         return [pose.inverse() for pose in _shape_map_fft_starts(
-            target, source, target_landmarks, source_landmarks, objective, extra_starts)]
+            target, source, target_landmarks, source_landmarks, objective, extra_starts,
+            None if valid_pose is None else lambda pose: valid_pose(pose.inverse()),
+            site_distance, peaks_per_orientation, lambda pose: center(pose.inverse()))]
     side = int(np.ceil(2 * radius / step)) + 1
     side += 1 - side % 2
     fft_shape = tuple(next_fast_len(n + side - 1) for n in target.matrix().shape)
@@ -3338,68 +3771,847 @@ def _shape_map_fft_starts(source, target, source_landmarks, target_landmarks, ob
         _, first = _gradient_density_field(source)
     else:
         first = np.sum(source.matrix().astype(float) ** 2)
-    target_fft = _shape_reference_fft(target, field, fft_shape, objective)
+    fft_threads = _shape_map_fft_threads(int(np.prod(fft_shape)))
+    target_fft = _shape_reference_fft(target, field, fft_shape, objective, workers=fft_threads)
     peaks = []
     for initial in _shape_starts(source_landmarks, target_landmarks, 96 + extra_starts):
+        _shape_checkpoint()
         rotation = Place(matrix=np.column_stack((initial.matrix[:, :3], np.zeros(3))))
         density = _resample_shape_density(source, origin, (side,) * 3, step, rotation)
-        cross = irfftn(target_fft * rfftn(density[::-1, ::-1, ::-1], fft_shape), fft_shape) / sqrt(first * second)
-        view = cross[half:half + field.shape[0], half:half + field.shape[1], half:half + field.shape[2]]
-        for _ in range(2):
+        cross = irfftn(target_fft * rfftn(density[::-1, ::-1, ::-1], fft_shape, workers=fft_threads),
+                        fft_shape, workers=fft_threads) / sqrt(first * second)
+        # argmax otherwise copies this strided FFT slice for every peak.
+        view = cross[half:half + field.shape[0], half:half + field.shape[1], half:half + field.shape[2]].copy()
+        accepted = 0
+        for _ in range(peaks_per_orientation if valid_pose is None else view.size):
             k, j, i = np.unravel_index(np.argmax(view), view.shape)
+            value = float(view[k, j, i])
+            if not np.isfinite(value):
+                break
             center = target.ijk_to_xyz_transform * np.array((i, j, k), dtype=float)
-            peaks.append((float(view[k, j, i]), Place(matrix=np.column_stack((rotation.matrix[:, :3], center)))))
-            distance = max(2, int(radius / (3 * step)))
+            pose = Place(matrix=np.column_stack((rotation.matrix[:, :3], center)))
+            if valid_pose is None or valid_pose(pose):
+                peaks.append((value, pose))
+                accepted += 1
+            distance = max(2, int(max(radius / 3, site_distance or 0) / step))
             view[max(0, k-distance):k+distance+1, max(0, j-distance):j+distance+1,
                  max(0, i-distance):i+distance+1] = -np.inf
+            if accepted == peaks_per_orientation:
+                break
     peaks.sort(key=lambda item: item[0], reverse=True)
-    kept = []
+    kept, sites = [], []
     probes = _shape_grid_corners(source)
     for _, pose in peaks:
         if any(np.sqrt(np.mean(np.sum((pose.transform_points(probes) - old.transform_points(probes)) ** 2, axis=1)))
                < step for old in kept):
             continue
+        center = (_site_center(pose) if _site_center is not None else pose.origin())
+        # Reserve room for weaker spatial basins before fine-detail scoring.
+        # A bright site must not occupy the entire tiled-search orientation beam.
+        if site_distance is not None and sum(np.linalg.norm(center - old) < site_distance for old in sites) >= 4:
+            continue
         kept.append(pose)
+        sites.append(center)
         if len(kept) == 48:
             break
     return kept
 
 
+def _shape_region_gaussian(matrix, affine, sigma):
+    """Finite physical Gaussian: constant interiors stay constant even below a voxel.
+
+    A truncated Fourier Gaussian has long ringing tails when its transfer at
+    Nyquist is nonzero. Those tails cannot be removed with a small spatial halo.
+    Use a normalized spatial kernel for local bands instead.
+    """
+    import numpy as np
+    from scipy.ndimage import gaussian_filter
+    from chimerax.core.errors import UserError
+
+    metric = affine.T @ affine
+    if np.allclose(metric, np.diag(np.diag(metric)), atol=float(np.max(np.diag(metric))) * 1e-8):
+        gaussian_filter(matrix, (sigma / np.sqrt(np.diag(metric)))[::-1],
+                         output=matrix, mode="constant", truncate=4)
+        return matrix
+    from scipy.signal import fftconvolve
+    from scipy.fft import next_fast_len
+
+    half = np.ceil(4 * sigma * np.linalg.norm(np.linalg.inv(affine), axis=1)).astype(int)
+    kernel_shape = tuple(2 * half[::-1] + 1)
+    fft_shape = tuple(next_fast_len(n + k - 1) for n, k in zip(matrix.shape, kernel_shape))
+    if np.prod(fft_shape) > _MAX_GRID_VOXELS:
+        raise UserError("The skew-map filtering grid is too large; restrict fitting atoms or use coarser settings.")
+    k, j, i = np.indices(kernel_shape, dtype=np.float64)
+    xyz = np.stack((i - half[0], j - half[1], k - half[2]), axis=-1) @ affine.T
+    squared = np.sum(xyz * xyz, axis=-1)
+    kernel = np.exp(-squared / (2 * sigma * sigma))
+    kernel[squared > (4 * sigma) ** 2] = 0
+    kernel /= kernel.sum()
+    return fftconvolve(matrix, kernel.astype(np.float32), mode="same").astype(np.float32)
+
+
+def _shape_map_box(target, points, pad, resolution=None):
+    """Numerical rectangular view with the original map frame and intensity scale.
+
+    Padding is physical (Angstroms), so rotated/skewed map grids work too.
+    This never creates a Volume or modifies the input matrix or surface.
+    """
+    from itertools import product
+    import numpy as np
+    from chimerax.map_data import ArrayGridData
+
+    lower = np.min(points, axis=0) + target.center - pad
+    upper = np.max(points, axis=0) + target.center + pad
+    corners = np.array(list(product(*zip(lower, upper))), dtype=float)
+    ijk = target.data.xyz_to_ijk_transform.transform_points(corners)
+    lo = np.maximum(0, np.floor(ijk.min(axis=0)).astype(int))
+    hi = np.minimum(target.data.size, np.ceil(ijk.max(axis=0)).astype(int) + 1)
+    if resolution is not None:
+        affine = target.data.ijk_to_xyz_transform.matrix[:, :3]
+        factors = np.maximum(1, np.floor((resolution / 3) / np.linalg.norm(affine, axis=0))).astype(int)
+        # Anchor decimation bins to the original grid, not the tile boundary.
+        lo = (lo // factors) * factors
+        hi = np.minimum(target.data.size, ((hi + factors - 1) // factors) * factors)
+    if np.any(hi <= lo):
+        return None
+    matrix = target.matrix[tuple(slice(a, b) for a, b in zip(lo[::-1], hi[::-1]))]
+    if not np.any(matrix):
+        return None
+    data = ArrayGridData(matrix, target.data.ijk_to_xyz_transform * lo,
+                         target.data.step, target.data.cell_angles, target.data.rotation)
+    # Bypass moment estimation: a working box must not recenter each candidate
+    # or renormalize its density independently of neighbouring boxes.
+    region = _ShapeDensityInput.__new__(_ShapeDensityInput)
+    region.model, region.atoms, region.is_map, region.weights = target.model, None, True, None
+    region.data, region.matrix, region.center, region.peak = data, matrix, target.center, target.peak
+    region.lower, region.upper = np.zeros(3, dtype=int), np.array(data.size) - 1
+    region._cache, region._grid_cache_key = {}, object()
+    region._shared_reference, region._normalize_grid = False, False
+    return region
+
+
+def _shape_map_contains(target, points):
+    import numpy as np
+
+    # An explicit CoFR sphere is a scoring selection, not the physical map edge.
+    data = target.model.data
+    ijk = data.xyz_to_ijk_transform.transform_points(points + target.center)
+    return np.all((ijk >= 0) & (ijk <= np.array(data.size) - 1), axis=1)
+
+
+def _shape_map_grid_voxels(region, resolution):
+    """Preflight the original map filter and Cartesian grid without allocating."""
+    from itertools import product
+    import numpy as np
+
+    affine = region.data.ijk_to_xyz_transform.matrix[:, :3]
+    factors = np.maximum(1, np.floor((resolution / 3) / np.linalg.norm(affine, axis=0))).astype(int)
+    shape = np.ceil((region.upper - region.lower + 1) / factors).astype(int)
+    sigma = resolution / (pi * sqrt(2))
+    inverse = np.linalg.inv(affine @ np.diag(factors))
+    halo = np.ceil(4 * sigma * np.linalg.norm(inverse, axis=1)).astype(int) + 1
+    corners = np.array(list(product(*zip(region.lower, region.upper))), dtype=float)
+    corners = region.data.ijk_to_xyz_transform.transform_points(corners)
+    cartesian = np.ceil((np.ptp(corners, axis=0) + 8 * sigma) / (resolution / 3)).astype(int) + 1
+    return max(int(np.prod(shape + 2 * halo)), int(np.prod(cartesian)))
+
+
+def _shape_map_fft_voxels(source, target):
+    """The allocation used by the original global FFT search, including reversal."""
+    import numpy as np
+    from scipy.fft import next_fast_len
+
+    radius = float(np.linalg.norm(_shape_grid_corners(source), axis=1).max())
+    target_radius = float(np.linalg.norm(_shape_grid_corners(target), axis=1).max())
+    if target_radius < radius:
+        source, target, radius = target, source, target_radius
+    side = int(np.ceil(2 * radius / source.step[0])) + 1
+    side += 1 - side % 2
+    return int(np.prod([next_fast_len(n + side - 1) for n in target.matrix().shape]))
+
+
+def _shape_submap_input(target, lower, upper, padding):
+    """A numerical submap with its own density geometry, using the original engine."""
+    from types import SimpleNamespace
+
+    box = _shape_map_box(target, (lower, upper), padding)
+    if box is None or min(box.data.size) < 2:
+        return None
+    region = _ShapeDensityInput(SimpleNamespace(data=box.data), None, allow_empty=True)
+    if region.empty:
+        return None
+    # All coordinates remain in the original map's local coordinate system.
+    # No Volume is created and the original owner/scene transform is retained.
+    region.model = target.model
+    return region
+
+
+def _shape_map_tiles(source, target, levels, tile_size=None):
+    """Partition the map into overlapping submaps sized from the fitted body.
+
+    The confidence-weighted ellipsoid plans the regions; it does not remove
+    fitting atoms. The original global search still fits the complete selection.
+    Submaps share a fitting pyramid and are shrunk if either original allocation
+    guard would be exceeded. Only numerical views/grids are retained.
+    """
+    from itertools import product
+    import numpy as np
+    from chimerax.core.errors import UserError
+
+    bounds = _shape_grid_corners(target.data) - target.center
+    lower, upper = bounds.min(axis=0), bounds.max(axis=0)
+    geometry = source.frame_landmarks
+    covariance = geometry.T @ geometry / len(geometry)
+    padding = max(float(np.sqrt(5 * np.linalg.eigvalsh(covariance)[-1])), levels[0])
+    core = float(tile_size) if tile_size is not None else 2.5 * _shape_spatial_size(geometry)
+    source_grid = source.grid(levels[0])
+    for _ in range(32):
+        counts = np.maximum(1, np.ceil((upper - lower) / core).astype(int))
+        regions, largest_fft, fits = [], 0, True
+        for index in product(*(range(int(n)) for n in counts)):
+            lo = lower + np.array(index) * core
+            hi = np.minimum(lo + core, upper)
+            region = _shape_submap_input(target, lo, hi, padding)
+            if region is None:
+                continue
+            if any(_shape_map_grid_voxels(region, level) > _MAX_GRID_VOXELS for level in levels):
+                fits = False
+                break
+            voxels = _shape_map_fft_voxels(source_grid, region.grid(levels[0]))
+            largest_fft = max(largest_fft, voxels)
+            if voxels > _MAX_PARTIAL_FFT_VOXELS:
+                fits = False
+                break
+            regions.append((region, lo, hi))
+        if fits:
+            return regions, dict(tiles=int(np.prod(counts)), nonempty_tiles=len(regions),
+                                 tile_core_angstroms=core, tile_padding_angstroms=padding,
+                                 tile_fft_voxels=largest_fft)
+        for region, _, _ in regions:
+            region._cache.clear()
+        core *= .8
+        if core < levels[0] / 3:
+            break
+    raise UserError("The moving model/submap search exceeds the working-grid limits; "
+                    "restrict fitting atoms or use a coarser resolution.")
+
+
+def _shape_keep_map_poses(scored, probes, distance, maximum=_SHAPE_MAP_BEAM):
+    """Keep distinct rigid placements by deterministic RMS-displacement checks."""
+    import numpy as np
+
+    kept, placed = [], []
+    for entry in sorted(scored, key=lambda item: item[0], reverse=True):
+        if not np.isfinite(entry[0]):
+            continue
+        pose = entry[1]
+        trial = pose.transform_points(probes)
+        if any(np.sqrt(np.mean(np.sum((trial - old) ** 2, axis=1))) < distance for old in placed):
+            continue
+        kept.append(entry)
+        placed.append(trial)
+        if len(kept) == maximum:
+            break
+    return kept
+
+
+class _ShapeBandScorer:
+    """Smooth Gaussian-difference band, measured inside a fixed model-local mask.
+
+    Both signs of the filtered density are retained. A deterministic importance
+    sample integrates the same soft mask for every candidate, independent of
+    tile size, background, map threshold, or candidate-specific peak values.
+    """
+
+    def __init__(self, source, coarse, fine, maximum):
+        import numpy as np
+        from chimerax.map.molmap import add_gaussians, bounding_grid
+        from chimerax.core.errors import UserError
+
+        step, pad = fine / 3, 4 * coarse / (pi * sqrt(2))
+        dimensions = np.ceil((np.ptp(source.landmarks, axis=0) + 2 * pad) / step)
+        if np.prod(dimensions) > _MAX_GRID_VOXELS:
+            raise UserError("The model-local scoring grid is too large; use a coarser map_resolution "
+                            "or restrict fitting atoms.")
+        grid = bounding_grid(source.landmarks, step, pad)
+        xyz, weights = _shape_points(source.landmarks, fine / 6, source.weights)
+        values = []
+        for blur in (fine, coarse, max(4, fine)):
+            grid.matrix()[:] = 0
+            add_gaussians(grid, xyz, weights, blur / (pi * sqrt(2)), 4)
+            values.append(grid.matrix().copy())
+        mask = values.pop()
+        positive = mask[mask > float(mask.max()) * .001]
+        mask /= max(float(np.median(positive)), 1e-30)
+        np.minimum(mask, 30, out=mask)
+        np.negative(mask, out=mask)
+        np.expm1(mask, out=mask)
+        mask *= -1
+        mask[mask < .001] = 0
+        cumulative = np.cumsum(mask.ravel(), dtype=np.float64)
+        indices = np.searchsorted(cumulative, (np.arange(maximum) + .5) * cumulative[-1] / maximum)
+        k, j, i = np.unravel_index(indices, mask.shape)
+        self.points = grid.ijk_to_xyz_transform.transform_points(np.column_stack((i, j, k)).astype(np.float32))
+        self.values = (values[0].ravel()[indices] - values[1].ravel()[indices]).astype(np.float64)
+        self.values -= self.values.mean()
+        self.norm = float(np.dot(self.values, self.values))
+        self.coarse, self.fine = coarse, fine
+
+    def score(self, target, pose):
+        import numpy as np
+        from chimerax.map_fit.fitmap import volume_values
+
+        placed = pose.transform_points(self.points)
+        # Missing map voxels must not improve a fit by shrinking its mask.
+        if np.mean(_shape_map_contains(target, placed)) < .99:
+            return -np.inf
+        values = []
+        for blur in (self.fine, self.coarse):
+            # Six sigmas keep artificial crop-edge tails below float32 noise.
+            region = _shape_map_box(target, placed, 6 * self.coarse / (pi * sqrt(2)), blur)
+            if region is None:
+                return -np.inf
+            grid = region.grid(blur)
+            values.append(volume_values(placed, grid.xyz_to_ijk_transform, grid.matrix()).astype(np.float64))
+            del grid, region
+        band = values[0] - values[1]
+        band -= band.mean()
+        variance = float(np.dot(band, band))
+        if variance <= max(1e-20, float(np.dot(values[0], values[0])) * 1e-10):
+            return -np.inf  # Reject constant/undefined bands, not float32 FFT roundoff.
+        denominator = sqrt(self.norm * variance)
+        return float(np.clip(np.dot(self.values, band) / denominator, -1, 1)) if denominator > 1e-20 else -np.inf
+
+
+class _ShapeEmptyMapSearch(Exception):
+    """A submap has no physically valid placement; other submaps may still fit."""
+
+
+def _shape_fit_levels(source, target, options):
+    final = options["resolution"]
+    if final is None and options.get("map_resolution") is not None:
+        automatic, _ = _shape_resolution_schedule(source.frame_landmarks, target.frame_landmarks)
+        final = max(automatic[-1], options["map_resolution"])
+    levels, stats = _shape_resolution_schedule(source.frame_landmarks, target.frame_landmarks,
+                                              final, options["radius"] is not None)
+    stats["resolution_mode"] = "automatic" if options["resolution"] is None else "explicit"
+    return levels, stats
+
+
+def _shape_refine_regional(source, target, pose, blur, maximum, objective):
+    """Use the original native sum-product refiner in a fresh padded map box."""
+    grid = source.grid(blur)
+    points, _ = _shape_density_samples(grid, maximum)
+    region = _shape_map_box(target, pose.transform_points(points),
+                            6 * blur / (pi * sqrt(2)) + 2 * blur, blur)
+    if region is None:
+        return float("-inf"), pose
+    region._normalize_grid = True  # Original map filtering and normalization.
+    results, _ = _refine_density_grids(grid, region.grid(blur), [pose], maximum, objective)
+    return results[0][:2]
+
+
+def _shape_common_map_score(source, target, pose, blur, maximum, objective):
+    """The original overlap objective on one common map scale, without tile norms.
+
+    The full reference energy is a constant for all placements. Omitting that
+    common denominator preserves ranking without allocating a whole-map fine
+    grid. This score is an overlap, not a normalized correlation coefficient.
+    """
+    import numpy as np
+    from chimerax.map_fit.fitmap import volume_values
+
+    grid = source.grid(blur)
+    points, weights = _shape_density_samples(grid, maximum)
+    region = _shape_map_box(target, pose.transform_points(points),
+                            6 * blur / (pi * sqrt(2)), blur)
+    if region is None:
+        return -np.inf
+    region._finite_gaussian = False  # Same filter as the original search.
+    reference = region.grid(blur)
+    field, _ = _shape_reference_field(reference, objective)
+    if objective == "gradient":
+        _, energy = _gradient_density_field(grid)
+    else:
+        energy = float(np.einsum("ijk,ijk->", grid.matrix(), grid.matrix(), dtype=np.float64))
+    values = volume_values(points, reference.xyz_to_ijk_transform * pose, field)
+    return float(np.dot(weights.astype(np.float64), values) / sqrt(energy))
+
+
+def _shape_symmetry_operators(session, model, symmetry, center, axis, copies=1):
+    """Native symmetry operators in reference-map coordinates, never scene axes."""
+    import numpy as np
+    from chimerax.atomic.args import parse_symmetry
+    from chimerax.core.errors import UserError
+
+    group = symmetry if isinstance(symmetry, str) else symmetry.group
+    requested_group = group
+    fields = group.lower().split(',')
+    kind = fields[0]
+    automatic_helix = kind == 'h' and len(fields) == 3 and '*' not in group
+    if automatic_helix:
+        fields += [str(copies), str(-(copies // 2))]
+        group = ','.join(fields)
+    if '*' in group:
+        count = 1
+        for component in group.split('*'):
+            if component.lower().startswith('h,') and len(component.split(',')) == 3:
+                raise UserError('Within symmetry products, use h,rise,twist,count[,offset].')
+            ops, _ = _shape_symmetry_operators(session, model, component, center, axis)
+            count *= len(ops)
+            if count > 256:
+                raise UserError('A symmetry product must contain at most 256 operators.')
+    elif kind.startswith(('c', 'd')):
+        try:
+            count = int(kind[1:]) * (2 if kind[0] == 'd' else 1)
+        except ValueError:
+            raise UserError('Use a native point group, such as C6, D4, T, O, or I.') from None
+        if not 1 <= count <= 256:
+            raise UserError('Symmetry must contain between 1 and 256 operators.')
+    elif kind == 'h':
+        try:
+            rise, twist, count = map(float, fields[1:4])
+            offset = float(fields[4]) if len(fields) == 5 else 0.
+            valid = (len(fields) in (4, 5) and np.isfinite([rise, twist, count, offset]).all()
+                     and rise != 0 and count == int(count) and 1 <= count <= 512
+                     and offset == int(offset) and offset <= 0 < offset + count)
+        except (ValueError, OverflowError):
+            valid = False
+        if not valid:
+            raise UserError('Use symmetry h,rise,twist[,count,offset]; rise must be nonzero, '
+                            'count must be 1-512, and an explicit repeat range must include zero.')
+    elif kind not in ('t', 'o', 'i'):
+        raise UserError('Symmetry supports native point groups Cn, Dn, T, O, I, or h,rise,twist,count[,offset].')
+
+    frame = model.scene_position
+    c = (model.data.ijk_to_xyz_transform * (np.array(model.data.size, dtype=float) / 2) if center is None else
+         frame.inverse() * center.scene_coordinates(frame) if hasattr(center, 'scene_coordinates')
+         else np.array(center, dtype=float))
+    a = ((0, 0, 1) if axis is None else
+         frame.inverse().transform_vectors(axis.scene_coordinates(frame)) if hasattr(axis, 'scene_coordinates')
+         else np.array(axis, dtype=float))
+    a = np.array(a, dtype=float)
+    if (np.shape(c) != (3,) or a.shape != (3,) or not np.isfinite(c).all()
+            or not np.isfinite(a).all() or np.linalg.norm(a) == 0):
+        raise UserError('symmetry_center and symmetry_axis must be finite XYZ values; the axis must be nonzero.')
+    a /= np.linalg.norm(a)
+    operators = []
+    for operator in parse_symmetry(session, group, tuple(c), tuple(a)):
+        if not any(np.allclose(operator.matrix, old.matrix, atol=1e-8, rtol=0) for old in operators):
+            operators.append(operator)
+    operators.sort(key=lambda op: not op.is_identity())
+    metadata = dict(symmetry=requested_group, symmetry_center=np.asarray(c).tolist(),
+                    symmetry_axis=a.tolist(), symmetry_operators=len(operators))
+    if kind == 'h' and '*' not in group:
+        metadata.update(helical_rise=rise, helical_twist=twist, helical_auto_range=automatic_helix)
+    return operators, metadata
+
+
+def _shape_pose_inside(source, target, raw):
+    import numpy as np
+
+    points = raw.transform_points(source.xyz) - target.center
+    return np.average(_shape_map_contains(target, points), weights=source.weights) >= .99
+
+
+def _shape_symmetry_clashes(source, context, raw, maximum, distance):
+    """Test implicit neighbours using one confidence-weighted source KD-tree."""
+    import numpy as np
+    from chimerax.geometry import Place, helical_symmetry_matrix
+
+    if '_body' not in context:
+        context['_body'] = _ShapeOccupiedCopy(source, Place())
+    body = context['_body']
+    parameters = context.get('parameters', {})
+    if 'helical_rise' in parameters:
+        axis = np.array(parameters['symmetry_axis'])
+        span = np.ptp(raw.transform_points(source.xyz) @ axis)
+        count = int(np.ceil((span + distance) / abs(parameters['helical_rise'])))
+        # Inverse repeats have identical symmetric overlap. Positive repeats
+        # suffice, and axial separation bounds all possible contacting neighbours.
+        operators = (helical_symmetry_matrix(parameters['helical_rise'], parameters['helical_twist'],
+                     axis=axis, center=parameters['symmetry_center'], n=n) for n in range(1, count + 1))
+    else:
+        operators = (op for op in context['operators'] if not op.is_identity())
+    inverse = raw.inverse()
+    for operator in operators:
+        relative = inverse * operator * raw
+        for pose in (relative, relative.inverse()):
+            points = pose.transform_points(source.xyz)
+            if np.any(points.max(axis=0) + distance < body.lower) or np.any(body.upper + distance < points.min(axis=0)):
+                continue
+            neighbours = body.tree.query_ball_point(points, distance)
+            weights = np.array([body.weights[indices].max() if len(indices) else 0 for indices in neighbours])
+            if np.dot(body.weights, weights) / body.weights.sum() > maximum:
+                return True
+    return False
+
+
+def _shape_expansion_operators(source, context, base):
+    """Finite point/range operators, or an automatic helix within the map box."""
+    import numpy as np
+    from chimerax.geometry import Place, helical_symmetry_matrix
+
+    parameters = context.get('parameters', {})
+    if not parameters.get('helical_auto_range'):
+        return iter(context['operators'])
+    target = context['target']
+    axis = np.array(parameters['symmetry_axis'])
+    bounds = _shape_grid_corners(target.model.data) @ axis
+    projected = base.transform_points(source.xyz) @ axis
+    rise = parameters['helical_rise']
+    interval = sorted(((bounds.min() - projected.max()) / rise, (bounds.max() - projected.min()) / rise))
+    lower, upper = int(np.ceil(interval[0])), int(np.floor(interval[1]))
+    def generate():
+        yield Place()
+        for n in range(1, max(abs(lower), abs(upper)) + 1):
+            for repeat in (-n, n):
+                if lower <= repeat <= upper:
+                    yield helical_symmetry_matrix(rise, parameters['helical_twist'], axis=axis,
+                                                  center=parameters['symmetry_center'], n=repeat)
+    return generate()
+
+
+def _shape_expand_seed(source, target, stats, options, best):
+    """Choose one seed, then expand it; no joint or repeated global fitting."""
+    import numpy as np
+    from chimerax.geometry import Place, translation
+    from chimerax.core.errors import UserError
+
+    context = options['_symmetry']
+    root = context['target']
+    rows = stats.get('candidates', [dict(score=stats['score'], matrix=best.matrix.tolist())])
+    base, score = None, None
+    for entry in sorted(rows, key=lambda row: row['score'], reverse=True):
+        _shape_checkpoint()
+        candidate = Place(matrix=np.array(entry['matrix']))
+        if (_shape_pose_inside(source, root, candidate) and not
+                _shape_symmetry_clashes(source, context, candidate, options['max_overlap'], options['overlap_distance'])):
+            base, score = candidate, entry['score']
+            break
+    if base is None:
+        raise UserError('No seed fit is compatible with its implicit symmetry neighbours.')
+    accepted, occupied = [], []
+    _shape_map_status(source.model.session.logger, 'Expanding the fitted seed by symmetry...')
+    for operator in _shape_expansion_operators(source, context, base):
+        _shape_checkpoint()
+        ideal = operator * base
+        if not _shape_pose_inside(source, root, ideal):
+            continue
+        pose = ideal
+        if options.get('refine_copies'):
+            _shape_map_status(source.model.session.logger,
+                              f"Local refinement of symmetry copy {len(accepted) + 1}/{options.get('copies', 1)}...")
+            centered = translation(-root.center) * ideal * translation(source.center)
+            _, refined = _shape_refine_regional(source, root, centered, stats['resolutions'][-1],
+                                                options['max_points'], options['objective'])
+            proposed = translation(root.center) * refined * translation(-source.center)
+            if _shape_pose_inside(source, root, proposed):
+                pose = proposed
+        body = _ShapeOccupiedCopy(source, pose)
+        if any(body.overlap(old, options['overlap_distance']) > options['max_overlap'] for old in occupied):
+            pose, body = ideal, _ShapeOccupiedCopy(source, ideal)
+            if any(body.overlap(old, options['overlap_distance']) > options['max_overlap'] for old in occupied):
+                continue
+        accepted.append((pose, score))
+        occupied.append(body)
+        if len(accepted) == options.get('copies', 1):
+            break
+    if not accepted:
+        raise UserError('No symmetry-expanded copy fits inside the map.')
+    stats.update(symmetry_mode='seed_then_expand', symmetry_search_copies=1,
+                 refine_copies=bool(options.get('refine_copies')), seed_matrix=base.matrix.tolist())
+    return accepted
+
+
+class _ShapeOccupiedCopy:
+    """Cache an accepted placement's atoms, confidence, and spatial index."""
+
+    def __init__(self, source, pose):
+        import numpy as np
+        from scipy.spatial import cKDTree
+
+        self.points = pose.transform_points(source.xyz)
+        self.weights = np.ones(len(self.points)) if source.weights is None else source.weights / source.weights.max()
+        self.lower, self.upper = self.points.min(axis=0), self.points.max(axis=0)
+        self.tree = cKDTree(self.points)
+
+    def overlap(self, other, distance):
+        import numpy as np
+
+        if np.any(self.upper + distance < other.lower) or np.any(other.upper + distance < self.lower):
+            return 0.
+
+        def fraction(first, second):
+            neighbours = second.tree.query_ball_point(first.points, distance)
+            weights = np.array([second.weights[indices].max() if len(indices) else 0 for indices in neighbours])
+            return float(np.dot(first.weights, weights) / first.weights.sum())
+
+        # Check both directions: a small confident core must not be hidden by
+        # the larger flexible region of the other placement.
+        return max(fraction(self, other), fraction(other, self))
+
+
+def _shape_copy_site_candidates(source, candidates, maximum, options):
+    """Keep different finished sites, not several orientations of one tile hit."""
+    import numpy as np
+    from chimerax.geometry import Place
+
+    kept, occupied = [], []
+    for entry in candidates:
+        _shape_checkpoint()
+        pose = Place(matrix=np.array(entry['matrix']))
+        body = _ShapeOccupiedCopy(source, pose)
+        if any(body.overlap(old, options['overlap_distance']) > options['max_overlap'] for old in occupied):
+            continue
+        kept.append(entry)
+        occupied.append(body)
+        if len(kept) == maximum:
+            break
+    return kept
+
+
+def _shape_select_copies(source, target, stats, options, best):
+    """Greedy score-ranked, confidence-weighted non-overlap across all tiles."""
+    import numpy as np
+    from chimerax.geometry import Place
+    from chimerax.core.errors import UserError
+
+    if options.get('_symmetry') is not None:
+        return _shape_expand_seed(source, target, stats, options, best)
+    candidates = stats.get('candidates', [dict(score=stats['score'], matrix=best.matrix.tolist())])
+    candidates = sorted(candidates, key=lambda row: row['score'], reverse=True)
+    operators = [Place()]
+    requested = options.get('copies', 1)
+    maximum, distance = options['max_overlap'], options['overlap_distance']
+    accepted, occupied = [], []
+    cutoff = candidates[0]['score'] * options['score_fraction']
+    if requested > 1 and candidates[0]['score'] <= 0:
+        raise UserError('No positive-scoring placements were found for multiple-copy fitting.')
+    for entry in candidates:
+        if accepted and entry['score'] < cutoff:
+            break
+        base = Place(matrix=np.array(entry['matrix'], dtype=float))
+        orbit, blocked = [], False
+        for operator in operators:
+            pose = operator * base
+            candidate = _ShapeOccupiedCopy(source, pose)
+            for old_pose, old in [*occupied, *orbit]:
+                displacement = (pose.transform_points(source.frame_landmarks + source.center) -
+                                old_pose.transform_points(source.frame_landmarks + source.center))
+                if (np.sqrt(np.mean(np.sum(displacement ** 2, axis=1))) < stats['resolutions'][-1] / 3
+                        or candidate.overlap(old, distance) > maximum):
+                    blocked = True
+                    break
+            if blocked:
+                break
+            orbit.append((pose, candidate))
+        if blocked:
+            continue
+        for pose, candidate in orbit:
+            accepted.append((pose, entry['score']))
+            occupied.append((pose, candidate))
+            if len(accepted) == requested:
+                return accepted
+    if not accepted:
+        raise UserError('No non-overlapping placement was found.')
+    return accepted
+
+
+def _fit_shape_tiled_maps(source, target, options, center):
+    """Run the original global-search engine independently on padded submaps."""
+    from contextlib import nullcontext
+    import numpy as np
+    from chimerax.geometry import Place, translation
+    from chimerax.core.errors import UserError
+
+    levels, stats = _shape_fit_levels(source, target, options)
+    windows, tile_stats = _shape_map_tiles(source, target, levels, options.get("tile_size"))
+    if not windows:
+        raise UserError("No submap has enough nonzero three-dimensional density for fitting.")
+    logger = source.model.session.logger
+    progress = [0, len(windows)]
+    progress_token = _SHAPE_TILE_PROGRESS.set(progress)
+    scorers, pooled = {}, []
+    context = _ShapeBatchCache() if _SHAPE_BATCH_CACHE.get() is None else nullcontext()
+    previous_shared = source._shared_reference
+    source._shared_reference = True
+    try:
+        with context:
+            for index, (window, _, _) in enumerate(windows):
+                _shape_map_status(logger, f"Tiled shape search: tile {index + 1}/{len(windows)} (original global search)...")
+                shift = translation(window.center - target.center)
+                def valid(pose):
+                    inside = _shape_map_contains(target, (shift * pose).transform_points(source.landmarks))
+                    weights = source.weights if options.get('_symmetry') is not None else None
+                    return np.average(inside, weights=weights) >= .99
+                finished = False
+                try:
+                    _, local = _fit_shape_original_map_search(
+                        source, window, options, None, force_global=True, collect=True,
+                        ranking_target=target, shared_levels=levels, scorers=scorers, valid_pose=valid)
+                    finished = True
+                    # Compare finished fits, not prematurely normalized tile
+                    # peaks. Each submap contributes several independent basins.
+                    contribution = max(_SHAPE_SUBMAP_FITS, options.get('copies', 1))
+                    candidates = local['candidates']
+                    if options.get('copies', 1) > 1:
+                        candidates = _shape_copy_site_candidates(source, candidates, contribution, options)
+                    for candidate in candidates[:contribution]:
+                        raw = Place(matrix=np.array(candidate["matrix"], dtype=float))
+                        pooled.append((candidate["score"], translation(-target.center) * raw *
+                                       translation(source.center), candidate["fit_score"]))
+                except _ShapeEmptyMapSearch:
+                    finished = True
+                    continue
+                finally:
+                    window._cache.clear()
+                    if finished:
+                        progress[0] += 1
+                        _shape_map_status(logger, f"Finished tile {index + 1}/{len(windows)}.")
+            if not pooled:
+                raise UserError("No complete moving-model placement was found inside the reference map.")
+            merged = []
+            _shape_map_status(logger, 'Comparing completed submap fits...')
+            for finished_score, pose, local_score in pooled:
+                if options.get("bandpass"):
+                    # Each submap already used this same final-band scorer
+                    # against the original map; do not filter it a second time.
+                    score = finished_score
+                else:
+                    score = _shape_common_map_score(source, target, pose, levels[-1],
+                                                    options["max_points"], options["objective"])
+                merged.append((score, pose, local_score))
+            pool_size = max(_SHAPE_MAP_BEAM, options.get('copies', 1) * 8)
+            kept = _shape_keep_map_poses(merged, source.frame_landmarks, levels[-1] / 3, maximum=pool_size)
+    finally:
+        source._shared_reference = previous_shared
+        _SHAPE_TILE_PROGRESS.reset(progress_token)
+    if not kept:
+        raise UserError("No submap fit has a defined common-reference score.")
+    score, pose, fit_score = kept[0]
+    bands = [(max(blur, 1.5 * options["map_resolution"]), max(options["map_resolution"], blur / 2))
+             for blur in levels] if options.get("bandpass") else []
+    stats.update(tile_stats, score=score, fit_score=fit_score, objective=options["objective"], partial=False,
+                 local=False, map_search=True, tiled=True, bandpass=bool(options.get("bandpass")),
+                 bandpasses=bands, map_resolution=options.get("map_resolution"), resolutions=levels,
+                 moving_input_type="atoms", reference_input_type="map",
+                 search_engine="original_global", submap_candidates=len(pooled),
+                 search_orientations=122 + options["extra_starts"],
+                 score_metric=("model-local bandpass correlation" if bands else
+                               f"common-map {options['objective']} overlap"),
+                 candidates=[dict(score=s, fit_score=f, matrix=(translation(target.center) * p *
+                                  translation(-source.center)).matrix.tolist()) for s, p, f in
+                             (kept if options.get('copies', 1) > 1 or options.get('_symmetry') else kept[:10])])
+    if options.get("radius_search") is not None:
+        stats["radius_search"] = options["radius_search"]
+    if center is not None:
+        stats["center_of_rotation"] = center.copy()
+    return translation(target.center) * pose * translation(-source.center), stats
+
+
 def _fit_shape_density_inputs(source, target, options, center):
+    from chimerax.core.errors import UserError
+
+    if options.get("tiled"):
+        return _fit_shape_tiled_maps(source, target, options, center)
+    try:
+        return _fit_shape_original_map_search(source, target, options, center,
+                                              force_global=options.get('copies', 1) > 1 and options['radius'] is None,
+                                              collect=bool(options.get("bandpass") or options.get('_symmetry')
+                                                           or options.get('copies', 1) > 1))
+    except _ShapeEmptyMapSearch:
+        raise UserError("No valid placement with a defined fitting score was found inside the map.") from None
+
+
+def _fit_shape_original_map_search(source, target, options, center, force_global=False,
+                                    collect=False, ranking_target=None, shared_levels=None,
+                                    scorers=None, valid_pose=None):
+    """The original PCA/FFT search and sum-product refiner, shared by all submaps.
+
+    With bandpass off this is the existing algorithm, not a local Pearson fit.
+    Optional band scores change candidate ranking only, never optimization.
+    """
     import numpy as np
     from chimerax.geometry import translation
 
+    context = options.get('_symmetry')
+    if context is not None:
+        original_valid = valid_pose
+        raw_frame = translation(target.center)
+        valid_pose = lambda pose: ((original_valid is None or original_valid(pose)) and
+                                  _shape_pose_inside(source, context['target'],
+                                                     raw_frame * pose * translation(-source.center)))
     objective, radius = options["objective"], options["radius"]
-    levels, stats = _shape_resolution_schedule(source.frame_landmarks, target.frame_landmarks,
-                                              options["resolution"], radius is not None)
+    levels, stats = _shape_fit_levels(source, target, options)
+    if shared_levels is not None:
+        levels = shared_levels
+    ranking_target = target if ranking_target is None else ranking_target
+    scorers = {} if scorers is None else scorers
+    fft_options = {} if valid_pose is None else dict(valid_pose=valid_pose)
+    if force_global:
+        # Keep several translation basins at model-size spacing. Fine-band
+        # ranking cannot recover sites removed by a bright coarse-density peak.
+        fft_options["site_distance"] = _shape_spatial_size(source.frame_landmarks)
+        fft_options["peaks_per_orientation"] = 8
+    last_kept = []
     initial = (translation(-target.center) * target.model.scene_position.inverse() *
                source.model.scene_position * translation(source.center))
     starts = [initial] if radius is not None else [*_shape_starts(
         source.frame_landmarks, target.frame_landmarks, options["extra_starts"]), initial]
     search_radius = options.get("radius_search")
-    if search_radius is not None:
+    if search_radius is not None or force_global:
         # A regional global search must explore translations even when PCA
         # already gives a good score. Only the reference density was cropped.
-        source.model.session.logger.status("Shape alignment: global search of the reference CoFR sphere...")
+        _shape_map_status(source.model.session.logger, "Shape alignment: global search of " +
+                          ("a numerical submap..." if force_global else "the reference CoFR sphere..."))
         starts.extend(_shape_map_fft_starts(
             source.grid(levels[0]), target.grid(levels[0]), source.frame_landmarks,
-            target.frame_landmarks, objective, options["extra_starts"]))
+            target.frame_landmarks, objective, options["extra_starts"], **fft_options))
 
     def refine(candidates, first=0):
+        nonlocal last_kept
         for blur in levels[first:]:
-            source.model.session.logger.status(f"Shape alignment: map density at {blur:.3g} A ({len(candidates)} starts)...")
+            _shape_map_status(source.model.session.logger,
+                              f"Shape alignment: map density at {blur:.3g} A ({len(candidates)} starts)...")
             results, points = _refine_density_grids(source.grid(blur), target.grid(blur), candidates,
                                                    options["max_points"], objective)
-            candidates = []
+            ranked = []
+            scorer = None
+            if options.get("bandpass"):
+                floor = options["map_resolution"]
+                key = (max(blur, 1.5 * floor), max(floor, blur / 2))
+                if key not in scorers:
+                    scorers[key] = _ShapeBandScorer(source, *key, options["max_points"])
+                scorer = scorers[key]
+            shift = translation(target.center - ranking_target.center)
+            for fit_score, pose, _ in results:
+                _shape_checkpoint()
+                if valid_pose is not None and not valid_pose(pose):
+                    continue
+                if context is not None:
+                    raw = translation(target.center) * pose * translation(-source.center)
+                    if _shape_symmetry_clashes(source, context, raw, options['max_overlap'], options['overlap_distance']):
+                        continue
+                score = scorer.score(ranking_target, shift * pose) if scorer is not None else fit_score
+                if np.isfinite(score):
+                    ranked.append((score, pose, fit_score))
+            if scorer is not None:
+                ranked.sort(key=lambda row: row[0], reverse=True)
+            candidates, last_kept = [], []
             probes = points[np.linspace(0, len(points) - 1, min(64, len(points)), dtype=int)]
-            for _, pose, _ in results:
+            for entry in ranked:
+                _, pose, _ = entry
                 if any(np.sqrt(np.mean(np.sum((pose.transform_points(probes) - old.transform_points(probes)) ** 2, axis=1)))
                        < blur / 3 for old in candidates):
                     continue
                 candidates.append(pose)
+                last_kept.append(entry)
                 if len(candidates) == 48:
                     break
-        return results[0][:2]
+            if not last_kept:
+                raise _ShapeEmptyMapSearch()
+        return last_kept[0][:2]
 
     score, pose = refine(starts)
     stats.update(objective=objective, partial=False, local=radius is not None, map_search=False,
@@ -3407,16 +4619,29 @@ def _fit_shape_density_inputs(source, target, options, center):
                  reference_input_type="map" if target.is_map else "atoms", resolutions=levels)
     if search_radius is not None:
         stats.update(map_search=True, map_search_resolution=levels[0], radius_search=search_radius)
-    elif radius is None and options["fallback_correlation"] > 0 and score < options["fallback_correlation"]:
+    elif force_global:
+        stats.update(map_search=True, map_search_resolution=levels[0])
+    elif radius is None and options["fallback_correlation"] > 0 and last_kept[0][2] < options["fallback_correlation"]:
         first = 1 if len(levels) > 2 else 0
         blur = levels[first]
         seeds = _shape_map_fft_starts(source.grid(blur), target.grid(blur), source.frame_landmarks,
-                                      target.frame_landmarks, objective, options["extra_starts"])
+                                      target.frame_landmarks, objective, options["extra_starts"], **fft_options)
+        previous_kept = last_kept
         proposed_score, proposed = refine([pose, *seeds], first)
         stats.update(map_search=True, map_search_resolution=blur, map_initial_score=score)
         if proposed_score > score:
             score, pose = proposed_score, proposed
+        else:
+            last_kept = previous_kept
     stats["score"] = score
+    if options.get("bandpass"):
+        stats.update(bandpass=True, tiled=False, fit_score=last_kept[0][2],
+                     score_metric="model-local bandpass correlation",
+                     bandpasses=[(max(blur, 1.5 * options["map_resolution"]),
+                                  max(options["map_resolution"], blur / 2)) for blur in levels])
+    if collect:
+        stats["candidates"] = [dict(score=s, fit_score=f, matrix=(translation(target.center) * p *
+                                translation(-source.center)).matrix.tolist()) for s, p, f in last_kept]
     if center is not None:
         stats["center_of_rotation"] = center.copy()
         if radius is not None:
@@ -3424,7 +4649,7 @@ def _fit_shape_density_inputs(source, target, options, center):
     return translation(target.center) * pose * translation(-source.center), stats
 
 
-def _shape_map_correlations(source, target, pose, resolution, window):
+def _shape_map_correlations(source, target, pose, resolution, window, regional=False):
     import numpy as np
     from chimerax.core.errors import UserError
     from chimerax.geometry import translation
@@ -3438,6 +4663,10 @@ def _shape_map_correlations(source, target, pose, resolution, window):
     size = np.ceil((placed.max(axis=0) + pad - origin) / step).astype(int) + 1
     if np.prod(size) > _MAX_CORRELATION_VOXELS:
         raise UserError("The local correlation grid is too large; use a coarser correlation resolution.")
+    if regional:
+        target = _shape_map_box(target, placed, pad)
+        if target is None:
+            raise UserError("The fitted model does not overlap the map correlation region.")
     centered_pose = translation(-target.center) * pose * translation(source.center)
     first = _resample_shape_density(source.grid(resolution), origin, size, step, centered_pose)
     second = _resample_shape_density(target.grid(resolution), origin, size, step)
@@ -3469,34 +4698,75 @@ def _shape_align_with_map(session, source_item, target_item, options, center, ta
     target = target_input if target_input is not None else _shape_reference_input(
         *target_item, center, radius if radius is not None else options.get("radius_search"),
         options.get("confidence_reference") or options.get("confidence", "auto"))
+    symmetry_spec = options.get('_symmetry_spec')
+    if symmetry_spec is not None:
+        # The seed search sphere does not crop the density of symmetry mates.
+        full_target = _shape_reference_input(target.model, None, None, None)
+        options = dict(options, _symmetry=dict(target=full_target, operators=symmetry_spec[0],
+                                              parameters=symmetry_spec[1]))
+        description = symmetry_spec[1]
+        axis_text = ','.join(f'{v:.4g}' for v in description['symmetry_axis'])
+        center_text = ','.join(f'{v:.4g}' for v in description['symmetry_center'])
+        session.logger.info(f"Symmetry {description['symmetry']}: one seed, then expansion; "
+                            f"reference-map axis {axis_text}, center {center_text}.")
     _shape_log_confidence(session, source.model, source.weights, "moving")
     _shape_log_confidence(session, target.model, target.weights, "reference")
-    pose, stats = _fit_shape_density_inputs(source, target, options, center)
+    workers = _SHAPE_MAP_WORKERS.get()
+    multiple = options.get('copies', 1) > 1
+    with _ShapeMapInputGuard((source_item, target_item)) as guard:
+        search_options = dict(options, copies=1) if symmetry_spec is not None else options
+        pose, stats = _fit_shape_density_inputs(source, target, search_options, center)
+        placements = (_shape_select_copies(source, target, stats, options, pose)
+                      if multiple or symmetry_spec is not None else [(pose, stats['score'])])
+        guard.validate()
+        if workers is not None and workers.used:
+            stats['map_workers'] = len(workers.processes)
     stats.update(moving_confidence="off" if source.weights is None else "plddt",
                  reference_confidence="off" if target.weights is None else "plddt")
+    if symmetry_spec is not None:
+        stats.update(symmetry_spec[1])
     if options.get("radius_search") is not None:
         stats["radius_search_automatic"] = auto_search
+    stats['score'] = placements[0][1]
     stats["seconds"] = perf_counter() - started
-    scores = None
-    if options["correlation"] or options["color_fit"]:
-        scoring_started = perf_counter()
-        scores, extra = _shape_map_correlations(source, target, pose, options["correlation_resolution"],
-                                               options["correlation_window"])
-        stats.update(extra, correlation_seconds=perf_counter() - scoring_started)
     model, reference = source.model, target.model
-    transform = reference.scene_position * pose * model.scene_position.inverse()
+    transform = reference.scene_position * placements[0][0] * model.scene_position.inverse()
     undo = UndoState("shape align")
+    original_model = model
+    created, records = [], []
+    scores = None
+    scoring_started = perf_counter()
     try:
-        if options["move"]:
-            parent = model.parent.scene_position
-            old = model.position
-            new = parent.inverse() * transform * parent * old
-            undo.add(model, "position", old, new)
-            model.position = new
-        if scores is not None:
-            _assign_shape_correlations(session, model, source.atoms, scores, undo, options["color_fit"])
+        for index, (local_pose, score) in enumerate(placements):
+            extra = {}
+            if options['correlation'] or options['color_fit']:
+                scoring_target = options['_symmetry']['target'] if symmetry_spec is not None else target
+                t0 = perf_counter()
+                scores, extra = _shape_map_correlations(
+                    source, scoring_target, local_pose, options['correlation_resolution'],
+                    options['correlation_window'],
+                    regional=bool(stats.get('tiled') or stats.get('bandpass') or symmetry_spec is not None))
+                extra['correlation_seconds'] = perf_counter() - t0
+            current, scoring_atoms = original_model, source.atoms
+            if options['move']:
+                motion = reference.scene_position * local_pose * original_model.scene_position.inverse()
+                current, scoring_atoms = _shape_place_model(
+                    session, original_model, source.atoms, motion, undo, options.get('copy', False) or multiple)
+                if current is not original_model:
+                    created.append(current)
+                    if multiple:
+                        current.name = f'{original_model.name} fit {index + 1}'
+            if scores is not None:
+                _assign_shape_correlations(session, current, scoring_atoms, scores, undo, options['color_fit'])
+            if index == 0:
+                model = current
+                stats.update(extra)
+            records.append(dict(score=score, matrix=local_pose.matrix.tolist(),
+                                model_id=current.id_string if options['move'] else None))
     except BaseException:
         undo.undo()
+        if created:
+            session.models.close(created)
         raise
     if undo.state:
         session.undo.register(undo)
@@ -3504,19 +4774,47 @@ def _shape_align_with_map(session, source_item, target_item, options, center, ta
         stats["correlation_grid_seconds"] = stats["correlation_seconds"]
         stats["correlation_seconds"] = perf_counter() - scoring_started
     stats.update(moving_model_id=model.id_string, reference_model_id=reference.id_string)
-    metric = "gradient correlation" if options["objective"] == "gradient" else "density overlap"
+    if multiple or symmetry_spec is not None:
+        stats.update(copies_requested=options.get('copies', 1), copies_found=len(records), placements=records,
+                     max_overlap=options['max_overlap'], overlap_distance=options['overlap_distance'],
+                     score_fraction=options['score_fraction'])
+    if multiple:
+        stats['moving_model_ids'] = [record['model_id'] for record in records if record['model_id'] is not None]
+        if len(records) < options['copies']:
+            if symmetry_spec is not None:
+                session.logger.warning(f"Expanded {len(records)}/{options['copies']} copies; the symmetry range, "
+                                       "map bounds, or overlap checks limit expansion.")
+            else:
+                session.logger.warning(f"Found {len(records)}/{options['copies']} non-overlapping copies among the "
+                                       "retained candidates above the score-fraction cutoff.")
+    if model is not original_model:
+        stats["source_model_id"] = original_model.id_string
+        fitted = ', '.join(f'#{item.id_string}' for item in created)
+        session.logger.info(f"Shape alignment: fitted {'copies' if len(created) > 1 else 'copy'} {fitted}; "
+                            f"original #{original_model.id_string} unchanged.")
+    metric = stats.get("score_metric") or ("whole gradient correlation" if options["objective"] == "gradient" else
+                                            "whole density overlap")
     region = (f"reference density in a {options['radius_search']:g} A CoFR search sphere."
               if options.get("radius_search") is not None else
               f"density in a {radius:g} A CoFR refinement sphere." if radius is not None else
               "full map density, independent of contour.")
     message = (f"Shape alignment #{model.id_string} ({stats['moving_input_type']}) to "
-               f"#{reference.id_string} ({stats['reference_input_type']}): whole {metric} "
-               f"score {stats['score']:.3f}; {stats['seconds']:.2f} s; {region}" +
+               f"#{reference.id_string} ({stats['reference_input_type']}): {metric} "
+               f"score {stats['score']:.3f}; " + (f"{len(records)}/{options['copies']} copies; " if multiple else '') +
+               f"{stats['seconds']:.2f} s; {region}" +
                (" (not moved)" if not options["move"] else ""))
     session.logger.info(message)
     session.logger.status(message)
     session.logger.info("Fitting scales: " + " -> ".join(f"{v:.3g}" for v in stats["resolutions"]) +
                         " A; Gaussian blur is additional to the map's existing resolution.")
+    if stats.get("tiled"):
+        session.logger.info(f"Tiled search: {stats['tiles']} translation cores, {stats['nonempty_tiles']} nonempty; "
+                            f"up to {stats['search_orientations']} orientations per tile; "
+                            f"largest FFT {stats['tile_fft_voxels']:,} voxels.")
+    if stats.get("bandpass"):
+        session.logger.info("Model-local validation bands (smooth Gaussian differences): " +
+                            " -> ".join(f"{coarse:.3g}-{fine:.3g}" for coarse, fine in stats["bandpasses"]) +
+                            " A. These are ranking scores, not probabilities or independent validation data.")
     if scores is not None:
         session.logger.info(f"Local density CC: {stats['correlation_defined_atoms']}/{len(source.atoms)} atoms defined; "
                             f"{stats['correlation_seconds']:.2f} s extra; saved shape_correlation" +
@@ -3544,13 +4842,14 @@ def _shape_align_help(session):
     rows = (
         ("radius_search [A]", "Global search in a reference-map CoFR sphere; omit A for 1.5x model radius."),
         ("radius_refine A", "Local refinement at CoFR. Use only one radius; both are in Angstroms."),
-        ("objective density|gradient", "Scoring method; default: density."),
-        ("resolution A", "Final fitting scale; default: automatic."),
-        ("confidence auto|off|plddt", "Weight known AlphaFold models automatically; off disables; plddt forces B-factor confidence."),
-        ("color_fit true", "Color moving atoms by local density agreement; default: off."),
-        ("workers 0|N", "Atomic batches: 0 available CPUs minus one, 1 serial, or an explicit count."),
+        ("copies N", "Model/map: up to N non-overlapping copies; N > 1 leaves the source unchanged."),
+        ("symmetry C6 / h,rise,twist", "Fit one seed, check implied clashes, then expand; default axis: map Z."),
+        ("resolution A / objective density|gradient", "Final scale: automatic; objective: density."),
+        ("confidence auto|off|plddt", "Weight AlphaFold confidence automatically, disable, or force B-factor pLDDT."),
+        ("workers 0|N / color_fit true", "CPUs: 0 automatic, 1 serial; or color atoms by local density agreement."),
     )
-    description = "Rigidly fit models/maps; only the moving inputs move. Supports Undo."
+    description = ("Rigidly fit models/maps; copy true fits a model copy. "
+                   "Model/map: tiled true; bandpass true map_resolution A. Supports Undo.")
     example = "shapealign #2 to #1 radius_search"
     if session.ui.is_gui:
         from html import escape
@@ -3581,7 +4880,10 @@ def shape_align(session, moving=None, to=None, resolution=None, max_points=12000
                 color_fit=False, correlation_resolution=8.0, correlation_window=12.0,
                 partial=None, fallback_correlation=None, objective="density",
                 radius_search=None, radius_refine=None, workers=0,
-                confidence="auto", confidence_moving=None, confidence_reference=None):
+                confidence="auto", confidence_moving=None, confidence_reference=None, copy=False,
+                tiled=False, bandpass=False, map_resolution=None, tile_size=None,
+                copies=1, max_overlap=.1, overlap_distance=4., score_fraction=.8,
+                symmetry=None, symmetry_center=None, symmetry_axis=None, refine_copies=False):
     """Align independent inputs globally, regionally, or by local refinement.
 
     radius_search globally searches a reference-map CoFR sphere, keeping the
@@ -3597,6 +4899,8 @@ def shape_align(session, moving=None, to=None, resolution=None, max_points=12000
 
     if moving is None and to is None:
         return _shape_align_help(session)
+    if getattr(session, '_shapealign_running', False):
+        raise UserError('shapealign is already running; wait for it to finish.')
     if moving is None or to is None:
         raise UserError("Specify both moving and reference inputs: shapealign <moving-spec> to <reference-spec>. "
                         "Type shapealign help for options.")
@@ -3620,6 +4924,46 @@ def shape_align(session, moving=None, to=None, resolution=None, max_points=12000
     sources = _shape_exclude_reference(session, sources, target)
     if not sources:
         return []
+    if isinstance(copies, bool) or not isinstance(copies, (int, np.integer)) or not 1 <= copies <= 512:
+        raise UserError('copies must be an integer from 1 to 512 (the maximum number of fitted copies).')
+    for name, value in (('max_overlap', max_overlap), ('score_fraction', score_fraction)):
+        if not isfinite(value) or not 0 <= value <= 1:
+            raise UserError(f'{name} must be between zero and one.')
+    if not isfinite(overlap_distance) or overlap_distance <= 0:
+        raise UserError('overlap_distance must be finite and positive, in Angstroms.')
+    if (copies > 1 or symmetry is not None) and (targets[0][1] is not None or any(a is None for _, a in sources)):
+        raise UserError('copies and symmetry currently require moving atomic models and a reference map.')
+    if copies > 1 and radius is not None and symmetry is None:
+        raise UserError('Multiple-copy search is global; use radius_search or tiled, not radius_refine.')
+    if symmetry is None and (symmetry_center is not None or symmetry_axis is not None):
+        raise UserError('symmetry_center and symmetry_axis require symmetry.')
+    if refine_copies and symmetry is None:
+        raise UserError('refine_copies is used after symmetry expansion; supply symmetry.')
+    symmetry_spec = None
+    if symmetry is not None:
+        symmetry_spec = _shape_symmetry_operators(session, target, symmetry, symmetry_center, symmetry_axis, copies)
+    if copy and not move:
+        raise UserError("copy true requires move true; move false reports a fit without creating a copy.")
+    if copy and any(atoms is None for _, atoms in sources):
+        raise UserError("copy true supports moving atomic models only; moving maps are never duplicated.")
+    regional_search = tiled or bandpass
+    if regional_search and (targets[0][1] is not None or any(atoms is None for _, atoms in sources)):
+        raise UserError("tiled and bandpass currently require moving atomic models and a reference map.")
+    if tiled and radius is not None:
+        raise UserError("tiled is a global search; do not combine it with radius_refine.")
+    if bandpass and map_resolution is None:
+        raise UserError("bandpass true requires map_resolution in Angstroms, for example map_resolution 2.2.")
+    if map_resolution is not None:
+        if not regional_search:
+            raise UserError("map_resolution is used with tiled true or bandpass true.")
+        if not isfinite(map_resolution) or map_resolution <= 0:
+            raise UserError("map_resolution must be finite and positive (Angstroms).")
+        if map_resolution + 1e-6 < 2 * max(target.data.step):
+            raise UserError("map_resolution cannot be finer than the reference map's Nyquist sampling limit.")
+        if resolution is not None and resolution < map_resolution:
+            raise UserError("resolution cannot be finer than map_resolution.")
+    if tile_size is not None and (not tiled or not isfinite(tile_size) or tile_size <= 0):
+        raise UserError("tile_size requires tiled true and a finite positive length in Angstroms.")
     for model, _ in sources:
         if target in model.drawing_lineage or model in target.drawing_lineage:
             raise UserError("Moving and reference models must not contain one another.")
@@ -3629,14 +4973,17 @@ def shape_align(session, moving=None, to=None, resolution=None, max_points=12000
                    radius=radius, correlation=correlation, color_fit=color_fit,
                    correlation_resolution=correlation_resolution, correlation_window=correlation_window,
                    partial=partial, fallback_correlation=fallback_correlation, objective=objective,
-                   confidence=confidence, confidence_moving=confidence_moving, confidence_reference=confidence_reference)
+                   confidence=confidence, confidence_moving=confidence_moving, confidence_reference=confidence_reference,
+                   copy=copy)
     if all(atoms is not None for _, atoms in [*sources, *targets]):
         from chimerax.atomic import concatenate
 
-        return _shape_align_atomic_models(session, concatenate([selected for _, selected in sources]),
-                                          targets[0][1], workers=workers, **options)
-    if workers > 1:
-        raise UserError("Parallel workers currently support atomic model/model batches only; use workers 1 for maps.")
+        with _ShapeUI(session):
+            return _shape_align_atomic_models(session, concatenate([selected for _, selected in sources]),
+                                              targets[0][1], workers=workers, **options)
+    options.update(tiled=tiled, bandpass=bandpass, map_resolution=map_resolution, tile_size=tile_size)
+    options.update(copies=copies, max_overlap=max_overlap, overlap_distance=overlap_distance,
+                   score_fraction=score_fraction, _symmetry_spec=symmetry_spec, refine_copies=refine_copies)
     if radius_search is not None:
         options["radius_search"] = radius_search
     if objective not in ("density", "gradient") or partial not in (None, False):
@@ -3671,7 +5018,7 @@ def shape_align(session, moving=None, to=None, resolution=None, max_points=12000
     target_input = None
     cache_context = _ShapeBatchCache() if len(sources) > 1 else nullcontext()
     undo_context = session.undo.aggregate("shape align models") if move and len(sources) > 1 else nullcontext()
-    with cache_context, undo_context as batch:
+    with _ShapeUI(session), cache_context, undo_context as batch, _ShapeMapWorkers(session, workers):
         try:
             for item in sources:
                 if item[1] is not None and targets[0][1] is not None:
@@ -3695,7 +5042,9 @@ def shape_align(session, moving=None, to=None, resolution=None, max_points=12000
 
 
 def _register_shape_align_command(logger):
-    from chimerax.core.commands import BoolArg, CmdDesc, EnumOf, FloatArg, IntArg, NoArg, ObjectsArg, Or, register
+    from chimerax.core.commands import (AxisArg, BoolArg, CenterArg, CmdDesc, EnumOf, FloatArg,
+                                       IntArg, NoArg, ObjectsArg, Or, register)
+    from chimerax.atomic import SymmetryArg
 
     class SearchRadiusArg(Or):
         # ChimeraX rejects empty keyword values before calling parse(), except
@@ -3709,13 +5058,17 @@ def _register_shape_align_command(logger):
     register("shapealign", CmdDesc(
         optional=[("moving", ObjectsArg)],
         keyword=[("to", ObjectsArg), ("resolution", FloatArg),
-                 ("max_points", IntArg), ("extra_starts", IntArg), ("move", BoolArg),
+                 ("max_points", IntArg), ("extra_starts", IntArg), ("move", BoolArg), ("copy", BoolArg),
                  ("radius_search", SearchRadiusArg(FloatArg, NoArg, name="radius in Angstroms or no value (automatic)")),
                  ("radius_refine", FloatArg), ("radius", FloatArg),
                  ("correlation", BoolArg), ("color_fit", BoolArg),
                  ("correlation_resolution", FloatArg), ("correlation_window", FloatArg),
                  ("partial", BoolArg), ("fallback_correlation", FloatArg),
                  ("workers", IntArg),
+                 ("tiled", BoolArg), ("bandpass", BoolArg), ("map_resolution", FloatArg), ("tile_size", FloatArg),
+                 ("copies", IntArg), ("max_overlap", FloatArg), ("overlap_distance", FloatArg),
+                 ("score_fraction", FloatArg), ("symmetry", SymmetryArg),
+                 ("symmetry_center", CenterArg), ("symmetry_axis", AxisArg), ("refine_copies", BoolArg),
                  ("confidence", EnumOf(("auto", "off", "plddt"))),
                  ("confidence_moving", EnumOf(("auto", "off", "plddt"))),
                  ("confidence_reference", EnumOf(("auto", "off", "plddt"))),
