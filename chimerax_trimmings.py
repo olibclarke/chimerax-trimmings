@@ -3479,11 +3479,42 @@ def _resample_shape_density(grid, origin, size, step, pose=None):
     return matrix
 
 
+def _shape_cofr_crop_bounds(data, center, radius):
+    """Native-grid box enclosing a physical CoFR sphere, clipped to the map."""
+    from itertools import product
+    import numpy as np
+
+    corners = np.array(list(product(*[(v - radius, v + radius) for v in center])))
+    ijk = data.xyz_to_ijk_transform.transform_points(corners)
+    lower = np.maximum(np.floor(ijk.min(axis=0)).astype(int), 0)
+    upper = np.minimum(np.ceil(ijk.max(axis=0)).astype(int) + 1, data.size)
+    return lower, upper
+
+
+def _shape_cofr_radius_limit(data, center, rejected_radius):
+    """Translate the crop allocation limit into an actionable physical radius."""
+    from math import floor, log10
+    import numpy as np
+
+    low, high = 0., rejected_radius
+    for _ in range(48):
+        middle = (low + high) / 2
+        lower, upper = _shape_cofr_crop_bounds(data, center, middle)
+        if np.prod(np.maximum(0, upper - lower)) <= _MAX_GRID_VOXELS:
+            low = middle
+        else:
+            high = middle
+    if low <= 0:
+        return 0.
+    # Round down, not to nearest: the suggested number must pass the same guard.
+    quantum = 10 ** (floor(log10(low)) - 1)
+    return floor(low / quantum) * quantum
+
+
 class _ShapeDensityInput:
     """A selected atomic density or native full map, in the owner's local frame."""
 
     def __init__(self, model, atoms, center=None, radius=None, confidence="auto", allow_empty=False):
-        from itertools import product
         import numpy as np
         from chimerax.atomic import Residue
         from chimerax.core.errors import UserError
@@ -3518,12 +3549,18 @@ class _ShapeDensityInput:
             raise UserError("Each map must contain a three-dimensional density grid.")
         if center is not None:
             local_center = model.scene_position.inverse() * center
-            box = np.array(list(product(*[(v - radius, v + radius) for v in local_center])))
-            ijk = data.xyz_to_ijk_transform.transform_points(box)
-            lower = np.maximum(np.floor(ijk.min(axis=0)).astype(int), 0)
-            upper = np.minimum(np.ceil(ijk.max(axis=0)).astype(int) + 1, data.size)
-            if np.any(upper <= lower) or np.prod(upper - lower) > _MAX_GRID_VOXELS:
-                raise UserError("The map CoFR region is empty or exceeds the working-grid limit.")
+            lower, upper = _shape_cofr_crop_bounds(data, local_center, radius)
+            if np.any(upper <= lower):
+                raise UserError(f"The {radius:.3g} A CoFR sphere does not intersect the map grid; "
+                                "move CoFR into the desired map region or increase the radius.")
+            voxels = int(np.prod(upper - lower))
+            if voxels > _MAX_GRID_VOXELS:
+                limit = _shape_cofr_radius_limit(data, local_center, radius)
+                example = min(50., limit)
+                raise UserError(f"The CoFR radius is {radius:.3g} A; the input-crop limit here is about {limit:g} A. "
+                                f"Set a smaller explicit radius, e.g. radius_search {example:g} "
+                                f"(or radius_refine {example:g} for local refinement). "
+                                "A bare radius_search chooses the radius automatically.")
             matrix = data.matrix(tuple(lower), tuple(upper - lower)).copy()
             if matrix.ndim != 3:
                 raise UserError("shapealign requires scalar three-dimensional density, not color/vector maps.")

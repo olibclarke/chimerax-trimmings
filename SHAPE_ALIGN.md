@@ -114,6 +114,10 @@ shapealign #2 to #1 radius_refine 30
   radius is chosen from the moving model's size.
 - `radius_refine`: refine the existing fit near the center of rotation.
 
+Long termini can make the automatic radius large. If the CoFR crop exceeds its
+memory limit, give an explicit radius, for example `radius_search 50`. For a
+whole-map search, omit the radius and use `tiled true` instead.
+
 ## Large-map search and bandpass scoring
 
 For a small atomic model in a large map, try the experimental tiled search:
