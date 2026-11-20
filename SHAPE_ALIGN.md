@@ -12,6 +12,24 @@ shapealign sel to #1
 The first input moves; `to` stays fixed. Atomic selections choose fitting atoms,
 but the whole model moves. Fits support Undo/Redo.
 
+Map inputs automatically trim near-zero outer padding before building fitting
+grids or search tiles. The retained box encloses all density whose absolute
+value exceeds 1% of the map's peak absolute value, with two native-grid planes
+of margin. Positive and negative density count equally; every value inside the
+box is retained. This is independent of the displayed contour. Disconnected
+regions above the cutoff are kept, not just the largest blob. Very weak regions
+below this cutoff can be excluded if they lie entirely in the outer padding.
+The Log reports the size reduction in Angstroms. Only numerical fitting arrays
+are cropped: the input map, its origin, display and symmetry center are unchanged.
+For global atomic-model/map fits, if that box still exceeds the fitting-grid or
+FFT limits, the search box is progressively reduced around the original map-box
+center until all search scales fit. With `radius_search`, the selected region's
+box center is used instead. The Log reports the retained dimensions and center
+in Angstroms. Density outside that smaller box is excluded from the search.
+This fallback never enables tiling or changes the requested fitting scales.
+Use `tiled true` explicitly to search the entire retained map, including
+peripheral sites; it is slower. Local refinement is not automatically cropped.
+
 ## Fit a copy
 
 ```chimerax
@@ -114,6 +132,36 @@ shapealign #2 to #1 radius_refine 30
   radius is chosen from the moving model's size.
 - `radius_refine`: refine the existing fit near the center of rotation.
 
+In the default single-model regional search, the model's starting orientation
+gets another chance at the finest scale, either at its current position or
+centered on CoFR. This helps when coarse blurring pulls a good seed away from
+its site. A recovered pose replaces the search result only if it scores better.
+If the starting orientation is uncertain and nearby density dominates the
+search, try `objective gradient`.
+
+Single-model density fits with `radius_search` now retry weak fits automatically:
+
+```chimerax
+shapealign #2 to #1 radius_search 50
+```
+
+This compares the poses using the same model-local bandpass correlation
+(normally 3–6 Å, coarser if required by map sampling or the requested fitting
+resolution). For a lower-resolution region, give its resolution in Å with
+`map_resolution` (for example, `map_resolution 6.5`); this changes the
+comparison band without changing the search. The density pose skips retry if
+it reaches `retry_cutoff` (default `0.30`). The retry starts one scale finer and
+refines fewer candidates. If there is no intermediate scale or the finer FFT
+would exceed the memory limit, it uses the standard gradient search on the
+same region. If the leading gradient pose fails validation, the command
+checks alternative hits it already found, then tries a few reproducible
+translation offsets of 10–30% of the moving model's enclosing radius. These
+start local refinements without moving CoFR or repeating the FFT search.
+If no pose passes the cutoff, the model stays in its starting position.
+Use `gradient_retry false` to skip the retry and its scoring check entirely.
+The cutoff is a heuristic, not a confidence estimate. Other search modes
+are unchanged.
+
 Long termini can make the automatic radius large. If the CoFR crop exceeds its
 memory limit, give an explicit radius, for example `radius_search 50`. For a
 whole-map search, omit the radius and use `tiled true` instead.
@@ -208,6 +256,7 @@ Do not use `plddt` for experimental B-factors.
 | --- | --- |
 | `resolution 8` | Set the fitting scale in Å; default is automatic |
 | `objective gradient` | Try the experimental gradient-based objective |
+| `gradient_retry false` | Disable the automatic retry and its validation check for eligible `radius_search` fits |
 | `tiled true` | Search a reference map with bounded, padded translation tiles |
 | `bandpass true map_resolution 2.2` | Rank model/map candidates by finer-band agreement |
 | `extra_starts 8` | Try more starting orientations |

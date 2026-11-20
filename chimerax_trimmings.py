@@ -1435,7 +1435,14 @@ _CHAIN_BACKUP_MIN_FRACTION = 0.2  # Ignore tiny chains and cap the extra searche
 _MAX_CHAIN_BACKUP_STARTS = 4
 _AUTO_FINE_LIMITS = (2.0, 8.0)  # Bound unnecessary atom-level detail and preserve helix-scale features.
 _SHAPE_MAP_BEAM = 48  # Preserve competing sites/orientations between scales.
+_SHAPE_COMPACT_GRADIENT_ORIENTATIONS = 48  # In addition to the native PCA starts.
+_SHAPE_COMPACT_GRADIENT_FFT_SEEDS = 24
+_SHAPE_COMPACT_GRADIENT_FINAL_STARTS = 16
+_SHAPE_GRADIENT_JITTERS_PER_POSE = 3
+_SHAPE_GRADIENT_JITTER_FRACTIONS = (.10, .30)
 _SHAPE_SUBMAP_FITS = 4  # Finish several fits per submap before comparing submaps.
+_SHAPE_PADDING_FRACTION = .01  # Numerical edge padding, independent of the displayed contour.
+_SHAPE_PADDING_MARGIN = 2  # Native-grid planes retained beyond the density support.
 
 
 class _ShapeBatchCache:
@@ -3511,10 +3518,50 @@ def _shape_cofr_radius_limit(data, center, rejected_radius):
     return floor(low / quantum) * quantum
 
 
-class _ShapeDensityInput:
-    """A selected atomic density or native full map, in the owner's local frame."""
+def _shape_density_bounds(matrix, fraction=_SHAPE_PADDING_FRACTION):
+    """Find signed-density support with bounded scratch space, before allocating fitting grids."""
+    import numpy as np
+    from chimerax.core.errors import UserError
 
-    def __init__(self, model, atoms, center=None, radius=None, confidence="auto", allow_empty=False):
+    # Axis projections avoid a second full-map mask and preserve disconnected
+    # islands, including negative density. No connected-component pruning.
+    zmax = np.empty(matrix.shape[0], dtype=np.float64)
+    ymax = np.zeros(matrix.shape[1], dtype=np.float64)
+    xmax = np.zeros(matrix.shape[2], dtype=np.float64)
+    for k, plane in enumerate(matrix):
+        _shape_checkpoint()
+        values = np.abs(plane.astype(np.float64))
+        if not np.isfinite(values).all():
+            raise UserError("Fitting maps must contain only finite density values.")
+        zmax[k] = values.max()
+        np.maximum(ymax, values.max(axis=1), out=ymax)
+        np.maximum(xmax, values.max(axis=0), out=xmax)
+    peak = float(zmax.max())
+    lower, upper = np.zeros(3, dtype=int), np.array(matrix.shape[::-1])
+    if peak:
+        for axis, projection in enumerate((xmax, ymax, zmax)):
+            occupied = np.flatnonzero(projection > fraction * peak)
+            lower[axis] = max(0, occupied[0] - _SHAPE_PADDING_MARGIN)
+            upper[axis] = min(upper[axis], occupied[-1] + 1 + _SHAPE_PADDING_MARGIN)
+    return lower, upper, peak
+
+
+def _shape_log_padding(session, value, role):
+    crop = getattr(value, 'padding_crop', None)
+    if crop is not None:
+        before = ' x '.join(f'{v:.3g}' for v in crop['original_extent'])
+        after = ' x '.join(f'{v:.3g}' for v in crop['extent'])
+        session.logger.info(f"Shape alignment {role} #{value.model.id_string}: trimmed near-zero edge padding "
+                            f"from {before} A to {after} A for fitting "
+                            f"(below {100 * _SHAPE_PADDING_FRACTION:g}% of peak absolute density). "
+                            "The displayed map is unchanged.")
+
+
+class _ShapeDensityInput:
+    """A selected atomic density or padding-trimmed map, in the owner's local frame."""
+
+    def __init__(self, model, atoms, center=None, radius=None, confidence="auto", allow_empty=False,
+                 trim_padding=True):
         import numpy as np
         from chimerax.atomic import Residue
         from chimerax.core.errors import UserError
@@ -3523,6 +3570,7 @@ class _ShapeDensityInput:
         self.model, self.atoms = model, atoms
         self.is_map = atoms is None
         self.weights = None
+        self.padding_crop = None
         self._cache = {}
         self._grid_cache_key = object()
         self._shared_reference = False
@@ -3575,22 +3623,26 @@ class _ShapeDensityInput:
             matrix = data.full_matrix()
         if matrix.ndim != 3:
             raise UserError("shapealign requires scalar three-dimensional density, not color/vector maps.")
-        self.data = data
-        self.matrix = matrix
-
-        # All voxel values, including negative density, contribute through rho^2
-        # to geometry. No displayed contour, surface mask, or display region is read.
-        peak = 0.0
-        for plane in matrix:
-            values = plane.astype(np.float64)
-            if not np.isfinite(values).all():
-                raise UserError("Fitting maps must contain only finite density values.")
-            peak = max(peak, float(np.max(np.abs(values))))
+        self.box_center = data.ijk_to_xyz_transform * ((np.asarray(data.size) - 1) / 2)
+        lower, upper, peak = _shape_density_bounds(matrix, _SHAPE_PADDING_FRACTION if trim_padding else 0.)
         if peak == 0:
             if allow_empty:
                 self.empty = True
                 return
             raise UserError("The map fitting region has no nonzero density.")
+        if trim_padding and (np.any(lower) or np.any(upper != data.size)):
+            original_size = np.array(data.size)
+            matrix = matrix[tuple(slice(a, b) for a, b in zip(lower[::-1], upper[::-1]))]
+            origin = data.ijk_to_xyz_transform * lower
+            # ArrayGridData is a numerical view, not a new session map. Preserve
+            # the native affine frame; a crop must never translate a fitted pose.
+            data = ArrayGridData(matrix, origin, data.step, data.cell_angles, data.rotation)
+            self.padding_crop = dict(original_size=original_size, size=np.array(data.size),
+                                     original_extent=(original_size - 1) * np.asarray(data.step),
+                                     extent=(np.array(data.size) - 1) * np.asarray(data.step))
+        self.data, self.matrix = data, matrix
+        # Retain every value inside the box, including weak/negative density.
+        # No displayed contour, surface mask, or display region is read.
         self.peak = peak
         mass, first, second = 0.0, np.zeros(3), np.zeros((3, 3))
         lower, upper = np.array(matrix.shape[::-1]), np.zeros(3, dtype=int)
@@ -3714,6 +3766,7 @@ def _shape_reference_input(model, atoms, center, radius, confidence="auto"):
     def prepare():
         value = _ShapeDensityInput(model, atoms, center, radius, confidence)
         value._shared_reference = True
+        _shape_log_padding(model.session, value, 'reference')
         return value
 
     if _SHAPE_BATCH_CACHE.get() is None:
@@ -3754,7 +3807,7 @@ def _shape_density_samples(grid, maximum):
     return points, weights.astype(np.float32)
 
 
-def _refine_density_grids(source, target, candidates, maximum, objective):
+def _refine_density_grids(source, target, candidates, maximum, objective, *, fine_seeds=()):
     import numpy as np
 
     points, weights = _shape_density_samples(source, maximum)
@@ -3765,21 +3818,37 @@ def _refine_density_grids(source, target, candidates, maximum, objective):
         first = np.einsum("ijk,ijk->", source.matrix(), source.matrix(), dtype=np.float64)
     denominator = sqrt(first * second)
     workers = _SHAPE_MAP_WORKERS.get()
-    if workers is not None:
-        results = workers.refine(points, weights, field, target.xyz_to_ijk_transform, candidates, denominator)
-        if results is not None:
-            return results, points
-    results = []
-    for index, initial in enumerate(candidates):
-        _shape_checkpoint()
-        score, pose = _shape_refine_grid_pose(points, weights, field, target.xyz_to_ijk_transform,
-                                             initial, denominator)
-        results.append((score, pose, index))
-    return sorted(results, key=lambda item: item[0], reverse=True), points
+    xyz_to_ijk = target.xyz_to_ijk_transform
+    results = (None if workers is None else
+               workers.refine(points, weights, field, xyz_to_ijk, candidates, denominator))
+    if results is None:
+        results = []
+        for index, initial in enumerate(candidates):
+            _shape_checkpoint()
+            score, pose = _shape_refine_grid_pose(points, weights, field, xyz_to_ijk, initial, denominator)
+            results.append((score, pose, index))
+        results.sort(key=lambda item: item[0], reverse=True)
+    if fine_seeds:
+        from chimerax.map_fit.fitmap import volume_values
+
+        weights64 = weights.astype(np.float64)
+        score, seed = max(((float(np.dot(weights64, volume_values(points, xyz_to_ijk * pose, field))) / denominator,
+                            pose) for pose in fine_seeds), key=lambda item: item[0])
+        if score > 0:
+            if not any(np.array_equal(seed.matrix, pose.matrix) for pose in candidates):
+                _shape_checkpoint()
+                refined_score, refined_pose = _shape_refine_grid_pose(points, weights, field, xyz_to_ijk, seed, denominator)
+                if refined_score > score:
+                    score, seed = refined_score, refined_pose
+            # Compare on the existing final objective; never replace a stronger fit.
+            if not results or score > results[0][0]:
+                results.insert(0, (score, seed, len(candidates)))
+    return results, points
 
 
 def _shape_map_fft_starts(source, target, source_landmarks, target_landmarks, objective, extra_starts,
-                          valid_pose=None, site_distance=None, peaks_per_orientation=2, _site_center=None):
+                          valid_pose=None, site_distance=None, peaks_per_orientation=2, _site_center=None,
+                          *, broad_orientations=96, max_seeds=_SHAPE_MAP_BEAM):
     import numpy as np
     from scipy.fft import rfftn, irfftn, next_fast_len
     from chimerax.core.errors import UserError
@@ -3795,7 +3864,8 @@ def _shape_map_fft_starts(source, target, source_landmarks, target_landmarks, ob
         return [pose.inverse() for pose in _shape_map_fft_starts(
             target, source, target_landmarks, source_landmarks, objective, extra_starts,
             None if valid_pose is None else lambda pose: valid_pose(pose.inverse()),
-            site_distance, peaks_per_orientation, lambda pose: center(pose.inverse()))]
+            site_distance, peaks_per_orientation, lambda pose: center(pose.inverse()),
+            broad_orientations=broad_orientations, max_seeds=max_seeds)]
     side = int(np.ceil(2 * radius / step)) + 1
     side += 1 - side % 2
     fft_shape = tuple(next_fast_len(n + side - 1) for n in target.matrix().shape)
@@ -3811,7 +3881,7 @@ def _shape_map_fft_starts(source, target, source_landmarks, target_landmarks, ob
     fft_threads = _shape_map_fft_threads(int(np.prod(fft_shape)))
     target_fft = _shape_reference_fft(target, field, fft_shape, objective, workers=fft_threads)
     peaks = []
-    for initial in _shape_starts(source_landmarks, target_landmarks, 96 + extra_starts):
+    for initial in _shape_starts(source_landmarks, target_landmarks, broad_orientations + extra_starts):
         _shape_checkpoint()
         rotation = Place(matrix=np.column_stack((initial.matrix[:, :3], np.zeros(3))))
         density = _resample_shape_density(source, origin, (side,) * 3, step, rotation)
@@ -3849,7 +3919,7 @@ def _shape_map_fft_starts(source, target, source_landmarks, target_landmarks, ob
             continue
         kept.append(pose)
         sites.append(center)
-        if len(kept) == 48:
+        if len(kept) == max_seeds:
             break
     return kept
 
@@ -3911,7 +3981,10 @@ def _shape_map_box(target, points, pad, resolution=None):
         hi = np.minimum(target.data.size, ((hi + factors - 1) // factors) * factors)
     if np.any(hi <= lo):
         return None
-    matrix = target.matrix[tuple(slice(a, b) for a, b in zip(lo[::-1], hi[::-1]))]
+    if target.matrix is None:
+        matrix = target.data.matrix(tuple(lo), tuple(hi - lo))
+    else:
+        matrix = target.matrix[tuple(slice(a, b) for a, b in zip(lo[::-1], hi[::-1]))]
     if not np.any(matrix):
         return None
     data = ArrayGridData(matrix, target.data.ijk_to_xyz_transform * lo,
@@ -3974,7 +4047,8 @@ def _shape_submap_input(target, lower, upper, padding):
     box = _shape_map_box(target, (lower, upper), padding)
     if box is None or min(box.data.size) < 2:
         return None
-    region = _ShapeDensityInput(SimpleNamespace(data=box.data), None, allow_empty=True)
+    # Trim once on the full input, not independently with each tile's peak.
+    region = _ShapeDensityInput(SimpleNamespace(data=box.data), None, allow_empty=True, trim_padding=False)
     if region.empty:
         return None
     # All coordinates remain in the original map's local coordinate system.
@@ -4052,6 +4126,13 @@ def _shape_keep_map_poses(scored, probes, distance, maximum=_SHAPE_MAP_BEAM):
     return kept
 
 
+def _shape_band_grid_voxels(source, coarse, fine):
+    import numpy as np
+
+    step, pad = fine / 3, 4 * coarse / (pi * sqrt(2))
+    return int(np.prod(np.ceil((np.ptp(source.landmarks, axis=0) + 2 * pad) / step)))
+
+
 class _ShapeBandScorer:
     """Smooth Gaussian-difference band, measured inside a fixed model-local mask.
 
@@ -4066,8 +4147,7 @@ class _ShapeBandScorer:
         from chimerax.core.errors import UserError
 
         step, pad = fine / 3, 4 * coarse / (pi * sqrt(2))
-        dimensions = np.ceil((np.ptp(source.landmarks, axis=0) + 2 * pad) / step)
-        if np.prod(dimensions) > _MAX_GRID_VOXELS:
+        if _shape_band_grid_voxels(source, coarse, fine) > _MAX_GRID_VOXELS:
             raise UserError("The model-local scoring grid is too large; use a coarser map_resolution "
                             "or restrict fitting atoms.")
         grid = bounding_grid(source.landmarks, step, pad)
@@ -4107,6 +4187,8 @@ class _ShapeBandScorer:
             # Six sigmas keep artificial crop-edge tails below float32 noise.
             region = _shape_map_box(target, placed, 6 * self.coarse / (pi * sqrt(2)), blur)
             if region is None:
+                return -np.inf
+            if target.matrix is None and _shape_map_grid_voxels(region, blur) > _MAX_GRID_VOXELS:
                 return -np.inf
             grid = region.grid(blur)
             values.append(volume_values(placed, grid.xyz_to_ijk_transform, grid.matrix()).astype(np.float64))
@@ -4547,23 +4629,259 @@ def _fit_shape_tiled_maps(source, target, options, center):
     return translation(target.center) * pose * translation(-source.center), stats
 
 
+def _shape_centered_search_input(source, target, options):
+    """Fit the working limits by shrinking the reference box, never by tiling.
+
+    Keep the original box center (not the density centroid or the view center).
+    Preflight both filtering grids and every FFT scale the global search can use.
+    """
+    from types import SimpleNamespace
+    import numpy as np
+    from chimerax.core.errors import UserError
+    from chimerax.map_data import ArrayGridData
+
+    if source.is_map or not target.is_map or options['radius'] is not None:
+        return target, None, {}
+    levels, _ = _shape_fit_levels(source, target, options)
+    fft_levels = []
+    if options.get('radius_search') is not None or options.get('copies', 1) > 1:
+        fft_levels.append(levels[0])
+    elif options.get('fallback_correlation', 0) > 0:
+        fft_levels.append(levels[1] if len(levels) > 2 else levels[0])
+    source_grids = {blur: source.grid(blur) for blur in fft_levels}
+
+    def fits(region):
+        if any(_shape_map_grid_voxels(region, blur) > _MAX_GRID_VOXELS for blur in levels):
+            return False
+        return all(_shape_map_fft_voxels(source_grids[blur], region.grid(blur)) <= _MAX_PARTIAL_FFT_VOXELS
+                   for blur in fft_levels)
+
+    if fits(target):
+        return target, None, {}
+    data = target.data
+    box_center = getattr(target, 'box_center', data.ijk_to_xyz_transform * ((np.asarray(data.size) - 1) / 2))
+    # This center originated on a voxel/half-voxel index. Remove affine-roundoff
+    # before ceil/floor so rotated grids do not acquire an asymmetric crop.
+    middle = np.round(2 * (data.xyz_to_ijk_transform * box_center)) / 2
+    # Use the same fractional reduction on every native-grid axis. Preserve the
+    # affine origin/rotation and all voxel values inside each candidate box.
+    half_span = np.maximum(middle + .5, np.asarray(data.size) - .5 - middle)
+    scale, previous_size = 1., np.array(data.size)
+    for _ in range(80):
+        _shape_checkpoint()
+        scale *= .9
+        lower = np.maximum(0, np.ceil(middle - scale * half_span).astype(int))
+        upper = np.minimum(data.size, np.floor(middle + scale * half_span).astype(int) + 1)
+        size = upper - lower
+        if min(size) < 2:
+            break
+        if np.array_equal(size, previous_size):
+            continue
+        previous_size = size
+        matrix = target.matrix[tuple(slice(a, b) for a, b in zip(lower[::-1], upper[::-1]))]
+        cropped = ArrayGridData(matrix, data.ijk_to_xyz_transform * lower, data.step, data.cell_angles, data.rotation)
+        region = _ShapeDensityInput(SimpleNamespace(data=cropped), None, allow_empty=True, trim_padding=False)
+        if region.empty:
+            break
+        region.model = target.model
+        if not fits(region):
+            continue
+        extent = (size - 1) * np.asarray(data.step)
+        before = ' x '.join(f'{v:.3g}' for v in (np.asarray(data.size) - 1) * np.asarray(data.step))
+        after = ' x '.join(f'{v:.3g}' for v in extent)
+        center_text = ', '.join(f'{v:.3g}' for v in box_center)
+        message = (f'Shape alignment: automatically trimmed the search box from {before} A to {after} A '
+                   f'around box center ({center_text}) to fit the working limits. '
+                   'Density outside this centered box is excluded from the search; the input map is unchanged.')
+        source.model.session.logger.info(message)
+        source.model.session.logger.status(message)
+        region._shared_reference = target._shared_reference
+        return region, levels, dict(center_trimmed=True, tiled=False, reference_search_box_center=box_center.tolist(),
+                                    reference_search_box_extent=extent.tolist(),
+                                    reference_map_original_size=tuple(int(v) for v in target.model.data.size),
+                                    reference_map_fitting_size=tuple(int(v) for v in size))
+    raise UserError('No usable density remains in a centered search box that fits the working limits. '
+                    'Use a coarser fitting resolution, or place CoFR on the desired density and use radius_search 30.')
+
+
+def _shape_gradient_jitter_seeds(source, target, center, radius_search, fitted_poses):
+    """Translate a few distinct poses without moving models or the CoFR sphere."""
+    import numpy as np
+    from chimerax.geometry import translation
+
+    target_inverse = target.model.scene_position.inverse()
+    initial = target_inverse * source.model.scene_position
+    cofr = target_inverse * center
+    centered = translation(cofr - initial * source.center) * initial
+    bases = []
+    for pose in (centered, *fitted_poses):
+        if not any(np.allclose(pose.matrix, other.matrix, atol=1e-5, rtol=0) for other in bases):
+            bases.append(pose)
+
+    rng = np.random.default_rng(0)
+    per_pose = _SHAPE_GRADIENT_JITTERS_PER_POSE
+    offsets = rng.normal(size=(len(bases) * per_pose, 3))
+    offsets /= np.linalg.norm(offsets, axis=1, keepdims=True)
+    radius = np.linalg.norm(source.landmarks, axis=1).max()
+    # Sample short, medium, and long displacements independently for each pose.
+    bands = np.linspace(*_SHAPE_GRADIENT_JITTER_FRACTIONS, per_pose + 1)
+    lengths = rng.uniform(bands[:-1], bands[1:], size=(len(bases), per_pose)) * radius
+    offsets *= lengths.ravel()[:, None]
+    return [translation(offset) * pose for pose, shifts in zip(bases, offsets.reshape(-1, per_pose, 3))
+            for offset in shifts if np.linalg.norm((pose * source.center) + offset - cofr) <= radius_search]
+
+
+def _fit_shape_with_gradient_retry(source, target, options, center, levels):
+    from math import isfinite
+    from types import SimpleNamespace
+    from chimerax.core.errors import UserError
+    import numpy as np
+    from chimerax.geometry import Place, translation
+
+    # Judge both poses against the original map, without the hard CoFR mask
+    # or full-map reads. Both passes use the same model-local sampling mask.
+    data = target.model.data
+    reference = SimpleNamespace(data=data, matrix=None, center=(0, 0, 0),
+                                peak=target.peak, model=target.model)
+    fine = max(3., 2 * max(data.step), options["retry_map_resolution"] or 0., options["resolution"] or 0.)
+    coarse = 2 * fine
+    judge = _ShapeBandScorer(source, coarse, fine, min(5000, options["max_points"]))
+    model_frame = translation(source.center)
+    cutoff = options["retry_cutoff"]
+    scores = {}
+    native_winners = {}
+
+    def band_score(pose, in_sphere=False):
+        if in_sphere:
+            center_in_map = target.model.scene_position.inverse() * center
+            if np.linalg.norm(pose * source.center - center_in_map) > options["radius_search"]:
+                return None
+        score = judge.score(reference, pose * model_frame)
+        return score if isfinite(score) else None
+
+    def passed(score):
+        return score is not None and score >= cutoff
+
+    def search(objective, search_levels, compact=False, seeds=None, key=None):
+        key = objective if key is None else key
+        collect = objective == "gradient"
+        try:
+            pose, stats = _fit_shape_original_map_search(
+                source, target, dict(options, objective=objective), center,
+                shared_levels=search_levels, compact_gradient=compact, collect=collect,
+                seed_poses=seeds)
+        except _ShapeEmptyMapSearch:
+            scores[key] = None
+            return None
+        native_winners[key] = pose
+        score = band_score(pose, in_sphere=seeds is not None)
+        candidates = stats.pop("candidates", ())
+        if collect and not passed(score):
+            # The native gradient rank and the local validation rank can
+            # disagree. Check the retained shortlist without another search.
+            for candidate in candidates[1:_SHAPE_COMPACT_GRADIENT_FINAL_STARTS]:
+                _shape_checkpoint()
+                alternative = Place(matrix=np.asarray(candidate["matrix"], dtype=float))
+                value = band_score(alternative, in_sphere=seeds is not None)
+                if value is not None and (score is None or value > score):
+                    pose, score = alternative, value
+                    stats["score"] = candidate["fit_score"]
+        scores[key] = score
+        return pose, stats
+
+    density = search("density", levels)
+    gradient = None
+    logger = source.model.session.logger
+    retry_schedule = None
+    gradient_key = "gradient"
+    if not passed(scores["density"]):
+        retry_levels = levels if levels is not None else _shape_fit_levels(source, target, options)[0]
+        # The density pass already checked all fitting grids. Only the finer
+        # translation FFT needs another preflight, without changing the ROI.
+        compact = (len(retry_levels) >= 3 and
+                   _shape_map_fft_voxels(source.grid(retry_levels[1]), target.grid(retry_levels[1]))
+                   <= _MAX_PARTIAL_FFT_VOXELS)
+        if compact:
+            retry_levels = retry_levels[1:]
+            retry_schedule = "compact"
+            logger.status(f"Shape alignment: weak density fit; retrying with compact gradient "
+                          f"from {retry_levels[0]:.3g} A.")
+        else:
+            retry_schedule = "standard"
+            if len(retry_levels) >= 3:
+                logger.info(f"The finer FFT at {retry_levels[1]:.3g} A exceeds the working limit; "
+                            "using the standard gradient search on the same region.")
+            logger.status("Shape alignment: weak density fit; retrying with standard gradient.")
+        gradient = search("gradient", retry_levels, compact)
+        if not passed(scores["gradient"]):
+            # Keep the ROI fixed. A new start can escape a local minimum
+            # without the cost of searching all translations again.
+            jitter_levels = retry_levels[-2:]
+            fitted = list(native_winners.values())
+            if gradient is not None:
+                fitted.append(gradient[0])
+            seeds = _shape_gradient_jitter_seeds(source, target, center, options["radius_search"], fitted)
+            if seeds:
+                logger.status(f"Shape alignment: weak retry; refining {len(seeds)} displaced starts.")
+                jittered = search("gradient", jitter_levels, seeds=seeds, key="jittered_gradient")
+                if passed(scores["jittered_gradient"]):
+                    gradient, gradient_key, retry_schedule = jittered, "jittered_gradient", "jittered"
+
+    def describe(objective):
+        if objective not in scores:
+            return "not needed"
+        score = scores[objective]
+        return "unavailable" if score is None else f"{score:.3f}"
+
+    comparison = f"density {describe('density')}, gradient {describe('gradient')}"
+    if "jittered_gradient" in scores:
+        comparison += f", displaced starts {describe('jittered_gradient')}"
+    passed_gradient = passed(scores.get(gradient_key))
+    if passed_gradient:
+        pose, stats = gradient
+    elif passed(scores["density"]):
+        pose, stats = density
+    else:
+        raise UserError(f"Weak regional fit ({comparison}; cutoff {cutoff:g}, {fine:g}-{coarse:g} A band). "
+                        "Model unchanged. Try placing CoFR on the intended site and using a smaller "
+                        "radius_search; for lower-resolution density, supply map_resolution in Angstroms.")
+    if options["retry_explicit"]:
+        stats.update(fit_score=stats["score"], score=scores[gradient_key if passed_gradient else "density"],
+                     score_metric="model-local bandpass correlation")
+    elif passed_gradient:
+        stats["score_metric"] = "whole gradient correlation"
+    stats.update(gradient_retry_attempted="gradient" in scores, retry_scores=scores,
+                 retry_cutoff=cutoff, retry_band=(coarse, fine), gradient_retry_schedule=retry_schedule)
+    detail = f" after {retry_schedule} gradient retry" if retry_schedule else ""
+    logger.info(f"Shape alignment retry check ({fine:g}-{coarse:g} A): {comparison}; "
+                f"selected {stats['objective']}{detail}.")
+    return pose, stats
+
+
 def _fit_shape_density_inputs(source, target, options, center):
     from chimerax.core.errors import UserError
 
     if options.get("tiled"):
         return _fit_shape_tiled_maps(source, target, options, center)
+    target, levels, crop_stats = _shape_centered_search_input(source, target, options)
     try:
-        return _fit_shape_original_map_search(source, target, options, center,
-                                              force_global=options.get('copies', 1) > 1 and options['radius'] is None,
-                                              collect=bool(options.get("bandpass") or options.get('_symmetry')
-                                                           or options.get('copies', 1) > 1))
+        if options.get("gradient_retry"):
+            pose, stats = _fit_shape_with_gradient_retry(source, target, options, center, levels)
+        else:
+            multiple = options.get('copies', 1) > 1
+            pose, stats = _fit_shape_original_map_search(
+                source, target, options, center, force_global=multiple and options['radius'] is None,
+                collect=bool(options.get("bandpass") or options.get('_symmetry') or multiple),
+                shared_levels=levels)
+        stats.update(crop_stats)
+        return pose, stats
     except _ShapeEmptyMapSearch:
         raise UserError("No valid placement with a defined fitting score was found inside the map.") from None
 
 
 def _fit_shape_original_map_search(source, target, options, center, force_global=False,
                                     collect=False, ranking_target=None, shared_levels=None,
-                                    scorers=None, valid_pose=None):
+                                    scorers=None, valid_pose=None, compact_gradient=False, seed_poses=None):
     """The original PCA/FFT search and sum-product refiner, shared by all submaps.
 
     With bandpass off this is the existing algorithm, not a local Pearson fit.
@@ -4586,6 +4904,9 @@ def _fit_shape_original_map_search(source, target, options, center, force_global
     ranking_target = target if ranking_target is None else ranking_target
     scorers = {} if scorers is None else scorers
     fft_options = {} if valid_pose is None else dict(valid_pose=valid_pose)
+    if compact_gradient:
+        fft_options.update(broad_orientations=_SHAPE_COMPACT_GRADIENT_ORIENTATIONS,
+                           max_seeds=_SHAPE_COMPACT_GRADIENT_FFT_SEEDS)
     if force_global:
         # Keep several translation basins at model-size spacing. Fine-band
         # ranking cannot recover sites removed by a bright coarse-density peak.
@@ -4594,10 +4915,24 @@ def _fit_shape_original_map_search(source, target, options, center, force_global
     last_kept = []
     initial = (translation(-target.center) * target.model.scene_position.inverse() *
                source.model.scene_position * translation(source.center))
-    starts = [initial] if radius is not None else [*_shape_starts(
-        source.frame_landmarks, target.frame_landmarks, options["extra_starts"]), initial]
+    if seed_poses is None:
+        starts = [initial] if radius is not None else [*_shape_starts(
+            source.frame_landmarks, target.frame_landmarks, options["extra_starts"]), initial]
+    else:
+        to_grid = translation(-target.center)
+        model_frame = translation(source.center)
+        starts = [to_grid * pose * model_frame for pose in seed_poses]
     search_radius = options.get("radius_search")
-    if search_radius is not None or force_global:
+    fine_seeds = ()
+    if ((objective == 'density' or compact_gradient) and search_radius is not None and center is not None and
+            not force_global and context is None and valid_pose is None and not options.get('bandpass') and
+            target.is_map and not source.is_map):
+        # Blurring can pull an otherwise useful seed into a different basin.
+        # Keep its orientation and try the better of its current and CoFR-centered positions once at fine scale.
+        cofr_local = target.model.scene_position.inverse() * center
+        cofr_shift = cofr_local - target.center - initial.origin()
+        fine_seeds = (initial, translation(cofr_shift) * initial) if np.linalg.norm(cofr_shift) > 1e-5 else (initial,)
+    if seed_poses is None and (search_radius is not None or force_global):
         # A regional global search must explore translations even when PCA
         # already gives a good score. Only the reference density was cropped.
         _shape_map_status(source.model.session.logger, "Shape alignment: global search of " +
@@ -4609,10 +4944,13 @@ def _fit_shape_original_map_search(source, target, options, center, force_global
     def refine(candidates, first=0):
         nonlocal last_kept
         for blur in levels[first:]:
+            if compact_gradient and blur == levels[-1]:
+                candidates = candidates[:_SHAPE_COMPACT_GRADIENT_FINAL_STARTS]
             _shape_map_status(source.model.session.logger,
-                              f"Shape alignment: map density at {blur:.3g} A ({len(candidates)} starts)...")
+                              f"Shape alignment: map {objective} at {blur:.3g} A ({len(candidates)} starts)...")
+            seed_options = dict(fine_seeds=fine_seeds) if fine_seeds and blur == levels[-1] else {}
             results, points = _refine_density_grids(source.grid(blur), target.grid(blur), candidates,
-                                                   options["max_points"], objective)
+                                                   options["max_points"], objective, **seed_options)
             ranked = []
             scorer = None
             if options.get("bandpass"):
@@ -4726,6 +5064,7 @@ def _shape_align_with_map(session, source_item, target_item, options, center, ta
     # intact, including when it starts completely outside the reference sphere.
     source = _ShapeDensityInput(*source_item, center if radius is not None else None, radius,
                                 options.get("confidence_moving") or options.get("confidence", "auto"))
+    _shape_log_padding(session, source, 'moving')
     auto_search = options.get("radius_search") is True
     if auto_search:
         search_radius = _shape_search_radius(source)
@@ -4760,6 +5099,11 @@ def _shape_align_with_map(session, source_item, target_item, options, center, ta
             stats['map_workers'] = len(workers.processes)
     stats.update(moving_confidence="off" if source.weights is None else "plddt",
                  reference_confidence="off" if target.weights is None else "plddt")
+    for role, value in (("moving", source), ("reference", target)):
+        crop = getattr(value, 'padding_crop', None)
+        if crop is not None:
+            stats.setdefault(f'{role}_map_original_size', tuple(int(v) for v in crop['original_size']))
+            stats.setdefault(f'{role}_map_fitting_size', tuple(int(v) for v in crop['size']))
     if symmetry_spec is not None:
         stats.update(symmetry_spec[1])
     if options.get("radius_search") is not None:
@@ -4834,7 +5178,10 @@ def _shape_align_with_map(session, source_item, target_item, options, center, ta
     region = (f"reference density in a {options['radius_search']:g} A CoFR search sphere."
               if options.get("radius_search") is not None else
               f"density in a {radius:g} A CoFR refinement sphere." if radius is not None else
-              "full map density, independent of contour.")
+              "map density with near-zero edge padding trimmed, independent of contour.")
+    if stats.get('center_trimmed'):
+        extent = ' x '.join(f'{v:.3g}' for v in stats['reference_search_box_extent'])
+        region = f'centered {extent} A reference-map search box; input map unchanged.'
     message = (f"Shape alignment #{model.id_string} ({stats['moving_input_type']}) to "
                f"#{reference.id_string} ({stats['reference_input_type']}): {metric} "
                f"score {stats['score']:.3f}; " + (f"{len(records)}/{options['copies']} copies; " if multiple else '') +
@@ -4886,7 +5233,8 @@ def _shape_align_help(session):
         ("workers 0|N / color_fit true", "CPUs: 0 automatic, 1 serial; or color atoms by local density agreement."),
     )
     description = ("Rigidly fit models/maps; copy true fits a model copy. "
-                   "Model/map: tiled true; bandpass true map_resolution A. Supports Undo.")
+                   "Model/map: automatic gradient retry for weak regional fits; tiled true; "
+                   "bandpass true map_resolution A. Supports Undo.")
     example = "shapealign #2 to #1 radius_search"
     if session.ui.is_gui:
         from html import escape
@@ -4920,7 +5268,8 @@ def shape_align(session, moving=None, to=None, resolution=None, max_points=12000
                 confidence="auto", confidence_moving=None, confidence_reference=None, copy=False,
                 tiled=False, bandpass=False, map_resolution=None, tile_size=None,
                 copies=1, max_overlap=.1, overlap_distance=4., score_fraction=.8,
-                symmetry=None, symmetry_center=None, symmetry_axis=None, refine_copies=False):
+                symmetry=None, symmetry_center=None, symmetry_axis=None, refine_copies=False,
+                gradient_retry=None, retry_cutoff=None):
     """Align independent inputs globally, regionally, or by local refinement.
 
     radius_search globally searches a reference-map CoFR sphere, keeping the
@@ -4963,6 +5312,19 @@ def shape_align(session, moving=None, to=None, resolution=None, max_points=12000
         return []
     if isinstance(copies, bool) or not isinstance(copies, (int, np.integer)) or not 1 <= copies <= 512:
         raise UserError('copies must be an integer from 1 to 512 (the maximum number of fitted copies).')
+    retry_eligible = (radius_search is not None and len(sources) == 1 and sources[0][1] is not None and
+                      objective == "density" and copies == 1 and not tiled and not bandpass and symmetry is None)
+    if gradient_retry and not retry_eligible:
+        raise UserError("gradient_retry requires a single moving atomic model, a reference map, and "
+                        "radius_search with objective density. Do not combine with tiled, bandpass, "
+                        "symmetry, or multiple copies.")
+    use_gradient_retry = retry_eligible and (gradient_retry is None or gradient_retry)
+    if use_gradient_retry:
+        retry_cutoff = .30 if retry_cutoff is None else retry_cutoff
+        if not isfinite(retry_cutoff) or not 0 < retry_cutoff <= 1:
+            raise UserError("retry_cutoff must be greater than zero and at most one.")
+    elif retry_cutoff is not None:
+        raise UserError("retry_cutoff requires gradient_retry on an eligible regional fit.")
     for name, value in (('max_overlap', max_overlap), ('score_fraction', score_fraction)):
         if not isfinite(value) or not 0 <= value <= 1:
             raise UserError(f'{name} must be between zero and one.')
@@ -4991,13 +5353,13 @@ def shape_align(session, moving=None, to=None, resolution=None, max_points=12000
     if bandpass and map_resolution is None:
         raise UserError("bandpass true requires map_resolution in Angstroms, for example map_resolution 2.2.")
     if map_resolution is not None:
-        if not regional_search:
-            raise UserError("map_resolution is used with tiled true or bandpass true.")
+        if not (regional_search or use_gradient_retry):
+            raise UserError("map_resolution is used with tiled true, bandpass true, or an eligible gradient retry.")
         if not isfinite(map_resolution) or map_resolution <= 0:
             raise UserError("map_resolution must be finite and positive (Angstroms).")
         if map_resolution + 1e-6 < 2 * max(target.data.step):
             raise UserError("map_resolution cannot be finer than the reference map's Nyquist sampling limit.")
-        if resolution is not None and resolution < map_resolution:
+        if regional_search and resolution is not None and resolution < map_resolution:
             raise UserError("resolution cannot be finer than map_resolution.")
     if tile_size is not None and (not tiled or not isfinite(tile_size) or tile_size <= 0):
         raise UserError("tile_size requires tiled true and a finite positive length in Angstroms.")
@@ -5018,11 +5380,15 @@ def shape_align(session, moving=None, to=None, resolution=None, max_points=12000
         with _ShapeUI(session):
             return _shape_align_atomic_models(session, concatenate([selected for _, selected in sources]),
                                               targets[0][1], workers=workers, **options)
-    options.update(tiled=tiled, bandpass=bandpass, map_resolution=map_resolution, tile_size=tile_size)
+    options.update(tiled=tiled, bandpass=bandpass, map_resolution=map_resolution if regional_search else None,
+                   tile_size=tile_size)
     options.update(copies=copies, max_overlap=max_overlap, overlap_distance=overlap_distance,
                    score_fraction=score_fraction, _symmetry_spec=symmetry_spec, refine_copies=refine_copies)
     if radius_search is not None:
         options["radius_search"] = radius_search
+    if use_gradient_retry:
+        options.update(gradient_retry=True, retry_explicit=gradient_retry is not None,
+                       retry_cutoff=retry_cutoff, retry_map_resolution=map_resolution)
     if objective not in ("density", "gradient") or partial not in (None, False):
         raise UserError("Map fitting supports objective density or gradient, with whole densities only; partial true is not supported.")
     if resolution is not None and (not isfinite(resolution) or resolution < 2):
@@ -5101,6 +5467,7 @@ def _register_shape_align_command(logger):
                  ("correlation", BoolArg), ("color_fit", BoolArg),
                  ("correlation_resolution", FloatArg), ("correlation_window", FloatArg),
                  ("partial", BoolArg), ("fallback_correlation", FloatArg),
+                 ("gradient_retry", BoolArg), ("retry_cutoff", FloatArg),
                  ("workers", IntArg),
                  ("tiled", BoolArg), ("bandpass", BoolArg), ("map_resolution", FloatArg), ("tile_size", FloatArg),
                  ("copies", IntArg), ("max_overlap", FloatArg), ("overlap_distance", FloatArg),
