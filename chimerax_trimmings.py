@@ -11077,22 +11077,25 @@ def _structural_pick_item(pick):
     return None
 
 
-def _visible_atom_pick(view, x, y):
+def _visible_atom_pick(view, x, y, exclude=None):
     from chimerax.graphics import PickedTriangle
 
+    options = {} if exclude is None else {"exclude": exclude}
     depth = None
     while True:
         # Inspect each hit so an opaque surface can stop the ray.
-        pick = view.picked_object(x, y, beyond=depth, max_transparent_layers=0)
+        pick = view.picked_object(x, y, beyond=depth, max_transparent_layers=0, **options)
         if pick is None:
             return None
-        if _structural_pick_item(pick) is not None:
-            return pick
-        # Map and model picks wrap the triangle, which has the actual opacity.
+        # A molecular patch reports a PickedAtom but carries its surface triangle.
+        # Treat triangle hits as occluders, not as the atoms that generated them.
         triangle = getattr(pick, "triangle_pick", getattr(pick, "picked_triangle", pick))
+        is_triangle = isinstance(triangle, PickedTriangle)
+        if not is_triangle and _structural_pick_item(pick) is not None:
+            return pick
         if not (
             getattr(pick, "pick_through", False)
-            or (isinstance(triangle, PickedTriangle) and triangle.is_transparent())
+            or (is_triangle and triangle.is_transparent())
         ):
             return None
         if pick.distance is None or pick.distance >= 1 or (depth is not None and pick.distance <= depth):
@@ -11100,11 +11103,28 @@ def _visible_atom_pick(view, x, y):
         depth = pick.distance
 
 
+def _ctrl_drag_pick_exclusion(view):
+    from chimerax.atomic import MolecularSurface
+
+    def transparent_subtree(drawing):
+        if drawing.texture is not None or drawing.multitexture or drawing._transparency() != (False, True):
+            return False
+        # The native ray picker can exclude an entire child subtree. Keep a
+        # molecular surface in the ray test if any of its clip caps can block it.
+        return all(not child.display or (getattr(child, "is_clip_cap", False) and transparent_subtree(child))
+                   for child in drawing.child_drawings())
+
+    skipped = {d for d in view.drawing.all_drawings(displayed_only=True)
+               if isinstance(d, MolecularSurface) and transparent_subtree(d)}
+    if skipped:
+        return lambda drawing: drawing in skipped or not drawing.pickable
+    return None
+
+
 def _visible_atom_box(view, start, end):
-    from chimerax.atomic import Atom, Atoms, Bond, Bonds, MolecularSurface, Pseudobond, Pseudobonds
+    from chimerax.atomic import Atom, Atoms, Bond, Bonds, Pseudobond, Pseudobonds
     from chimerax.atomic.shapedrawing import PickedAtomicShapes
     from chimerax.atomic.structure import PickedAtoms, PickedBonds, PickedPseudobonds, PickedResidues
-    from chimerax.graphics import PickedTriangles
     from numpy import concatenate, flatnonzero, linspace
 
     camera = view.camera
@@ -11114,6 +11134,7 @@ def _visible_atom_box(view, start, end):
     left, right = sorted((start[0], end[0]))
     top, bottom = sorted((start[1], end[1]))
     visible = set()
+    exclude = _ctrl_drag_pick_exclusion(view)
 
     def pixels(coords, position):
         if position is not None:
@@ -11126,7 +11147,7 @@ def _visible_atom_box(view, start, end):
         return indices[inside], xy[inside]
 
     def sees(item, xy):
-        return _structural_pick_item(_visible_atom_pick(view, *xy)) == item
+        return _structural_pick_item(_visible_atom_pick(view, *xy, exclude=exclude)) == item
 
     def centers(items, coords, drawing):
         positions = (None,) if drawing is None else drawing.get_scene_positions(displayed_only=True)
@@ -11153,7 +11174,8 @@ def _visible_atom_box(view, start, end):
                 visible.add(item)
                 return
 
-    for group in view.rectangle_pick(left, top, right, bottom):
+    options = {} if exclude is None else {"exclude": exclude}
+    for group in view.rectangle_pick(left, top, right, bottom, **options):
         if isinstance(group, PickedAtoms):
             for structure, atoms in group.atoms.by_structure:
                 centers(atoms, atoms.coords, structure)
@@ -11185,21 +11207,6 @@ def _visible_atom_box(view, start, end):
             for shape in group.shapes:
                 if shape.atoms:
                     mesh(shape, drawing, drawing.triangles[shape.triangle_range])
-        elif isinstance(group, PickedTriangles):
-            drawing = group.drawing()
-            if isinstance(drawing, MolecularSurface):
-                atom_indices = drawing.vertex_to_atom_map()
-                if atom_indices is None:
-                    continue
-                triangles = drawing.triangles[group._triangles_mask]
-                keys = atom_indices[triangles[:, 0]]
-                order = keys.argsort()
-                keys = keys[order]
-                starts = [0, *(1 + flatnonzero(keys[1:] != keys[:-1])), len(keys)]
-                atoms = drawing.atoms
-                for first, last in zip(starts, starts[1:]):
-                    if first < last and 0 <= keys[first] < len(atoms):
-                        mesh(atoms[keys[first]], drawing, triangles[order[first:last]])
 
     atoms, bonds, pseudobonds = set(), [], []
     for item in visible:
@@ -11217,6 +11224,43 @@ def _visible_atom_box(view, start, end):
         if items:
             picks.append(pick_type(collection(list(items))))
     return picks
+
+
+def _hide_ctrl_pick_surface_highlights(session):
+    from chimerax.atomic import MolecularSurface
+    from chimerax.core.triggerset import DEREGISTER
+
+    surfaces = [s for s in session.models.list(type=MolecularSurface) if s.showing_transparent(False)]
+    if not surfaces:
+        return
+
+    def after_graphics_update(*_):
+        for surface in surfaces:
+            if surface.deleted:
+                continue
+            mask = surface.highlighted_triangles_mask
+            if mask is None or not mask.any():
+                continue
+            colors = surface.vertex_colors
+            if colors is None:
+                if surface.color[3] < 255:
+                    surface.highlighted = False
+            else:
+                selected = mask.nonzero()[0]
+                opaque = (colors[surface.triangles[selected], 3] == 255).all(axis=1)
+                if opaque.all():
+                    continue
+                if opaque.any():
+                    remaining = mask.copy()
+                    remaining[selected[~opaque]] = False
+                    surface.highlighted_triangles_mask = remaining
+                else:
+                    surface.highlighted = False
+        return DEREGISTER
+
+    # Native atom/ribbon selection rebuilds the coupled surface highlight during
+    # graphics update. Remove only its transparent part, after that rebuild.
+    session.triggers.add_handler("graphics update", after_graphics_update)
 
 
 def _install_atom_selection(session):
@@ -11242,6 +11286,8 @@ def _install_atom_selection(session):
                 pick = _visible_atom_pick(self.view, *event.position())
             MouseMode.mouse_up(self, event)
             select_pick(self.session, pick, mode)
+            if pick:
+                _hide_ctrl_pick_surface_highlights(self.session)
 
     manager = session.ui.mouse_modes
     atom_select = manager.named_mode("select visible atoms")

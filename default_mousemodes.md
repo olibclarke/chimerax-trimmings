@@ -14,7 +14,7 @@ _**Mouse modes:**_
 
 **Ctrl+Alt**-left-click: Picks & colors clicked blob (launches "Measure and Color Blobs" tool).
 
-**Ctrl**-left-click or drag: Selects visible atoms, bonds, cartoon residues, and atom-linked surfaces or shapes through transparent contours and surfaces. Opaque objects block picking. Box selection checks visibility at projected atom or bond centers and samples the drawn geometry of cartoons and surfaces.
+**Ctrl**-left-click or drag: Selects visible atoms, bonds, cartoon residues, and atom-linked shapes through transparent contours and surfaces. Molecular surface patches are not selection targets, and transparent patches are not highlighted by these picks. Opaque surfaces block picking. Box selection checks visibility at projected atom or bond centers and samples the drawn geometry of cartoons and atom-linked shapes.
 
 **Ctrl+Shift**-left-click or drag: Toggles the same selection.
 
