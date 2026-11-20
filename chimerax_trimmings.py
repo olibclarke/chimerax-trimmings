@@ -5368,27 +5368,27 @@ def shape_align(session, moving=None, to=None, resolution=None, max_points=12000
             raise UserError("Moving and reference models must not contain one another.")
         if any(other in model.drawing_lineage[:-1] for other, _ in sources):
             raise UserError("Moving inputs must be independent models, not ancestor/descendant pairs.")
-    options = dict(resolution=resolution, max_points=max_points, extra_starts=extra_starts, move=move,
-                   radius=radius, correlation=correlation, color_fit=color_fit,
-                   correlation_resolution=correlation_resolution, correlation_window=correlation_window,
-                   partial=partial, fallback_correlation=fallback_correlation, objective=objective,
-                   confidence=confidence, confidence_moving=confidence_moving, confidence_reference=confidence_reference,
-                   copy=copy)
+    atomic_options = dict(resolution=resolution, max_points=max_points, extra_starts=extra_starts, move=move,
+                          radius=radius, correlation=correlation, color_fit=color_fit,
+                          correlation_resolution=correlation_resolution, correlation_window=correlation_window,
+                          partial=partial, fallback_correlation=fallback_correlation, objective=objective,
+                          confidence=confidence, confidence_moving=confidence_moving,
+                          confidence_reference=confidence_reference, copy=copy)
     if all(atoms is not None for _, atoms in [*sources, *targets]):
         from chimerax.atomic import concatenate
 
         with _ShapeUI(session):
             return _shape_align_atomic_models(session, concatenate([selected for _, selected in sources]),
-                                              targets[0][1], workers=workers, **options)
-    options.update(tiled=tiled, bandpass=bandpass, map_resolution=map_resolution if regional_search else None,
-                   tile_size=tile_size)
-    options.update(copies=copies, max_overlap=max_overlap, overlap_distance=overlap_distance,
-                   score_fraction=score_fraction, _symmetry_spec=symmetry_spec, refine_copies=refine_copies)
+                                              targets[0][1], workers=workers, **atomic_options)
+    map_options = dict(atomic_options, tiled=tiled, bandpass=bandpass,
+                       map_resolution=map_resolution if regional_search else None, tile_size=tile_size,
+                       copies=copies, max_overlap=max_overlap, overlap_distance=overlap_distance,
+                       score_fraction=score_fraction, _symmetry_spec=symmetry_spec, refine_copies=refine_copies)
     if radius_search is not None:
-        options["radius_search"] = radius_search
+        map_options["radius_search"] = radius_search
     if use_gradient_retry:
-        options.update(gradient_retry=True, retry_explicit=gradient_retry is not None,
-                       retry_cutoff=retry_cutoff, retry_map_resolution=map_resolution)
+        map_options.update(gradient_retry=True, retry_explicit=gradient_retry is not None,
+                           retry_cutoff=retry_cutoff, retry_map_resolution=map_resolution)
     if objective not in ("density", "gradient") or partial not in (None, False):
         raise UserError("Map fitting supports objective density or gradient, with whole densities only; partial true is not supported.")
     if resolution is not None and (not isfinite(resolution) or resolution < 2):
@@ -5398,7 +5398,7 @@ def shape_align(session, moving=None, to=None, resolution=None, max_points=12000
     cutoff = (.5 if objective == "gradient" else .7) if fallback_correlation is None else fallback_correlation
     if not isfinite(cutoff) or not 0 <= cutoff <= 1:
         raise UserError("fallback_correlation must be between 0 and 1.")
-    options["fallback_correlation"] = cutoff
+    map_options["fallback_correlation"] = cutoff
     if correlation or color_fit:
         if not move or any(atoms is None for _, atoms in sources):
             raise UserError("correlation/color_fit require moving atomic models and move true, not moving maps.")
@@ -5425,7 +5425,7 @@ def shape_align(session, moving=None, to=None, resolution=None, max_points=12000
         try:
             for item in sources:
                 if item[1] is not None and targets[0][1] is not None:
-                    result = _shape_align_one(session, item[1], targets[0][1], sphere_center=center, **options)
+                    result = _shape_align_one(session, item[1], targets[0][1], sphere_center=center, **atomic_options)
                 else:
                     started = perf_counter()
                     # Automatic search sizes are per moving input, not inherited
@@ -5433,7 +5433,7 @@ def shape_align(session, moving=None, to=None, resolution=None, max_points=12000
                     if target_input is None and radius_search is not True:
                         target_input = _shape_reference_input(
                             *targets[0], center, region_radius, confidence_reference or confidence)
-                    result = _shape_align_with_map(session, item, targets[0], options, center, target_input, started)
+                    result = _shape_align_with_map(session, item, targets[0], map_options, center, target_input, started)
                 results.append(result)
         except BaseException:
             if batch is not None:
