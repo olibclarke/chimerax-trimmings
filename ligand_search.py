@@ -15,6 +15,8 @@ import threading
 import time
 
 CCD_URL = 'https://files.wwpdb.org/pub/pdb/data/monomers/components.cif.gz'
+CCD_ENTRY_URL = 'https://files.rcsb.org/ligands/download/{}.cif'
+MAX_CCD_ENTRY_BYTES = 8 * 1024 * 1024
 PDB_IDS_URL = 'https://data.rcsb.org/rest/v1/holdings/current/entry_ids'
 PDB_DATA_URL = 'https://data.rcsb.org/graphql'
 CHEBI_URL = 'https://ftp.ebi.ac.uk/pub/databases/chebi/ontology/chebi_core.obo.gz'
@@ -88,6 +90,7 @@ STANDARD_EXTRA_STARTS, STANDARD_SAMPLES = 24, 3000
 FAST_EXTRA_STARTS, FAST_SAMPLES = 8, 1500
 DEFAULT_CONFORMERS, MAX_CONFORMERS = 8, 32
 FINAL_CONFORMERS, MAX_FINAL_CONFORMERS = 64, 256
+MAX_SINGLE_CONFORMERS, MAX_SINGLE_FINAL_CONFORMERS = 256, 512
 DEFAULT_LIBRARY_SOURCE = 'ccd_chebi'
 CONFORMER_RMSD = .25  # Ignore torsion variants indistinguishable after rigid alignment.
 BLOB_HIGHLIGHT_RGB = (80, 230, 120)
@@ -1600,6 +1603,49 @@ def validate_smiles(value):
     return value
 
 
+def validate_ccd_code(value):
+    import re
+
+    code = value.strip()
+    if not re.fullmatch(r'[A-Za-z0-9]{1,5}', code):
+        raise ValueError('Enter one CCD code (1-5 letters or digits), for example ATP.')
+    return code.upper()
+
+
+def single_ccd_component(cache, code, target):
+    """Read one cached component or fetch only that entry in the fitting worker."""
+    from http.client import HTTPException
+    from urllib.error import HTTPError
+    from urllib.request import Request, urlopen
+
+    code = validate_ccd_code(code)
+    cache = Path(cache).expanduser().resolve()
+    try:
+        if library_info(cache) is not None:
+            with closing(sqlite3.connect((cache / 'ccd.sqlite').as_uri() + '?mode=ro', uri=True)) as db:
+                row = db.execute('SELECT payload FROM components WHERE id=?', (code,)).fetchone()
+            if row is not None:
+                return json.loads(row[0])
+    except (ValueError, OSError, sqlite3.Error):
+        pass  # An old or unreadable index should not require a rebuild for one entry.
+
+    try:
+        request = Request(CCD_ENTRY_URL.format(code), headers={'User-Agent': 'ChimeraX-ligandsearch/1'})
+        with urlopen(request, timeout=20) as response:
+            data = response.read(MAX_CCD_ENTRY_BYTES + 1)
+    except (OSError, HTTPException) as error:
+        if isinstance(error, HTTPError) and error.code == 404:
+            raise ValueError(f'CCD code {code} was not found. Check the code and try again.') from error
+        raise ValueError(f'Could not download CCD code {code} from RCSB. Check network access and retry.') from error
+    if len(data) > MAX_CCD_ENTRY_BYTES:
+        raise ValueError(f'CCD entry {code} is too large to load as a single ligand.')
+    target.write_bytes(data)
+    record = component_record(target)
+    if record is None or record['id'] != code:
+        raise ValueError(f'CCD entry {code} has no usable coordinates for fitting. At least four heavy atoms are required.')
+    return record
+
+
 def smiles_component(smiles):
     """Use ChimeraX's built-in converter in the disposable fitting process."""
     from collections import Counter
@@ -1665,6 +1711,17 @@ def smiles_component(smiles):
 def validate_conformer_limit(limit, maximum=MAX_CONFORMERS, name='conformers'):
     if isinstance(limit, bool) or not isinstance(limit, int) or not 2 <= limit <= maximum:
         raise ValueError(f'{name} must be an integer from 2 to {maximum} (total per ligand).')
+
+
+def conformer_caps(single):
+    return ((MAX_SINGLE_CONFORMERS, MAX_SINGLE_FINAL_CONFORMERS) if single else
+            (MAX_CONFORMERS, MAX_FINAL_CONFORMERS))
+
+
+def validate_conformer_limits(conformers, refine_conformers, single):
+    screen_max, final_max = conformer_caps(single)
+    validate_conformer_limit(conformers, screen_max)
+    validate_conformer_limit(refine_conformers, final_max, 'refine_conformers')
 
 
 def rotatable_bonds(record):
@@ -1862,7 +1919,7 @@ class Fitter:
         outside = float(np.count_nonzero(predicted & ~c['mask']) / max(1, np.count_nonzero(predicted)))
         return cc, supported, coverage, outside
 
-    def fit(self, record, observed=True, fast=False, torsions=False, conformers=DEFAULT_CONFORMERS):
+    def fit(self, record, observed=True, fast=False, torsions=False, conformers=DEFAULT_CONFORMERS, *, single=False):
         import numpy as np
         from chimerax.geometry import Place
         from chimerax.core.errors import UserError
@@ -1873,7 +1930,8 @@ class Fitter:
                        fallback_correlation=0., bandpass=False)
         best = first_fit_error = None
         tested, skipped = 0, 0
-        variants = sparse_conformers(record, observed, conformers) if torsions else selected_conformers(record, observed)
+        variants = (sparse_conformers(record, observed, conformers, maximum=conformer_caps(single)[0])
+                    if torsions else selected_conformers(record, observed))
         for conformer in variants:
             try:
                 source = self.source(conformer['xyz'], record['elements'])
@@ -1921,15 +1979,16 @@ class Fitter:
                                   ijk_step_size_min=.01, ijk_step_size_max=.5, metric='sum product')
         return delta * initial
 
-    def refine(self, hit, conformers=FINAL_CONFORMERS):
+    def refine(self, hit, conformers=FINAL_CONFORMERS, *, single=False):
         """Broader sparse sampling around the winning conformation, not small-angle descent."""
         import numpy as np
         from chimerax.geometry import Place
         from chimerax.core.errors import UserError
 
-        validate_conformer_limit(conformers, MAX_FINAL_CONFORMERS, 'refine_conformers')
+        maximum = conformer_caps(single)[1]
+        validate_conformer_limit(conformers, maximum, 'refine_conformers')
         record = dict(hit, conformers=[dict(source='ideal', xyz=hit['xyz'])])
-        variants = sparse_conformers(record, limit=conformers, maximum=MAX_FINAL_CONFORMERS)
+        variants = sparse_conformers(record, limit=conformers, maximum=maximum)
         best, initial = dict(hit), Place(matrix=np.array(hit['pose'], float))
         original_score = hit.get('score', hit['cc'])
         tested = skipped = 0
@@ -1976,12 +2035,18 @@ def worker_main(directory):
             job = json.loads(line)
             try:
                 if 'refine_hit' in job:
-                    hit = fitter.refine(job['refine_hit'], job['refine_conformers'])
+                    hit = fitter.refine(job['refine_hit'], job['refine_conformers'], single=job.get('single', False))
                 else:
-                    record = smiles_component(job['smiles']) if 'smiles' in job else job['component']
+                    if 'smiles' in job:
+                        record = smiles_component(job['smiles'])
+                    elif 'ccd_code' in job:
+                        record = single_ccd_component(job['cache'], job['ccd_code'], root / 'component.cif')
+                    else:
+                        record = job['component']
                     hit = fitter.fit(record, job.get('observed', True), fast=job.get('fast', False),
                                      torsions=job.get('torsions', False),
-                                     conformers=job.get('conformers', DEFAULT_CONFORMERS))
+                                     conformers=job.get('conformers', DEFAULT_CONFORMERS),
+                                     single='smiles' in job or 'ccd_code' in job)
                 result = dict(result=hit)
             except Exception as error:
                 result = dict(error=f'{type(error).__name__}: {error}')
@@ -1995,10 +2060,14 @@ class SearchJob:
     """Bounded worker dispatch. Stop terminates outstanding work, not saved hits."""
     def __init__(self, cache, config, workers=0, observed=True, ids=None, frequency=True, fast=False,
                  torsions=False, conformers=DEFAULT_CONFORMERS, groups='all', group_match='any', sources='ccd',
-                 refine=False, refine_conformers=FINAL_CONFORMERS, top=20, smiles=None):
-        validate_conformer_limit(conformers)
-        validate_conformer_limit(refine_conformers, MAX_FINAL_CONFORMERS, 'refine_conformers')
-        self.shortlist = TopHits(top)
+                 refine=False, refine_conformers=FINAL_CONFORMERS, top=20, smiles=None, ccd_code=None):
+        self.smiles = None if smiles is None else validate_smiles(smiles)
+        self.ccd_code = None if ccd_code is None else validate_ccd_code(ccd_code)
+        if self.smiles and self.ccd_code:
+            raise ValueError('Choose either a CCD code or a SMILES string.')
+        self.single = bool(self.smiles or self.ccd_code)
+        validate_conformer_limits(conformers, refine_conformers, self.single)
+        self.shortlist = TopHits(1 if self.single else top)
         self.refine, self.refine_conformers = refine, refine_conformers
         self.cache, self.config, self.requested = Path(cache).expanduser().resolve(), config, workers
         self.observed, self.ids = observed, None if ids is None else set(ids)
@@ -2010,7 +2079,6 @@ class SearchJob:
         if sources not in ('ccd', 'ccd_chebi'):
             raise ValueError('sources must be ccd or ccd_chebi')
         self.sources = sources
-        self.smiles = None if smiles is None else validate_smiles(smiles)
         self.events, self.cancel = queue.Queue(maxsize=128), threading.Event()
         self.thread = None
 
@@ -2040,8 +2108,8 @@ class SearchJob:
         refined = refine_total = refine_failures = 0
         try:
             with tempfile.TemporaryDirectory(prefix='ligand_search_') as temporary, ExitStack() as stack:
-                if self.smiles is not None:
-                    ordered = [(None, 'LIG', None)]
+                if self.single:
+                    ordered = [(None, self.ccd_code or 'LIG', None)]
                 else:
                     if library_info(self.cache) is None:
                         raise ValueError('CCD library missing. Click Expand/Update CCD library first.')
@@ -2106,6 +2174,8 @@ class SearchJob:
                                total=total, done=0))
                 if self.smiles is not None:
                     self.emit(dict(kind='status', text='Converting SMILES to 3D and fitting one ligand...'))
+                elif self.ccd_code is not None:
+                    self.emit(dict(kind='status', text=f'Loading CCD entry {self.ccd_code} and fitting one ligand...'))
                 root = Path(temporary)
                 copyfile(Path(__file__), root / 'ligand_search.py')
                 # Snapshot both files so a script reload cannot change a running job.
@@ -2145,7 +2215,7 @@ class SearchJob:
                                     result = json.loads(line[len('LIGAND_RESULT:'):])
                                     if result['id'] != job['component']['id']:
                                         raise RuntimeError('A worker returned the wrong CCD component.')
-                                    if 'result' in result and 'refine_hit' not in job and 'smiles' not in job:
+                                    if 'result' in result and 'classification' in job:
                                         result['result'].update(estimated_volume=job['estimated_volume'],
                                                                 search_priority=job['search_priority'],
                                                                 pdb_entries=job['pdb_entries'], **job['classification'])
@@ -2170,9 +2240,11 @@ class SearchJob:
                             prior, ident, estimated = next(cursor)
                         except StopIteration:
                             return
-                        if self.smiles is not None:
-                            waiting.put(dict(component={'id': ident}, smiles=self.smiles, observed=False,
-                                             fast=self.fast, torsions=self.torsions, conformers=self.conformers))
+                        if self.single:
+                            entry = (dict(smiles=self.smiles) if self.smiles else
+                                     dict(ccd_code=self.ccd_code, cache=str(self.cache)))
+                            waiting.put(dict(component={'id': ident}, observed=bool(self.ccd_code) and self.observed,
+                                             fast=self.fast, torsions=self.torsions, conformers=self.conformers, **entry))
                             return
                         record = expanded.get(ident)
                         if record is None:
@@ -2194,7 +2266,7 @@ class SearchJob:
                             continue
                         if 'fatal' in message:
                             raise RuntimeError(message['fatal'])
-                        if self.smiles is not None and 'error' in message:
+                        if self.single and 'error' in message:
                             raise ValueError(message['error'])
                         done += 1
                         failures += 'error' in message
@@ -2210,7 +2282,7 @@ class SearchJob:
                                        f'up to {self.refine_conformers} conformers per hit'))
                         for hit in self.shortlist.rows:
                             waiting.put(dict(component={'id': hit['id']}, refine_hit=hit,
-                                             refine_conformers=self.refine_conformers))
+                                             refine_conformers=self.refine_conformers, single=self.single))
                         while refined < refine_total:
                             _cancelled(self.cancel)
                             try:
@@ -2576,11 +2648,19 @@ def create_browser(session):
             self.sources = EntryComboBox()
             self.sources.addItem('CCD', 'ccd')
             self.sources.addItem('CCD + ChEBI metabolites', 'ccd_chebi')
+            self.sources.addItem('Single ligand (CCD code)', 'ccd_code')
             self.sources.addItem('Single ligand (SMILES)', 'smiles')
             self.sources.setCurrentIndex(self.sources.findData(DEFAULT_LIBRARY_SOURCE))
             self.sources.setToolTip('CCD + ChEBI adds metabolites that have usable PubChem3D conformers. '
                                     'Exact CCD matches reuse existing coordinates; duplicates are tested once.')
             setup_row(2, 'Compounds', self.sources)
+            self.ccd_code = QLineEdit()
+            self.ccd_code.setPlaceholderText('Enter a CCD code, e.g. ATP')
+            self.ccd_code.setToolTip('Use one CCD entry. If it is not in the local index, download just that entry from RCSB.')
+            ccd_code_label = setup_row(3, 'CCD code', self.ccd_code)
+            ccd_code_label.hide()
+            self.ccd_code.hide()
+            self.ccd_code.textChanged.connect(self.refresh_rows)
             self.smiles = QLineEdit()
             self.smiles.setPlaceholderText('Enter a SMILES string')
             self.smiles.setMaxLength(2048)
@@ -2619,12 +2699,20 @@ def create_browser(session):
             self.group_match.currentIndexChanged.connect(lambda *_: self.set_groups(self.selected_groups()))
             groups_label = setup_row(4, 'Chemical groups', self.group_button, self.group_match)
             def source_changed():
-                single = self.sources.currentData() == 'smiles'
+                source = self.sources.currentData()
+                single = source in ('ccd_code', 'smiles')
+                for widget in (ccd_code_label, self.ccd_code):
+                    widget.setVisible(source == 'ccd_code')
                 for widget in (smiles_label, self.smiles):
-                    widget.setVisible(single)
+                    widget.setVisible(source == 'smiles')
                 for widget in (groups_label, self.group_button, self.group_match):
                     widget.setVisible(not single)
                 search_form.setRowVisible(self.codes, not single)
+                screen_max, final_max = conformer_caps(single)
+                self.conformers.setMaximum(screen_max)
+                self.refine_conformers.setMaximum(final_max)
+                self.conformers_label.setText(f'Search conformers (max {screen_max})')
+                self.refine_conformers_label.setText(f'Final conformers (max {final_max})')
                 self.set_busy(self.job is not None)
                 self.refresh_group_counts()
             self.sources.currentIndexChanged.connect(source_changed)
@@ -2697,7 +2785,7 @@ def create_browser(session):
                 field.setFixedWidth(max(field.sizeHint().width(), field_width))
                 field.setAlignment(Qt.AlignmentFlag.AlignRight)
                 field.setKeyboardTracking(False)
-            for widget in (self.codes, self.smiles, self.library, self.sources):
+            for widget in (self.codes, self.ccd_code, self.smiles, self.library, self.sources):
                 widget.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
             results = QWidget()
             results_layout = QVBoxLayout(results)
@@ -2801,10 +2889,10 @@ def create_browser(session):
             self.tool_window.manage('side')
 
         def set_busy(self, busy):
-            single = self.sources.currentData() == 'smiles'
+            single = self.sources.currentData() in ('ccd_code', 'smiles')
             for widget in (self.update_library_action, self.install_action, self.resolution,
                            self.top, self.workers, self.fast, self.torsions, self.refine, self.frequency,
-                           self.codes, self.smiles, self.library, self.maps, self.pick, self.sources):
+                           self.codes, self.ccd_code, self.smiles, self.library, self.maps, self.pick, self.sources):
                 widget.setEnabled(not busy)
             for widget in (self.frequency, self.workers, self.top):
                 widget.setEnabled(not busy and not single)
@@ -3081,9 +3169,11 @@ def create_browser(session):
                     raise ValueError('Click Pick blob, then click a positive-density surface before starting a search.')
                 sources = self.sources.currentData()
                 smiles = validate_smiles(self.smiles.text()) if sources == 'smiles' else None
+                ccd_code = validate_ccd_code(self.ccd_code.text()) if sources == 'ccd_code' else None
+                single = bool(smiles or ccd_code)
                 cache = Path(self.library.text()).expanduser().resolve()
-                groups = ('all',) if smiles else self.selected_groups()
-                if smiles is None:
+                groups = ('all',) if single else self.selected_groups()
+                if not single:
                     if library_info(cache) is None:
                         self.pending_start = True
                         self.start_library()
@@ -3118,7 +3208,7 @@ def create_browser(session):
                 self.watched_data = model.data
                 self.watched_data.add_change_callback(self.data_changed)
                 self.remove_preview()
-                top = 1 if smiles else self.top.value()
+                top = 1 if single else self.top.value()
                 self.buffer, self.current, self.failures = TopHits(top), None, []
                 self.hit_title.setText('Searching for candidates')
                 self.result_groups = groups
@@ -3134,6 +3224,7 @@ def create_browser(session):
                 if self.refine.isChecked():
                     mode += f'; final torsion search ({self.refine_conformers.value()} conformers/hit)'
                 candidates = ('Fitting one SMILES ligand; no library search. ' if smiles else
+                              f'Fitting one CCD entry ({ccd_code}). ' if ccd_code else
                               f'Keeping top {top} hits. Volume and optional PDB frequency prioritize the queue. ')
                 self.summary.setText(f'{mode}; blob volume {config["volume"]:.3g} A^3. {candidates}'
                                      'Ranking uses density fit. No clash tests. '
@@ -3141,13 +3232,13 @@ def create_browser(session):
                 if adjustment:
                     self.status.setText(adjustment)
                 codes = [v.strip().upper() for v in self.codes.text().replace(' ', ',').split(',') if v.strip()] or None
-                self.job = SearchJob(cache, config, 1 if smiles else self.workers.value(),
-                                     observed=not smiles and self.include_observed, ids=None if smiles else codes,
-                                     frequency=not smiles and self.frequency.isChecked(), fast=self.fast.isChecked(),
+                self.job = SearchJob(cache, config, 1 if single else self.workers.value(),
+                                     observed=not smiles and self.include_observed, ids=None if single else codes,
+                                     frequency=not single and self.frequency.isChecked(), fast=self.fast.isChecked(),
                                      torsions=self.torsions.isChecked(), conformers=self.conformers.value(), groups=groups,
-                                     group_match=self.group_match.currentData(), sources='ccd' if smiles else sources,
+                                     group_match=self.group_match.currentData(), sources='ccd' if single else sources,
                                      refine=self.refine.isChecked(), refine_conformers=self.refine_conformers.value(),
-                                     top=top, smiles=smiles)
+                                     top=top, smiles=smiles, ccd_code=ccd_code)
                 self.begin_job()
             except Exception as error:
                 self.report_error(error)
@@ -3303,6 +3394,8 @@ def create_browser(session):
             custom = hit.get('library_source') == 'SMILES'
             if custom or source == 'smiles':
                 return custom and source == 'smiles'
+            if source == 'ccd_code':
+                return self.result_sources == 'ccd_code' and hit['id'] == self.ccd_code.text().strip().upper()
             return ((source != 'ccd' or not hit['id'].startswith('CHEBI:')) and
                     hit_matches_groups(hit, groups, match))
 
@@ -3323,6 +3416,8 @@ def create_browser(session):
                 return joiner.join(labels.get(key, key) for key in keys)
             if self.sources.currentData() == 'smiles':
                 self.result_scope.setText('Single ligand (SMILES); no library search.')
+            elif self.sources.currentData() == 'ccd_code':
+                self.result_scope.setText('Single ligand from the CCD.')
             elif self.result_groups is not None and set(groups) == set(self.result_groups) and match == self.result_group_match:
                 self.result_scope.setText('Search groups: ' + describe(self.result_groups, self.result_group_match))
             elif self.result_groups is not None or self.buffer.rows:
@@ -3537,7 +3632,7 @@ def create_browser(session):
 def ligand_search(session, map_model=None, resolution=2.6, top=20,
                   library=None, workers=0, observed=True, codes=None, frequency=True, fast=False,
                   torsions=False, conformers=DEFAULT_CONFORMERS, groups='all', group_match='any', sources=None,
-                  refine=False, refine_conformers=FINAL_CONFORMERS, smiles=None):
+                  refine=False, refine_conformers=FINAL_CONFORMERS, smiles=None, ccd_code=None):
     from chimerax.core.errors import UserError
 
     if not session.ui.is_gui:
@@ -3545,14 +3640,19 @@ def ligand_search(session, map_model=None, resolution=2.6, top=20,
     try:
         if sources not in (None, 'ccd', 'ccd_chebi'):
             raise ValueError('sources must be ccd or ccd_chebi')
-        validate_conformer_limit(conformers)
-        validate_conformer_limit(refine_conformers, MAX_FINAL_CONFORMERS, 'refine_conformers')
+        validate_conformer_limits(conformers, refine_conformers, single=smiles is not None or ccd_code is not None)
         groups = parse_groups(groups)
         group_match = parse_group_match(group_match)
+        if smiles is not None and ccd_code is not None:
+            raise ValueError('Choose either ccd_code or smiles, not both.')
         if smiles is not None:
             smiles = validate_smiles(smiles)
             if codes is not None or groups != ('all',) or sources not in (None, 'ccd'):
                 raise ValueError('smiles fits one ligand; omit codes, groups and sources.')
+        if ccd_code is not None:
+            ccd_code = validate_ccd_code(ccd_code)
+            if codes is not None or groups != ('all',) or sources not in (None, 'ccd'):
+                raise ValueError('ccd_code fits one CCD entry; omit codes, groups and sources.')
     except ValueError as error:
         raise UserError(str(error)) from error
     if not math.isfinite(resolution) or not .5 <= resolution <= 20:
@@ -3576,20 +3676,22 @@ def ligand_search(session, map_model=None, resolution=2.6, top=20,
     browser.frequency.setChecked(frequency)
     browser.fast.setChecked(fast)
     browser.torsions.setChecked(torsions)
-    browser.conformers.setValue(conformers)
     browser.refine.setChecked(refine)
-    browser.refine_conformers.setValue(refine_conformers)
     if library is not None:
         browser.library.setText(str(Path(library).expanduser().resolve()))
     browser.group_match.setCurrentIndex(browser.group_match.findData(group_match))
-    source = 'smiles' if smiles else sources or DEFAULT_LIBRARY_SOURCE
+    source = 'smiles' if smiles else 'ccd_code' if ccd_code else sources or DEFAULT_LIBRARY_SOURCE
     source_index = browser.sources.findData(source)
     if browser.sources.currentIndex() == source_index:
         browser.refresh_group_counts()
     else:
         browser.sources.setCurrentIndex(source_index)
+    browser.conformers.setValue(conformers)
+    browser.refine_conformers.setValue(refine_conformers)
     if smiles is not None:
         browser.smiles.setText(smiles)
+    if ccd_code is not None:
+        browser.ccd_code.setText(ccd_code)
     browser.set_groups(groups)
     if codes is not None:
         browser.codes.setText(codes)

@@ -10583,13 +10583,13 @@ def _ligand_tool_module():
 def ligand_search(session, map_model=None, resolution=2.6, top=20,
                   library=None, workers=0, observed=True, codes=None, frequency=True, fast=False,
                   torsions=False, conformers=8, groups='all', group_match='any', sources=None,
-                  refine=False, refine_conformers=64, smiles=None):
+                  refine=False, refine_conformers=64, smiles=None, ccd_code=None):
     return _ligand_tool_module().ligand_search(session, map_model, resolution,
                                               top, library, workers, observed, codes, frequency, fast,
                                               torsions=torsions, conformers=conformers, groups=groups,
                                               group_match=group_match, sources=sources,
                                               refine=refine, refine_conformers=refine_conformers,
-                                              smiles=smiles)
+                                              smiles=smiles, ccd_code=ccd_code)
 
 
 def ligand_search_stop(session):
@@ -10702,6 +10702,7 @@ def register_command(logger):
         ('fast', BoolArg), ('torsions', BoolArg), ('conformers', IntArg), ('groups', StringArg),
         ('group_match', EnumOf(('any', 'all'))), ('sources', EnumOf(('ccd', 'ccd_chebi'))),
         ('refine', BoolArg), ('refine_conformers', IntArg), ('smiles', StringArg),
+        ('ccd_code', StringArg),
     ], synopsis='Browse ligand fits from CCD and optional ChEBI metabolites against a density blob'),
              ligand_search, logger=logger)
     register('ligandsearch stop', CmdDesc(synopsis='Stop ligand screening or library update; retain completed top hits'),

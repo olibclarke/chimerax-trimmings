@@ -59,10 +59,11 @@ hit** to resume. Each new search enables live following again.
 | `frequency` | `true` | Combine volume match with PDB occurrence frequency for search ordering. `false` uses volume alone. |
 | `observed` | `true` | Try the CCD example observed-coordinate conformer when available and distinct, even without torsion sampling. Use `observed false` to prefer ideal coordinates only. |
 | `torsions` | `false` | Generate a sparse, deterministic set of additional conformers around flexible single bonds. Slower; not exhaustive or energy-minimized. |
-| `conformers` | `8` | Maximum total conformers per CCD entry when `torsions true`, including selected CCD originals. Range 2-32; rigid ligands may yield fewer. |
+| `conformers` | `8` | Maximum total conformers per ligand when `torsions true`, including its starting conformers. Range 2-32 for library searches or 2-256 for a single ligand. |
 | `refine` | `false` | After screening, run a broader sparse torsion search and local rigid fitting on the retained top hits. |
-| `refine_conformers` | `64` | Maximum conformers per shortlisted hit in the final pass, including the starting conformation; range 2-256. Independent of `conformers`. |
+| `refine_conformers` | `64` | Maximum conformers per shortlisted hit in the final pass, including the starting conformation. Range 2-256 for library searches or 2-512 for a single ligand. |
 | `codes` | All indexed entries | Optional comma-separated CCD codes, for example `"ATP,ADP,AMP"`. |
+| `ccd_code` | none | Fit one CCD entry, using the local index or downloading only that entry. Omit `codes`, `groups`, `sources` and `smiles`. |
 | `smiles` | none | Fit one custom ligand using ChimeraX's built-in online SMILES converter, without a library search. Quote the string; omit `codes`, `groups` and `sources`. |
 | `groups` | `all` | Comma-separated chemical-family or role keys. Intersects with `codes` when both are supplied. |
 | `group_match` | `any` | `any` accepts any selected group (OR); `all` requires every selected group (AND). |
@@ -79,7 +80,16 @@ density-scoring formula. Standard search remains the default; omit `fast` or
 use `fast false` for the original settings. CSV exports record the search mode
 in `fast_search` for each hit.
 
-## Fit a Single SMILES Ligand
+## Fit One Ligand
+
+Choose **Single ligand (CCD code)** in **Compounds**, enter a code such as
+`ATP`, pick the blob and start the search. The tool uses the local CCD index
+if the entry is present, otherwise it downloads just that entry from RCSB.
+No full library download is needed. Both torsion passes are available.
+
+```chimerax
+ligandsearch #2 ccd_code ATP resolution 2.6 torsions true conformers 64 refine true
+```
 
 Choose **Single ligand (SMILES)** in **Compounds**, enter a stereospecific
 SMILES, pick the blob and start the search. Or pass the SMILES on the command line:
@@ -93,6 +103,9 @@ Only the SMILES string goes to the conversion service, never the density map or
 model; don't use confidential structures. Enter one molecule rather than a salt
 or mixture. No CCD or ChEBI download is needed. Both torsion passes work as
 usual, and the CSV records the input string.
+
+Both single-ligand modes allow up to 256 screening conformers and 512 in the
+final pass. The defaults are still 8 and 64; higher caps can take longer.
 
 ## Chemical Groups
 
@@ -239,8 +252,8 @@ map or fitted coordinates to ChEBI, RCSB or PubChem.
 ## Sparse Conformers
 
 Enable **Sample torsions during screening** in the browser, or use `torsions true`.
-The browser enables **Search conformers (max 32)** only while sparse torsion
-sampling is selected and no job is running.
+The browser enables **Search conformers** only while sparse torsion sampling is
+selected and no job is running. The label shows the cap for the selected mode.
 
 CCD screening tries the ideal conformer and a distinct observed conformer when
 available, with or without torsion sampling. The default sampling cap is eight
@@ -264,7 +277,7 @@ ligands, and more conformers can also increase the opportunity to fit noise.
 
 ### Final Top-Hit Search
 
-Enable **Final torsion search on top hits** and set **Final conformers (max 256)**,
+Enable **Final torsion search on top hits** and set **Final conformers**,
 or use:
 
 ```chimerax
