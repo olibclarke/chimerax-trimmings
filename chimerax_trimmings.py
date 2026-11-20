@@ -10580,12 +10580,16 @@ def _ligand_tool_module():
     return module
 
 
-def ligand_search(session, map_model=None, resolution=2.6, level=None, radius=14., top=20,
+def ligand_search(session, map_model=None, resolution=2.6, top=20,
                   library=None, workers=0, observed=False, codes=None, frequency=True, fast=False,
-                  torsions=False, conformers=8):
-    return _ligand_tool_module().ligand_search(session, map_model, resolution, level, radius,
+                  torsions=False, conformers=8, groups='all', group_match='any', sources='ccd',
+                  refine=False, refine_conformers=64, smiles=None):
+    return _ligand_tool_module().ligand_search(session, map_model, resolution,
                                               top, library, workers, observed, codes, frequency, fast,
-                                              torsions=torsions, conformers=conformers)
+                                              torsions=torsions, conformers=conformers, groups=groups,
+                                              group_match=group_match, sources=sources,
+                                              refine=refine, refine_conformers=refine_conformers,
+                                              smiles=smiles)
 
 
 def ligand_search_stop(session):
@@ -10600,10 +10604,12 @@ def register_command(logger):
 
     from chimerax.map import MapArg
     register('ligandsearch', CmdDesc(optional=[('map_model', MapArg)], keyword=[
-        ('resolution', FloatArg), ('level', FloatArg), ('radius', FloatArg), ('top', IntArg),
+        ('resolution', FloatArg), ('top', IntArg),
         ('library', StringArg), ('workers', IntArg), ('observed', BoolArg), ('codes', StringArg), ('frequency', BoolArg),
-        ('fast', BoolArg), ('torsions', BoolArg), ('conformers', IntArg),
-    ], synopsis='Browse a live top-hit CCD ligand search against a picked density blob or CoFR'),
+        ('fast', BoolArg), ('torsions', BoolArg), ('conformers', IntArg), ('groups', StringArg),
+        ('group_match', EnumOf(('any', 'all'))), ('sources', EnumOf(('ccd', 'ccd_chebi'))),
+        ('refine', BoolArg), ('refine_conformers', IntArg), ('smiles', StringArg),
+    ], synopsis='Browse ligand fits from CCD and optional ChEBI metabolites against a density blob'),
              ligand_search, logger=logger)
     register('ligandsearch stop', CmdDesc(synopsis='Stop ligand screening or library update; retain completed top hits'),
              ligand_search_stop, logger=logger)
