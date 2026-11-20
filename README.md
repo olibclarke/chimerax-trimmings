@@ -21,7 +21,7 @@ This repository contains:
 
 Windows note: the Startup preferences are typically reached from the `Favorites` menu rather than the application menu.
 
-Trimmings makes Ctrl-click and Ctrl-drag select visible atoms through transparent surfaces. See [mouse bindings and how to restore standard ChimeraX selection](default_mousemodes.md#restore-standard-chimerax-selection).
+Trimmings makes Ctrl-click and Ctrl-drag select visible atoms, cartoons, and other atom-linked representations through transparent maps and surfaces. See [mouse bindings and how to restore standard ChimeraX selection](default_mousemodes.md#restore-standard-chimerax-selection).
 
 ## Local domain library
 

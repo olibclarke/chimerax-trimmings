@@ -14,9 +14,9 @@ _**Mouse modes:**_
 
 **Ctrl+Alt**-left-click: Picks & colors clicked blob (launches "Measure and Color Blobs" tool).
 
-**Ctrl**-left-click or drag: Selects visible atoms through transparent contours and surfaces. Box selection tests visibility at each atom's projected center.
+**Ctrl**-left-click or drag: Selects visible atoms, bonds, cartoon residues, and atom-linked surfaces or shapes through transparent contours and surfaces. Opaque objects block picking. Box selection checks visibility at projected atom or bond centers and samples the drawn geometry of cartoons and surfaces.
 
-**Ctrl+Shift**-left-click or drag: Toggles selection of those atoms.
+**Ctrl+Shift**-left-click or drag: Toggles the same selection.
 
 **Ctrl+Alt+Shift**-left-click: Uses ChimeraX's standard selection to toggle the object under the cursor, including maps and surfaces.
 
@@ -30,7 +30,7 @@ mousemode control shift left select
 mousemode control alt shift left none
 ```
 
-To keep this behavior across restarts, add these commands to the end of your Startup preferences. Reloading Trimmings or clicking `reset_mouse_and_help` re-enables atom-only picking for the current session.
+To keep this behavior across restarts, add these commands to the end of your Startup preferences. Reloading Trimmings or clicking `reset_mouse_and_help` re-enables visible-structure picking for the current session.
 
 _**Function keys:**_
 

@@ -11060,18 +11060,34 @@ def ligand_search_stop(session):
     return _ligand_tool_module().ligand_stop(session)
 
 
+def _structural_pick_item(pick):
+    from chimerax.atomic import PickedAtom, PickedBond, PickedPseudobond, PickedResidue
+    from chimerax.atomic.shapedrawing import PickedAtomicShape
+
+    if isinstance(pick, PickedAtom):
+        return pick.atom
+    if isinstance(pick, PickedResidue):
+        return pick.residue
+    if isinstance(pick, PickedBond):
+        return pick.bond
+    if isinstance(pick, PickedPseudobond):
+        return pick.pbond
+    if isinstance(pick, PickedAtomicShape) and pick.shape.atoms:
+        return pick.shape
+    return None
+
+
 def _visible_atom_pick(view, x, y):
-    from chimerax.atomic import PickedAtom
     from chimerax.graphics import PickedTriangle
 
     depth = None
     while True:
         # Inspect each hit so an opaque surface can stop the ray.
         pick = view.picked_object(x, y, beyond=depth, max_transparent_layers=0)
-        if isinstance(pick, PickedAtom):
-            return pick
         if pick is None:
             return None
+        if _structural_pick_item(pick) is not None:
+            return pick
         # Map and model picks wrap the triangle, which has the actual opacity.
         triangle = getattr(pick, "triangle_pick", getattr(pick, "picked_triangle", pick))
         if not (
@@ -11085,9 +11101,11 @@ def _visible_atom_pick(view, x, y):
 
 
 def _visible_atom_box(view, start, end):
-    from chimerax.atomic import Atoms
-    from chimerax.atomic.structure import PickedAtoms
-    from numpy import ones
+    from chimerax.atomic import Atom, Atoms, Bond, Bonds, MolecularSurface, Pseudobond, Pseudobonds
+    from chimerax.atomic.shapedrawing import PickedAtomicShapes
+    from chimerax.atomic.structure import PickedAtoms, PickedBonds, PickedPseudobonds, PickedResidues
+    from chimerax.graphics import PickedTriangles
+    from numpy import concatenate, flatnonzero, linspace
 
     camera = view.camera
     width, height = view.window_size
@@ -11096,24 +11114,109 @@ def _visible_atom_box(view, start, end):
     left, right = sorted((start[0], end[0]))
     top, bottom = sorted((start[1], end[1]))
     visible = set()
-    for group in view.rectangle_pick(*start, *end):
-        if not isinstance(group, PickedAtoms):
-            continue
-        for structure, atoms in group.atoms.by_structure:
-            coords = atoms.coords
-            points = ones((len(atoms), 4))
-            for position in structure.get_scene_positions(displayed_only=True):
-                points[:, :3] = position * coords
-                projected = points @ scene_to_clip
-                for atom, (x, y, _, w) in zip(atoms, projected):
-                    if atom in visible or w <= 0:
-                        continue
-                    px, py = (1 + x / w) * width / 2, (1 - y / w) * height / 2
-                    if left <= px <= right and top <= py <= bottom:
-                        pick = _visible_atom_pick(view, px, py)
-                        if pick is not None and pick.atom == atom:
-                            visible.add(atom)
-    return [PickedAtoms(Atoms(list(visible)))] if visible else []
+
+    def pixels(coords, position):
+        if position is not None:
+            coords = position * coords
+        projected = coords @ scene_to_clip[:3] + scene_to_clip[3]
+        indices = flatnonzero(projected[:, 3] > 0)
+        xy = projected[indices, :2] / projected[indices, 3, None]
+        xy = (xy + (1, -1)) * (width / 2, -height / 2)
+        inside = (left <= xy[:, 0]) & (xy[:, 0] <= right) & (top <= xy[:, 1]) & (xy[:, 1] <= bottom)
+        return indices[inside], xy[inside]
+
+    def sees(item, xy):
+        return _structural_pick_item(_visible_atom_pick(view, *xy)) == item
+
+    def centers(items, coords, drawing):
+        positions = (None,) if drawing is None else drawing.get_scene_positions(displayed_only=True)
+        for position in positions:
+            indices, screen_points = pixels(coords, position)
+            for index, xy in zip(indices, screen_points):
+                item = items[index]
+                if item not in visible and sees(item, xy):
+                    visible.add(item)
+
+    def mesh(item, drawing, triangles):
+        if item in visible or len(triangles) == 0:
+            return
+        vertices = drawing.vertices[triangles]
+        middle = vertices.mean(axis=1)
+        # Test actual drawn geometry, including narrow edge-only selections.
+        near_vertices = .98 * vertices + .02 * middle[:, None, :]
+        samples = concatenate((middle, near_vertices.reshape(-1, 3)))
+        for position in drawing.get_scene_positions(displayed_only=True):
+            _, xy = pixels(samples, position)
+            if len(xy) > 12:
+                xy = xy[linspace(0, len(xy) - 1, 12, dtype=int)]
+            if any(sees(item, point) for point in xy):
+                visible.add(item)
+                return
+
+    for group in view.rectangle_pick(left, top, right, bottom):
+        if isinstance(group, PickedAtoms):
+            for structure, atoms in group.atoms.by_structure:
+                centers(atoms, atoms.coords, structure)
+        elif isinstance(group, PickedBonds):
+            for structure, bonds in group.bonds.by_structure:
+                a, b = bonds.atoms
+                centers(bonds, .5 * (a.coords + b.coords), structure)
+        elif isinstance(group, PickedPseudobonds):
+            for pbg, bonds in group.pseudobonds.by_group:
+                a, b = bonds.atoms
+                if pbg.structure is None:
+                    centers(bonds, .5 * (a.pb_scene_coords + b.pb_scene_coords), None)
+                else:
+                    centers(bonds, .5 * (a.pb_coords + b.pb_coords), pbg)
+        elif isinstance(group, PickedResidues):
+            residues = set(group.residues)
+            if not residues:
+                continue
+            # RibbonDrawing maps tessellated triangle ranges to native residues.
+            drawing = next(iter(residues)).structure._ribbons_drawing
+            if drawing is None:
+                continue
+            for index, first, last, _, _ in drawing._triangle_ranges.copy():
+                residue = drawing._residues[index]
+                if residue in residues:
+                    mesh(residue, drawing, drawing.triangles[first:last])
+        elif isinstance(group, PickedAtomicShapes):
+            drawing = group._drawing
+            for shape in group.shapes:
+                if shape.atoms:
+                    mesh(shape, drawing, drawing.triangles[shape.triangle_range])
+        elif isinstance(group, PickedTriangles):
+            drawing = group.drawing()
+            if isinstance(drawing, MolecularSurface):
+                atom_indices = drawing.vertex_to_atom_map()
+                if atom_indices is None:
+                    continue
+                triangles = drawing.triangles[group._triangles_mask]
+                keys = atom_indices[triangles[:, 0]]
+                order = keys.argsort()
+                keys = keys[order]
+                starts = [0, *(1 + flatnonzero(keys[1:] != keys[:-1])), len(keys)]
+                atoms = drawing.atoms
+                for first, last in zip(starts, starts[1:]):
+                    if first < last and 0 <= keys[first] < len(atoms):
+                        mesh(atoms[keys[first]], drawing, triangles[order[first:last]])
+
+    atoms, bonds, pseudobonds = set(), [], []
+    for item in visible:
+        if isinstance(item, Atom):
+            atoms.add(item)
+        elif isinstance(item, Bond):
+            bonds.append(item)
+        elif isinstance(item, Pseudobond):
+            pseudobonds.append(item)
+        else:  # A residue or an atom-backed shape.
+            atoms.update(item.atoms)
+    picks = []
+    for items, collection, pick_type in ((atoms, Atoms, PickedAtoms), (bonds, Bonds, PickedBonds),
+                                         (pseudobonds, Pseudobonds, PickedPseudobonds)):
+        if items:
+            picks.append(pick_type(collection(list(items))))
+    return picks
 
 
 def _install_atom_selection(session):
