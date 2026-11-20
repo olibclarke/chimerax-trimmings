@@ -21,6 +21,8 @@ This repository contains:
 
 Windows note: the Startup preferences are typically reached from the `Favorites` menu rather than the application menu.
 
+Trimmings makes Ctrl-click and Ctrl-drag select visible atoms through transparent surfaces. See [mouse bindings and how to restore standard ChimeraX selection](default_mousemodes.md#restore-standard-chimerax-selection).
+
 ## Local domain library
 
 Install [Foldseek](https://github.com/steineggerlab/foldseek#installation)
@@ -404,7 +406,7 @@ It currently includes buttons for:
 - `mark_cofr`: place a marker at the current center of rotation
 - `togglemaps`: hide shown maps, then restore the same set on the next use
 - `togglemodels`: hide shown atomic models, then restore the same set on the next use
-- `reset_mouse_and_help`: restore the default mouse bindings and open the mouse-mode help page
+- `reset_mouse_and_help`: restore the Trimmings mouse bindings and open the mouse-mode help page
 - `previous_model_map`: show the previous unskipped atomic model or volume map
 - `next_model_map`: show the next unskipped atomic model or volume map
 

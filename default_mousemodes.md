@@ -14,6 +14,24 @@ _**Mouse modes:**_
 
 **Ctrl+Alt**-left-click: Picks & colors clicked blob (launches "Measure and Color Blobs" tool).
 
+**Ctrl**-left-click or drag: Selects visible atoms through transparent contours and surfaces. Box selection tests visibility at each atom's projected center.
+
+**Ctrl+Shift**-left-click or drag: Toggles selection of those atoms.
+
+**Ctrl+Alt+Shift**-left-click: Uses ChimeraX's standard selection to toggle the object under the cursor, including maps and surfaces.
+
+### Restore standard ChimeraX selection
+
+Run these commands in ChimeraX to restore standard object picking for Ctrl-click and Ctrl-drag, including maps and surfaces.
+
+```chimerax
+mousemode control left select
+mousemode control shift left select
+mousemode control alt shift left none
+```
+
+To keep this behavior across restarts, add these commands to the end of your Startup preferences. Reloading Trimmings or clicking `reset_mouse_and_help` re-enables atom-only picking for the current session.
+
 _**Function keys:**_
 
 **F1** - previous model

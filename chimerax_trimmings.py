@@ -10596,6 +10596,99 @@ def ligand_search_stop(session):
     return _ligand_tool_module().ligand_stop(session)
 
 
+def _visible_atom_pick(view, x, y):
+    from chimerax.atomic import PickedAtom
+    from chimerax.graphics import PickedTriangle
+
+    depth = None
+    while True:
+        # Inspect each hit so an opaque surface can stop the ray.
+        pick = view.picked_object(x, y, beyond=depth, max_transparent_layers=0)
+        if isinstance(pick, PickedAtom):
+            return pick
+        if pick is None:
+            return None
+        # Map and model picks wrap the triangle, which has the actual opacity.
+        triangle = getattr(pick, "triangle_pick", getattr(pick, "picked_triangle", pick))
+        if not (
+            getattr(pick, "pick_through", False)
+            or (isinstance(triangle, PickedTriangle) and triangle.is_transparent())
+        ):
+            return None
+        if pick.distance is None or pick.distance >= 1 or (depth is not None and pick.distance <= depth):
+            return None
+        depth = pick.distance
+
+
+def _visible_atom_box(view, start, end):
+    from chimerax.atomic import Atoms
+    from chimerax.atomic.structure import PickedAtoms
+    from numpy import ones
+
+    camera = view.camera
+    width, height = view.window_size
+    projection = camera.projection_matrix(view.near_far_distances(camera, None), None, (width, height))
+    scene_to_clip = camera.position.inverse().opengl_matrix() @ projection
+    left, right = sorted((start[0], end[0]))
+    top, bottom = sorted((start[1], end[1]))
+    visible = set()
+    for group in view.rectangle_pick(*start, *end):
+        if not isinstance(group, PickedAtoms):
+            continue
+        for structure, atoms in group.atoms.by_structure:
+            coords = atoms.coords
+            points = ones((len(atoms), 4))
+            for position in structure.get_scene_positions(displayed_only=True):
+                points[:, :3] = position * coords
+                projected = points @ scene_to_clip
+                for atom, (x, y, _, w) in zip(atoms, projected):
+                    if atom in visible or w <= 0:
+                        continue
+                    px, py = (1 + x / w) * width / 2, (1 - y / w) * height / 2
+                    if left <= px <= right and top <= py <= bottom:
+                        pick = _visible_atom_pick(view, px, py)
+                        if pick is not None and pick.atom == atom:
+                            visible.add(atom)
+    return [PickedAtoms(Atoms(list(visible)))] if visible else []
+
+
+def _install_atom_selection(session):
+    from types import MethodType
+
+    from chimerax.mouse_modes import MouseMode
+    from chimerax.mouse_modes.std_modes import SelectMouseMode, select_pick
+
+    class VisibleAtomSelect(SelectMouseMode):
+        def __init__(self, session):
+            super().__init__(session)
+            self.name = "select visible atoms"
+
+        def mouse_up(self, event):
+            if self.double_click:
+                SelectMouseMode.mouse_up(self, event)
+                return
+            self._undraw_drag_rectangle()
+            mode = "toggle" if event.shift_down() else "replace"
+            if self._is_drag(event):
+                pick = _visible_atom_box(self.view, self.mouse_down_position, event.position())
+            else:
+                pick = _visible_atom_pick(self.view, *event.position())
+            MouseMode.mouse_up(self, event)
+            select_pick(self.session, pick, mode)
+
+    manager = session.ui.mouse_modes
+    atom_select = manager.named_mode("select visible atoms")
+    if atom_select is None:
+        atom_select = VisibleAtomSelect(session)
+        manager.add_mode(atom_select)
+    else:
+        # runscript uses fresh globals. Refresh the handler on the registered mode.
+        atom_select.mouse_up = MethodType(VisibleAtomSelect.mouse_up, atom_select)
+    for modifiers in (["control"], ["control", "shift"]):
+        manager.bind_mouse_mode("left", modifiers, atom_select)
+    manager.bind_mouse_mode("left", ["control", "alt", "shift"], manager.named_mode("select"))
+
+
 def register_command(logger):
     from chimerax.atomic import AtomsArg
     from chimerax.core.commands import BoolArg, CmdDesc, EnumOf, FloatArg, IntArg, ModelsArg, OpenFileNameArg, StringArg, register
@@ -10788,6 +10881,8 @@ def register_command(logger):
 
 if "session" in globals():
     register_command(session.logger)
+    if session.ui.is_gui:
+        _install_atom_selection(session)
 
     # Reloading also upgrades an already-enabled controller in the session.
     if getattr(getattr(session, "_trimmings_model_motion", None), "enabled", False):

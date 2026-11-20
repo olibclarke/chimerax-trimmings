@@ -114,7 +114,7 @@ buttonpanel Shortcuts add cootmode command "cootmode"
 buttonpanel Shortcuts add mark_cofr command "marker #20000 position cofr radius 1"
 buttonpanel Shortcuts add togglemaps command "togglemaps"
 buttonpanel Shortcuts add togglemodels command "togglemodels"
-buttonpanel Shortcuts add reset_mouse_and_help command "mousemode alt right contour ; mousemode right clip ; mousemode alt left 'translate selected models' ; mousemode shift left 'rotate selected models' ; mousemode alt control left 'pick blobs'; help https://github.com/olibclarke/chimerax-trimmings/blob/main/default_mousemodes.md"
+buttonpanel Shortcuts add reset_mouse_and_help command "mousemode alt right contour ; mousemode right clip ; mousemode alt left 'translate selected models' ; mousemode shift left 'rotate selected models' ; mousemode alt control left 'pick blobs'; mousemode control left 'select visible atoms'; mousemode control shift left 'select visible atoms'; mousemode control alt shift left select; help https://github.com/olibclarke/chimerax-trimmings/blob/main/default_mousemodes.md"
 buttonpanel Shortcuts add previous_model_map command "previtem"
 buttonpanel Shortcuts add next_model_map command "nextitem"
 volume defaultvalues limitVoxelCount false voxelLimitForPlane 1000000000000000 voxelLimitForOpen 1000000000000000 saveSettings true
