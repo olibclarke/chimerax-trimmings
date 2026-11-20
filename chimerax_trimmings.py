@@ -10581,8 +10581,8 @@ def _ligand_tool_module():
 
 
 def ligand_search(session, map_model=None, resolution=2.6, top=20,
-                  library=None, workers=0, observed=False, codes=None, frequency=True, fast=False,
-                  torsions=False, conformers=8, groups='all', group_match='any', sources='ccd',
+                  library=None, workers=0, observed=True, codes=None, frequency=True, fast=False,
+                  torsions=False, conformers=8, groups='all', group_match='any', sources=None,
                   refine=False, refine_conformers=64, smiles=None):
     return _ligand_tool_module().ligand_search(session, map_model, resolution,
                                               top, library, workers, observed, codes, frequency, fast,

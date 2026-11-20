@@ -7,7 +7,7 @@ This repository contains:
 
 - `chimerax_trimmings.txt`: Startup commands, aliases, keybindings, and Shortcut buttonpanel setup.
 - `chimerax_trimmings.py`: Companion ChimeraX Python commands, including sequence-independent shape alignment. See [SHAPE_ALIGN.md](SHAPE_ALIGN.md).
-- `ligand_search.py` and `ligand_chebi.py`: Companion GUI for screening CCD ligands and optional ChEBI metabolites against an isolated density blob. Keep both beside the main Python script. See [LIGAND_SEARCH.md](LIGAND_SEARCH.md).
+- `ligand_search.py` and `ligand_chebi.py`: Companion GUI for screening CCD ligands and ChEBI metabolites against an isolated density blob. Keep both beside the main Python script. See [LIGAND_SEARCH.md](LIGAND_SEARCH.md).
 - `map_salami.py`: Experimental script that , if invoked via runscript, adds a command `map_salami`, which automates the generation of section-by-section map/model density fit figures (can run as `map_salami model #1 selection /A:100-220 map #2 zone 2 patches 3 movie true movie_resolution 1080p segment_size 40 image_height 2000 output_dir ~/Desktop/map_salami_panels`, everything except for map & model is optional; patches controls `MaxComponents` of surface, defaults to `None`; `movie_resolution` can be either 4k or 1080p, defaults to 1080p; `zone` is the surface zone clipping offset, defaults to 2 Å; `segment_size` is the residue range chunk to use, defaults to 40 but will expand to include entire helix/strand or short terminal segments if needed.)
 - Caveat - I have re-organized, updated, and translated from the original `chimera-trimmings` with the help of an LLM (Codex). I have tried to carefully check for errors and unexpected behaviors, and inspect each ChimeraX command invoked, but if you notice anything broken or unexpected, please let me know and I will do my best to fix it.
 
@@ -105,7 +105,7 @@ See [shape alignment options](SHAPE_ALIGN.md).
 ```chimerax
 ligandsearch
 ligandsearch #2 resolution 2.6
-ligandsearch #2 sources ccd_chebi groups metabolites
+ligandsearch #2 groups metabolites
 ligandsearch #2 groups "organic_nitrogen,metabolites" group_match all
 ligandsearch #2 resolution 2.6 fast true torsions true conformers 8
 ligandsearch stop
@@ -114,8 +114,11 @@ ligandsearch stop
 Screen ligands against an isolated map blob selected by clicking its surface.
 The background search shows a live top-hit preview; browse, keep or export hits,
 or stop at any time. The first library search downloads one 61 MB CCD + ChEBI
-archive to ChimeraX's download cache. Later searches can run offline. Choose
-**CCD + ChEBI metabolites** to search the expanded library.
+archive to ChimeraX's download cache. Later searches can run offline. Both
+libraries are searched by default; choose **CCD** to restrict the scope.
+
+Map and compound controls stay above the results. Use **Search options...** for
+advanced fitting settings and **Library** to manage the cache.
 
 Optional `fast true` speeds fitting; `torsions true conformers 8` tests a sparse
 set of conformers. Both are off by default. Density fit determines ranking;

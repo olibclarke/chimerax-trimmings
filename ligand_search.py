@@ -88,6 +88,7 @@ STANDARD_EXTRA_STARTS, STANDARD_SAMPLES = 24, 3000
 FAST_EXTRA_STARTS, FAST_SAMPLES = 8, 1500
 DEFAULT_CONFORMERS, MAX_CONFORMERS = 8, 32
 FINAL_CONFORMERS, MAX_FINAL_CONFORMERS = 64, 256
+DEFAULT_LIBRARY_SOURCE = 'ccd_chebi'
 CONFORMER_RMSD = .25  # Ignore torsion variants indistinguishable after rigid alignment.
 BLOB_HIGHLIGHT_RGB = (80, 230, 120)
 INTERNAL_OVERLAP = 1.6  # Reject newly introduced gross heavy-atom overlaps, in Angstroms.
@@ -1587,7 +1588,7 @@ class _Quiet:
         pass
 
 
-def selected_conformers(record, observed=False):
+def selected_conformers(record, observed=True):
     conformers = record['conformers'] if observed else [c for c in record['conformers'] if c['source'] == 'ideal']
     return conformers or record['conformers'][:1]
 
@@ -1742,7 +1743,7 @@ def _rotate_fragment(xyz, rotor, angle):
     return True
 
 
-def sparse_conformers(record, observed=False, limit=DEFAULT_CONFORMERS, maximum=MAX_CONFORMERS):
+def sparse_conformers(record, observed=True, limit=DEFAULT_CONFORMERS, maximum=MAX_CONFORMERS):
     """Bounded single/multiple torsion perturbations; no Cartesian product search."""
     import numpy as np
     from scipy.spatial import cKDTree
@@ -1861,7 +1862,7 @@ class Fitter:
         outside = float(np.count_nonzero(predicted & ~c['mask']) / max(1, np.count_nonzero(predicted)))
         return cc, supported, coverage, outside
 
-    def fit(self, record, observed=False, fast=False, torsions=False, conformers=DEFAULT_CONFORMERS):
+    def fit(self, record, observed=True, fast=False, torsions=False, conformers=DEFAULT_CONFORMERS):
         import numpy as np
         from chimerax.geometry import Place
         from chimerax.core.errors import UserError
@@ -1870,18 +1871,17 @@ class Fitter:
                        max_points=FAST_SAMPLES if fast else STANDARD_SAMPLES,
                        extra_starts=FAST_EXTRA_STARTS if fast else STANDARD_EXTRA_STARTS,
                        fallback_correlation=0., bandpass=False)
-        best = None
+        best = first_fit_error = None
         tested, skipped = 0, 0
         variants = sparse_conformers(record, observed, conformers) if torsions else selected_conformers(record, observed)
         for conformer in variants:
-            source = self.source(conformer['xyz'], record['elements'])
             try:
+                source = self.source(conformer['xyz'], record['elements'])
                 _, stats = self.api._fit_shape_original_map_search(source, self.target, options, None, collect=True)
-            except (UserError, self.api._ShapeEmptyMapSearch):
-                if not conformer.get('torsion_changes'):
-                    raise
-                # An expanded trial can exceed a grid limit or have no fit.
-                # Keep the successful original conformer rather than losing its CCD.
+            except (UserError, self.api._ShapeEmptyMapSearch) as error:
+                # One unusable conformer should not discard another's valid fit.
+                if first_fit_error is None:
+                    first_fit_error = error
                 skipped += 1
                 continue
             tested += 1
@@ -1900,6 +1900,8 @@ class Fitter:
                                 names=record['names'], elements=record['elements'], bonds=record['bonds'],
                                 supported=supported, coverage=coverage, outside=outside)
         if best is None:
+            if first_fit_error is not None:
+                raise first_fit_error
             raise ValueError('No usable coordinate conformer.')
         best.update(conformers_tested=tested, conformers_skipped=skipped)
         best.update({key: record[key] for key in ('library_source', 'chebi_ids', 'pubchem_cid', 'inchikey', 'formal_charge', 'smiles')
@@ -1977,7 +1979,7 @@ def worker_main(directory):
                     hit = fitter.refine(job['refine_hit'], job['refine_conformers'])
                 else:
                     record = smiles_component(job['smiles']) if 'smiles' in job else job['component']
-                    hit = fitter.fit(record, job['observed'], fast=job.get('fast', False),
+                    hit = fitter.fit(record, job.get('observed', True), fast=job.get('fast', False),
                                      torsions=job.get('torsions', False),
                                      conformers=job.get('conformers', DEFAULT_CONFORMERS))
                 result = dict(result=hit)
@@ -1991,7 +1993,7 @@ def worker_main(directory):
 
 class SearchJob:
     """Bounded worker dispatch. Stop terminates outstanding work, not saved hits."""
-    def __init__(self, cache, config, workers=0, observed=False, ids=None, frequency=True, fast=False,
+    def __init__(self, cache, config, workers=0, observed=True, ids=None, frequency=True, fast=False,
                  torsions=False, conformers=DEFAULT_CONFORMERS, groups='all', group_match='any', sources='ccd',
                  refine=False, refine_conformers=FINAL_CONFORMERS, top=20, smiles=None):
         validate_conformer_limit(conformers)
@@ -2388,27 +2390,20 @@ def make_model(session, row, volume, existing=None):
 def create_browser(session):
     from Qt.QtCore import QEvent, Qt, QTimer
     from Qt.QtGui import QColor, QFont, QPalette
-    from Qt.QtWidgets import (QCheckBox, QComboBox, QDoubleSpinBox, QFileDialog, QFormLayout,
+    from Qt.QtWidgets import (QCheckBox, QComboBox, QDialog, QDialogButtonBox, QDoubleSpinBox, QFileDialog, QFormLayout,
                               QHBoxLayout, QLabel, QLineEdit, QPushButton, QSpinBox,
                               QTableWidget, QTableWidgetItem, QVBoxLayout, QAbstractItemView,
-                              QToolButton, QMenu, QScrollArea, QWidget, QSplitter, QGridLayout, QSizePolicy,
-                              QHeaderView, QProgressBar, QApplication)
+                              QMenu, QScrollArea, QToolButton, QWidget, QGridLayout, QSizePolicy,
+                              QHeaderView, QProgressBar)
     from chimerax.core.models import ADD_MODELS, REMOVE_MODELS
     from chimerax.core.tools import ToolInstance
     from chimerax.ui import MainToolWindow
     from chimerax.map import Volume
 
     class NoWheel:
-        # Ignore wheel input even while focused; trackpad scrolling belongs to
-        # the settings pane, not to the value underneath the pointer.
+        # Moving the pointer over a control must not change its value.
         def wheelEvent(self, event):
             event.ignore()
-            parent = self.parentWidget()
-            while parent is not None:
-                if isinstance(parent, QScrollArea):
-                    QApplication.sendEvent(parent.viewport(), event)
-                    return
-                parent = parent.parentWidget()
 
     class EntrySpinBox(NoWheel, QSpinBox):
         pass
@@ -2445,6 +2440,7 @@ def create_browser(session):
             super().__init__(session, 'Ligand Search')
             self._closed, self.job, self.preview = False, None, None
             self._implementation = IMPLEMENTATION
+            self.include_observed = True
             self.current, self.volume, self.watched_data = None, None, None
             self.blob_volume = 0.
             self.buffer, self.failures = TopHits(20), []
@@ -2457,16 +2453,15 @@ def create_browser(session):
             self._has_library = False
             self.group_labels, self.custom_groups = {}, set()
             self.group_counts = {}
+            self._combined_group_counts = (None, {})
             self.tool_window = MainToolWindow(self)
             root = QVBoxLayout(self.tool_window.ui_area)
-            root.setContentsMargins(12, 12, 12, 10)
-            root.setSpacing(6)
+            root.setContentsMargins(10, 10, 10, 8)
+            root.setSpacing(5)
 
-            def emphasis(widget, larger=False):
+            def emphasis(widget):
                 font = widget.font()
                 font.setWeight(QFont.Weight.DemiBold)
-                if larger:
-                    font.setPointSizeF(max(12., font.pointSizeF() + 2))
                 widget.setFont(font)
 
             def secondary(widget):
@@ -2478,65 +2473,36 @@ def create_browser(session):
                 palette.setColor(QPalette.ColorRole.WindowText, color)
                 widget.setPalette(palette)
 
-            heading = QHBoxLayout()
-            title = QLabel('Ligand Search')
-            emphasis(title, larger=True)
-            heading.addWidget(title)
-            heading.addStretch(1)
-            root.addLayout(heading)
-            instruction = QLabel('Pick a density blob, choose compounds, then search.')
-            instruction.setWordWrap(True)
-            secondary(instruction)
-            root.addWidget(instruction)
+            toolbar = QHBoxLayout()
+            root.addLayout(toolbar)
+            self.options_button = QToolButton()
+            self.options_button.setText('Search options...')
+            self.library_button = QToolButton()
+            self.library_button.setText('Library')
+            self.library_button.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
+            toolbar.addWidget(self.options_button)
+            toolbar.addWidget(self.library_button)
+            toolbar.addStretch(1)
+            setup = QGridLayout()
+            setup.setHorizontalSpacing(8)
+            setup.setVerticalSpacing(4)
+            setup.setColumnStretch(1, 1)
+            root.addLayout(setup)
             self.progress = QProgressBar()
             self.progress.setTextVisible(False)
             self.progress.setRange(0, 1)
             self.progress.setValue(0)
             self.progress.setFixedHeight(5)
             root.addWidget(self.progress)
-            self.settings_scroll = QScrollArea()
-            self.settings_scroll.setWidgetResizable(True)
-            self.settings_scroll.setMinimumHeight(80)
-            self.settings_scroll.setFrameShape(self.settings_scroll.Shape.NoFrame)
-            settings = QWidget()
-            settings_layout = QVBoxLayout(settings)
-            settings_layout.setContentsMargins(0, 0, 4, 0)
-            settings_layout.setSpacing(3)
-            self.sections = {}
-            def section(title, expanded=False):
-                container = QWidget()
-                layout = QVBoxLayout(container)
-                layout.setContentsMargins(0, 0, 0, 0)
-                button, body = QToolButton(), QWidget()
-                button.setText(title)
-                emphasis(button)
-                button.setAutoRaise(True)
-                button.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
-                button.setStyleSheet('QToolButton { text-align: left; border: none; padding: 5px 0; } '
-                                    'QToolButton:hover { background: palette(alternate-base); }')
-                button.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
-                button.setCheckable(True)
-                button.setChecked(expanded)
-                def toggle(checked):
-                    body.setVisible(checked)
-                    button.setArrowType(Qt.ArrowType.DownArrow if checked else Qt.ArrowType.RightArrow)
-                button.toggled.connect(toggle)
-                layout.addWidget(button)
-                layout.addWidget(body)
-                toggle(expanded)
-                content = QVBoxLayout(body)
-                content.setContentsMargins(14, 3, 0, 10)
-                content.setSpacing(7)
-                self.sections[title] = (button, body)
-                settings_layout.addWidget(container)
-                return content
-            blob_layout = section('Density and blob', True)
-            group_layout = section('Chemical filters', True)
-            search_layout = section('Search options')
-            library_layout = section('Library')
-            notes_layout = section('Search notes')
-            settings_layout.addStretch(1)
-            self.settings_scroll.setWidget(settings)
+            def auxiliary_dialog(title):
+                dialog = QDialog(self.tool_window.ui_area)
+                dialog.setWindowTitle(title)
+                layout = QVBoxLayout(dialog)
+                close = QDialogButtonBox(QDialogButtonBox.StandardButton.Close)
+                close.rejected.connect(dialog.close)
+                layout.addWidget(close)
+                return dialog, layout
+
             def form_layout(layout):
                 form = QFormLayout()
                 form.setRowWrapPolicy(QFormLayout.RowWrapPolicy.WrapLongRows)
@@ -2544,30 +2510,57 @@ def create_browser(session):
                 form.setLabelAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
                 form.setHorizontalSpacing(12)
                 form.setVerticalSpacing(7)
-                layout.addLayout(form)
+                layout.insertLayout(0, form)
                 return form
-            map_form = form_layout(blob_layout)
-            form = form_layout(blob_layout)
-            group_form = form_layout(group_layout)
-            search_form = form_layout(search_layout)
+            self.options_dialog, options_layout = auxiliary_dialog('Ligand Search Options')
+            self.options_button.clicked.connect(self.options_dialog.show)
+            search_form = form_layout(options_layout)
+            self.library_dialog, library_layout = auxiliary_dialog('Ligand Library Status and Cache')
             library_form = form_layout(library_layout)
-            self.summary = QLabel('Search CCD compounds and optional ChEBI metabolites against the selected blob. '
-                                  'Density fit suggests candidates; it does not establish chemical identity. No receptor clash filtering.')
+            self.summary = QLabel('Density fit suggests candidates; it does not establish chemical identity. '
+                                  'No receptor clash filtering.')
             self.summary.setWordWrap(True)
-            notes_layout.addWidget(self.summary)
+            notes = QScrollArea()
+            notes.setFrameShape(QScrollArea.Shape.NoFrame)
+            notes.setWidgetResizable(True)
+            notes.setFixedHeight(72)
+            notes.setWidget(self.summary)
+            options_layout.insertWidget(1, notes)
+
+            def setup_row(row, title, field, trailing=None):
+                label = QLabel(title)
+                label.setBuddy(field)
+                setup.addWidget(label, row, 0)
+                setup.addWidget(field, row, 1, 1, 2 if trailing is None else 1)
+                if trailing is not None:
+                    setup.addWidget(trailing, row, 2)
+                return label
+
             self.maps = EntryComboBox()
             self.maps.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
-            self.maps.setMinimumContentsLength(18)
+            self.maps.setMinimumContentsLength(10)
             self.maps.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
             self.maps.currentIndexChanged.connect(self.map_changed)
-            map_form.addRow('Density map', self.maps)
+            self.pick = QPushButton('Pick blob')
+            self.pick.setToolTip('Then click the density surface in the graphics window.')
+            self.pick.clicked.connect(self.begin_pick)
+            setup_row(0, 'Density map', self.maps, self.pick)
             self.resolution = EntryDoubleSpinBox()
             self.resolution.setRange(.5, 20.)
             self.resolution.setDecimals(2)
             self.resolution.setValue(2.6)
             self.resolution.setSuffix(' A')
             self.resolution.setToolTip('Approximate local map resolution, in Angstroms.')
-            form.addRow('Resolution', self.resolution)
+            self.location = QLabel('No blob picked')
+            secondary(self.location)
+            resolution_row = QHBoxLayout()
+            resolution_row.setSpacing(8)
+            resolution_row.addWidget(self.resolution)
+            resolution_row.addWidget(self.location, 1)
+            resolution_label = QLabel('Resolution')
+            resolution_label.setBuddy(self.resolution)
+            setup.addWidget(resolution_label, 1, 0)
+            setup.addLayout(resolution_row, 1, 1, 1, 2)
             self.top = EntrySpinBox()
             self.top.setRange(1, 100)
             self.top.setValue(20)
@@ -2579,19 +2572,23 @@ def create_browser(session):
             search_form.addRow('CPU workers', self.workers)
             self.codes = QLineEdit()
             self.codes.setPlaceholderText('All entries, or ATP,ADP,CHEBI:15422')
+            search_form.addRow('Compound IDs', self.codes)
             self.sources = EntryComboBox()
             self.sources.addItem('CCD', 'ccd')
             self.sources.addItem('CCD + ChEBI metabolites', 'ccd_chebi')
             self.sources.addItem('Single ligand (SMILES)', 'smiles')
-            self.sources.setToolTip('Optional expansion with ChEBI metabolites that have usable PubChem3D conformers. '
+            self.sources.setCurrentIndex(self.sources.findData(DEFAULT_LIBRARY_SOURCE))
+            self.sources.setToolTip('CCD + ChEBI adds metabolites that have usable PubChem3D conformers. '
                                     'Exact CCD matches reuse existing coordinates; duplicates are tested once.')
-            group_form.addRow('Compound library', self.sources)
+            setup_row(2, 'Compounds', self.sources)
             self.smiles = QLineEdit()
             self.smiles.setPlaceholderText('Enter a SMILES string')
             self.smiles.setMaxLength(2048)
             self.smiles.setToolTip('Uses ChimeraX\'s built-in online SMILES converter. Only the string is sent; '
                                    'do not enter confidential structures.')
-            group_form.addRow('SMILES (online)', self.smiles)
+            smiles_label = setup_row(3, 'SMILES (online)', self.smiles)
+            smiles_label.hide()
+            self.smiles.hide()
             self.library = QLineEdit(str(default_cache()))
             library_form.addRow('Cache folder', self.library)
             self.group_button = QPushButton()
@@ -2614,29 +2611,26 @@ def create_browser(session):
             self.group_button.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
             self.group_button.setMinimumWidth(1)
             self.group_button.setStyleSheet('QPushButton { text-align: left; padding: 3px 22px 3px 7px; }')
-            group_form.addRow('Chemical groups', self.group_button)
             self.group_match = EntryComboBox()
-            self.group_match.addItem('Any group (OR)', 'any')
-            self.group_match.addItem('Every group (AND)', 'all')
+            self.group_match.addItem('Any (OR)', 'any')
+            self.group_match.addItem('All (AND)', 'all')
+            self.group_match.setAccessibleName('Match groups')
             self.group_match.setToolTip('AND requires every selected chemical family/class/role; OR accepts any one.')
             self.group_match.currentIndexChanged.connect(lambda *_: self.set_groups(self.selected_groups()))
-            group_form.addRow('Match groups', self.group_match)
-            group_form.addRow('Compound IDs', self.codes)
+            groups_label = setup_row(4, 'Chemical groups', self.group_button, self.group_match)
             def source_changed():
                 single = self.sources.currentData() == 'smiles'
-                group_form.setRowVisible(self.smiles, single)
-                for widget in (self.group_button, self.group_match, self.codes):
-                    group_form.setRowVisible(widget, not single)
+                for widget in (smiles_label, self.smiles):
+                    widget.setVisible(single)
+                for widget in (groups_label, self.group_button, self.group_match):
+                    widget.setVisible(not single)
+                search_form.setRowVisible(self.codes, not single)
                 self.set_busy(self.job is not None)
                 self.refresh_group_counts()
-            group_form.setRowVisible(self.smiles, False)
             self.sources.currentIndexChanged.connect(source_changed)
             self.group_coverage = QLabel()
             self.group_coverage.setWordWrap(True)
-            library_layout.addWidget(self.group_coverage)
-            self.group_update = QPushButton('Update chemical groups')
-            self.group_update.clicked.connect(self.start_groups)
-            library_layout.addWidget(self.group_update)
+            library_layout.insertWidget(1, self.group_coverage)
             self.library.editingFinished.connect(self.refresh_group_counts)
             self.fast = QCheckBox('Fast screening')
             self.fast.setToolTip('Tests the same CCD entries with fewer orientation starts and refinement samples. '
@@ -2651,13 +2645,10 @@ def create_browser(session):
             self.conformers = EntrySpinBox()
             self.conformers.setRange(2, MAX_CONFORMERS)
             self.conformers.setValue(DEFAULT_CONFORMERS)
-            self.conformers.setToolTip('Maximum total per CCD entry, including selected ideal/observed conformers. '
+            self.conformers.setToolTip('Maximum total per ligand, including its starting conformers. '
                                        'Rigid ligands or rejected/duplicate rotations may yield fewer.')
-            self.conformers_label = QLabel('Search conformers')
+            self.conformers_label = QLabel(f'Search conformers (max {MAX_CONFORMERS})')
             search_form.addRow(self.conformers_label, self.conformers)
-            self.observed = QCheckBox('Also try CCD observed conformer')
-            self.observed.setToolTip('Adds the CCD example structure, not your bound ligand pose. Slower.')
-            search_form.addRow(self.observed)
             self.torsions.toggled.connect(self.update_conformer_controls)
             self.refine = QCheckBox('Final torsion search on top hits')
             self.refine.setToolTip('After screening, sample larger torsion changes from each shortlisted fitted '
@@ -2669,7 +2660,7 @@ def create_browser(session):
             self.refine_conformers.setValue(FINAL_CONFORMERS)
             self.refine_conformers.setToolTip('Final-pass cap per shortlisted hit, including its starting conformation. '
                                               'Fewer variants may survive chemical restrictions and deduplication.')
-            self.refine_conformers_label = QLabel('Final conformers')
+            self.refine_conformers_label = QLabel(f'Final conformers (max {MAX_FINAL_CONFORMERS})')
             search_form.addRow(self.refine_conformers_label, self.refine_conformers)
             self.refine.toggled.connect(self.update_conformer_controls)
             self.frequency = QCheckBox('Use PDB frequency for search order')
@@ -2677,63 +2668,41 @@ def create_browser(session):
             self.frequency.setToolTip('Common components get a capped priority boost. All components remain eligible; '
                                       'frequency does not affect density scores or the final ranking.')
             search_form.addRow(self.frequency)
-            location = QHBoxLayout()
-            self.pick = QPushButton('Pick blob')
-            self.pick.clicked.connect(self.begin_pick)
-            location.addWidget(self.pick)
-            self.location = QLabel('Pick a blob in the map to enable search.')
-            self.location.setWordWrap(True)
-            secondary(self.location)
-            blob_layout.insertLayout(1, location)
-            blob_layout.insertWidget(2, self.location)
-            self.start_button, self.stop_button, self.update_button = (
-                QPushButton('Start search'), QPushButton('Stop'), QPushButton('Expand/Update CCD library'))
+            self.start_button, self.stop_button = QPushButton('Start search'), QToolButton()
+            self.stop_button.setText('Stop')
             emphasis(self.start_button)
             self.start_button.setAutoDefault(False)
-            self.stop_button.setAutoDefault(False)
             self.start_button.clicked.connect(self.start_search)
             self.stop_button.clicked.connect(self.stop)
-            self.update_button.clicked.connect(lambda: self.start_library())
             for button in (self.start_button, self.stop_button):
-                heading.addWidget(button)
-            library_layout.addWidget(self.update_button)
-            self.chebi_update = QPushButton('Expand/Update ChEBI metabolites')
-            self.chebi_update.clicked.connect(self.start_chebi)
-            library_layout.addWidget(self.chebi_update)
-            self.install_button = QPushButton('Install library archive...')
-            self.install_button.setToolTip('Install a prebuilt combined library into an empty cache folder; '
+                toolbar.addWidget(button)
+            library_menu = QMenu(self.library_button)
+            self.library_button.setMenu(library_menu)
+            self.library_button.setMinimumWidth(self.library_button.sizeHint().width() + 8)
+            library_menu.addAction('Library status and cache...', self.library_dialog.show)
+            library_menu.addSeparator()
+            self.update_library_action = library_menu.addAction('Expand/Update CCD library', lambda: self.start_library())
+            self.chebi_update = library_menu.addAction('Expand/Update ChEBI metabolites', self.start_chebi)
+            self.group_update = library_menu.addAction('Update chemical groups', self.start_groups)
+            self.install_action = library_menu.addAction('Install library archive...', self.install_archive)
+            self.install_action.setToolTip('Install a prebuilt combined library into an empty cache folder; '
                                            'existing libraries and active downloads are never overwritten.')
-            self.install_button.clicked.connect(self.install_archive)
-            library_layout.addWidget(self.install_button)
             self.chebi_status = QLabel()
             self.chebi_status.setWordWrap(True)
-            library_layout.addWidget(self.chebi_status)
-            # Align form labels across sections, but never stretch numeric inputs
-            # to the full window width. Sizes follow the application's font.
-            labels = [form_.itemAt(row, QFormLayout.ItemRole.LabelRole).widget()
-                      for form_ in (map_form, form, group_form, search_form, library_form) for row in range(form_.rowCount())
-                      if form_.itemAt(row, QFormLayout.ItemRole.LabelRole) is not None]
-            label_width = max(label.sizeHint().width() for label in labels) + 4
-            field_width = self.tool_window.ui_area.fontMetrics().horizontalAdvance('0000.00000000') + 42
-            for label in labels:
-                label.setMinimumWidth(label_width)
+            library_layout.insertWidget(2, self.chebi_status)
+            self.library_dialog.resize(430, self.library_dialog.sizeHint().height())
+            field_width = self.tool_window.ui_area.fontMetrics().horizontalAdvance('000.00 A') + 33
             for field in (self.resolution, self.top, self.workers,
                           self.conformers, self.refine_conformers):
-                field.setFixedWidth(field_width)
+                field.setFixedWidth(max(field.sizeHint().width(), field_width))
                 field.setAlignment(Qt.AlignmentFlag.AlignRight)
                 field.setKeyboardTracking(False)
-            for widget in (self.codes, self.smiles, self.library, self.group_match, self.sources):
+            for widget in (self.codes, self.smiles, self.library, self.sources):
                 widget.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
-            self.splitter = QSplitter(Qt.Orientation.Vertical)
-            self.splitter.addWidget(self.settings_scroll)
-            self.splitter.setChildrenCollapsible(False)
             results = QWidget()
             results_layout = QVBoxLayout(results)
             results_layout.setContentsMargins(0, 0, 0, 0)
-            self.splitter.addWidget(results)
-            self.splitter.setStretchFactor(0, 0)
-            self.splitter.setStretchFactor(1, 1)
-            root.addWidget(self.splitter, 1)
+            root.addWidget(results, 1)
             self.table = HitTable(0, 8)
             self.table.setMinimumHeight(120)
             self.table.setHorizontalHeaderLabels(('ID', 'Compound', 'Score', 'CC', 'Blob %', 'Atom %', 'Size', 'PDB'))
@@ -2816,12 +2785,11 @@ def create_browser(session):
             # Long filenames/chemical names must scroll or wrap, not impose a
             # window-wide minimum. Keep the result table's minimum height intact.
             for widget in (self.summary, self.details, self.hit_title, self.group_coverage,
-                           self.result_scope, self.status, self.location, instruction):
+                           self.chebi_status, self.result_scope, self.status, self.location):
                 policy = widget.sizePolicy()
                 policy.setHorizontalPolicy(QSizePolicy.Policy.Ignored)
                 widget.setSizePolicy(policy)
                 widget.setMinimumWidth(0)
-            self.splitter.setSizes([330, 350])
             self.timer = QTimer(self.tool_window.ui_area)
             self.timer.setInterval(200)
             self.timer.timeout.connect(self.poll)
@@ -2834,7 +2802,7 @@ def create_browser(session):
 
         def set_busy(self, busy):
             single = self.sources.currentData() == 'smiles'
-            for widget in (self.start_button, self.update_button, self.install_button, self.resolution,
+            for widget in (self.update_library_action, self.install_action, self.resolution,
                            self.top, self.workers, self.fast, self.torsions, self.refine, self.frequency,
                            self.codes, self.smiles, self.library, self.maps, self.pick, self.sources):
                 widget.setEnabled(not busy)
@@ -2859,7 +2827,6 @@ def create_browser(session):
             enabled = self.torsions.isEnabled() and self.torsions.isChecked()
             for widget in (self.conformers_label, self.conformers):
                 widget.setEnabled(enabled)
-            self.observed.setEnabled(enabled and self.sources.currentData() != 'smiles')
             enabled = self.refine.isEnabled() and self.refine.isChecked()
             for widget in (self.refine_conformers_label, self.refine_conformers):
                 widget.setEnabled(enabled)
@@ -2895,7 +2862,7 @@ def create_browser(session):
             from Qt.QtWidgets import QDialog, QDialogButtonBox, QListWidget, QListWidgetItem
 
             if not self.group_labels:
-                self.report_error('Click Update chemical groups first to download the structural classifications.')
+                self.report_error('Choose Library > Update chemical groups first to download the structural classifications.')
                 return
             dialog = QDialog(self.tool_window.ui_area)
             dialog.setWindowTitle('Structural chemical classes')
@@ -2944,7 +2911,12 @@ def create_browser(session):
             try:
                 expansion = chebi_api().info(cache)
                 if current and expansion is not None and self.sources.currentData() == 'ccd_chebi':
-                    counts = chebi_api().group_counts(cache)
+                    versions = tuple((entry.st_ino, entry.st_mtime_ns, entry.st_size)
+                                     for entry in ((cache / name).stat() for name in ('groups.sqlite', 'chebi.sqlite')))
+                    key = (cache, versions)
+                    if self._combined_group_counts[0] != key:
+                        self._combined_group_counts = (key, chebi_api().group_counts(cache))
+                    counts = self._combined_group_counts[1]
                     total = counts['all']
             except (OSError, sqlite3.Error):
                 expansion = None
@@ -2962,7 +2934,7 @@ def create_browser(session):
                 self.group_coverage.setText('Chemical-group tags are ' + ('out of date' if info else 'not downloaded') +
                                             '. Update chemical groups to filter; All compounds remains available.')
             self.group_update.setEnabled(self.job is None and self._has_library)
-            self.chebi_status.setText('ChEBI metabolites: not downloaded (optional).' if expansion is None else
+            self.chebi_status.setText('ChEBI metabolites: not downloaded.' if expansion is None else
                                       f'ChEBI metabolites: {expansion["count"]} cached entries; {expansion.get("state", "partial")}. '
                                       'Update resumes cached downloads. Group counts describe the selected library.')
             self.chebi_update.setEnabled(self.job is None and self._has_library)
@@ -2993,7 +2965,7 @@ def create_browser(session):
             self.picked_surface = None
             self.seed = None
             self.unwatch()
-            self.location.setText('Pick a blob in the map to enable search.')
+            self.location.setText('No blob picked')
             self.start_button.setEnabled(False)
 
         def models_changed(self, name, models):
@@ -3012,7 +2984,7 @@ def create_browser(session):
             self.blob_highlight.clear()
             self.picked_surface = None
             self.seed = None
-            self.location.setText('Pick the blob again before starting a new search.')
+            self.location.setText('Pick the blob again')
             self.start_button.setEnabled(False)
             self.status.setText(text)
 
@@ -3035,7 +3007,7 @@ def create_browser(session):
             self.unwatch()
             self.watched_data = owner.data
             self.watched_data.add_change_callback(self.data_changed)
-            self.location.setText(f'Picked blob in #{owner.id_string}; contour {surface.level:.4g}.')
+            self.location.setText(f'Blob contour: {surface.level:.4g}')
             self.start_button.setEnabled(self.job is None)
             self.status.setText('Blob selected (green). Click Start search.')
 
@@ -3131,7 +3103,7 @@ def create_browser(session):
                 requested_level = float(self.picked_surface.level)
                 config = prepare_blob(model.data, self.seed, self.resolution.value(), requested_level)
                 displayed_changed = self.show_blob_selection(model, config)
-                self.location.setText(f'Picked blob in #{model.id_string}; contour {config["level"]:.4g}.')
+                self.location.setText(f'Blob contour: {config["level"]:.4g}')
                 adjustment = ''
                 if config['level'] > requested_level:
                     adjustment = (f'Blob contour automatically raised from {requested_level:.6g} to '
@@ -3170,8 +3142,8 @@ def create_browser(session):
                     self.status.setText(adjustment)
                 codes = [v.strip().upper() for v in self.codes.text().replace(' ', ',').split(',') if v.strip()] or None
                 self.job = SearchJob(cache, config, 1 if smiles else self.workers.value(),
-                                     not smiles and self.observed.isChecked(), None if smiles else codes,
-                                     not smiles and self.frequency.isChecked(), fast=self.fast.isChecked(),
+                                     observed=not smiles and self.include_observed, ids=None if smiles else codes,
+                                     frequency=not smiles and self.frequency.isChecked(), fast=self.fast.isChecked(),
                                      torsions=self.torsions.isChecked(), conformers=self.conformers.value(), groups=groups,
                                      group_match=self.group_match.currentData(), sources='ccd' if smiles else sources,
                                      refine=self.refine.isChecked(), refine_conformers=self.refine_conformers.value(),
@@ -3547,6 +3519,8 @@ def create_browser(session):
                 return
             self._closed = True
             self.stop()
+            self.options_dialog.close()
+            self.library_dialog.close()
             self.timer.stop()
             self.unwatch()
             self.blob_highlight.clear()
@@ -3561,15 +3535,15 @@ def create_browser(session):
 
 
 def ligand_search(session, map_model=None, resolution=2.6, top=20,
-                  library=None, workers=0, observed=False, codes=None, frequency=True, fast=False,
-                  torsions=False, conformers=DEFAULT_CONFORMERS, groups='all', group_match='any', sources='ccd',
+                  library=None, workers=0, observed=True, codes=None, frequency=True, fast=False,
+                  torsions=False, conformers=DEFAULT_CONFORMERS, groups='all', group_match='any', sources=None,
                   refine=False, refine_conformers=FINAL_CONFORMERS, smiles=None):
     from chimerax.core.errors import UserError
 
     if not session.ui.is_gui:
         raise UserError('ligandsearch is a GUI tool; run it in a graphical ChimeraX session.')
     try:
-        if sources not in ('ccd', 'ccd_chebi'):
+        if sources not in (None, 'ccd', 'ccd_chebi'):
             raise ValueError('sources must be ccd or ccd_chebi')
         validate_conformer_limit(conformers)
         validate_conformer_limit(refine_conformers, MAX_FINAL_CONFORMERS, 'refine_conformers')
@@ -3577,7 +3551,7 @@ def ligand_search(session, map_model=None, resolution=2.6, top=20,
         group_match = parse_group_match(group_match)
         if smiles is not None:
             smiles = validate_smiles(smiles)
-            if codes is not None or groups != ('all',) or sources != 'ccd':
+            if codes is not None or groups != ('all',) or sources not in (None, 'ccd'):
                 raise ValueError('smiles fits one ligand; omit codes, groups and sources.')
     except ValueError as error:
         raise UserError(str(error)) from error
@@ -3598,7 +3572,7 @@ def ligand_search(session, map_model=None, resolution=2.6, top=20,
     browser.resolution.setValue(resolution)
     browser.top.setValue(top)
     browser.workers.setValue(workers)
-    browser.observed.setChecked(observed)
+    browser.include_observed = observed
     browser.frequency.setChecked(frequency)
     browser.fast.setChecked(fast)
     browser.torsions.setChecked(torsions)
@@ -3607,9 +3581,13 @@ def ligand_search(session, map_model=None, resolution=2.6, top=20,
     browser.refine_conformers.setValue(refine_conformers)
     if library is not None:
         browser.library.setText(str(Path(library).expanduser().resolve()))
-    browser.refresh_group_counts()
     browser.group_match.setCurrentIndex(browser.group_match.findData(group_match))
-    browser.sources.setCurrentIndex(browser.sources.findData('smiles' if smiles else sources))
+    source = 'smiles' if smiles else sources or DEFAULT_LIBRARY_SOURCE
+    source_index = browser.sources.findData(source)
+    if browser.sources.currentIndex() == source_index:
+        browser.refresh_group_counts()
+    else:
+        browser.sources.setCurrentIndex(source_index)
     if smiles is not None:
         browser.smiles.setText(smiles)
     browser.set_groups(groups)

@@ -1,6 +1,6 @@
 # Ligand Search
 
-Screen CCD components and optional ChEBI metabolites against an isolated positive-density blob and browse a
+Screen CCD components and ChEBI metabolites against an isolated positive-density blob and browse a
 running shortlist. This experimental tool suggests ligand hypotheses; density
 fit alone does not establish chemical identity.
 
@@ -57,7 +57,7 @@ hit** to resume. Each new search enables live following again.
 | `workers` | `0` | CPU workers; zero chooses automatically, leaving one available core free where possible. |
 | `fast` | `false` | Opt-in fast search: 8 extra orientation starts and up to 1,500 density samples, instead of 24 and 3,000. Same candidate set and final scorer, but poses and rankings may change. |
 | `frequency` | `true` | Combine volume match with PDB occurrence frequency for search ordering. `false` uses volume alone. |
-| `observed` | `false` | Also try the CCD example observed-coordinate conformer. Slower; this is not a comprehensive conformer search. |
+| `observed` | `true` | Try the CCD example observed-coordinate conformer when available and distinct, even without torsion sampling. Use `observed false` to prefer ideal coordinates only. |
 | `torsions` | `false` | Generate a sparse, deterministic set of additional conformers around flexible single bonds. Slower; not exhaustive or energy-minimized. |
 | `conformers` | `8` | Maximum total conformers per CCD entry when `torsions true`, including selected CCD originals. Range 2-32; rigid ligands may yield fewer. |
 | `refine` | `false` | After screening, run a broader sparse torsion search and local rigid fitting on the retained top hits. |
@@ -66,11 +66,11 @@ hit** to resume. Each new search enables live following again.
 | `smiles` | none | Fit one custom ligand using ChimeraX's built-in online SMILES converter, without a library search. Quote the string; omit `codes`, `groups` and `sources`. |
 | `groups` | `all` | Comma-separated chemical-family or role keys. Intersects with `codes` when both are supplied. |
 | `group_match` | `any` | `any` accepts any selected group (OR); `all` requires every selected group (AND). |
-| `sources` | `ccd` | `ccd_chebi` adds cached ChEBI metabolites with validated 3D conformers. |
+| `sources` | `ccd_chebi` | Search both libraries, or use `ccd` to search only CCD. |
 | `library` | ChimeraX download cache | Override the local ligand-library folder. Quote paths containing spaces. |
 
 ```chimerax
-ligandsearch #2 resolution 2.8 top 10 workers 4 fast true frequency true observed false torsions true conformers 8 codes "ATP,ADP,AMP" library "~/Desktop/ligand library"
+ligandsearch #2 resolution 2.8 top 10 workers 4 fast true frequency true torsions true conformers 8 codes "ATP,ADP,AMP" library "~/Desktop/ligand library"
 ```
 
 **Fast screening** is also available as a checkbox in the browser. It does not
@@ -81,7 +81,7 @@ in `fast_search` for each hit.
 
 ## Fit a Single SMILES Ligand
 
-Choose **Single ligand (SMILES)** in **Compound library**, enter a stereospecific
+Choose **Single ligand (SMILES)** in **Compounds**, enter a stereospecific
 SMILES, pick the blob and start the search. Or pass the SMILES on the command line:
 
 ```chimerax
@@ -96,8 +96,8 @@ usual, and the CSV records the input string.
 
 ## Chemical Groups
 
-Choose groups from the browser's **Chemical groups** menu. **Match groups**
-chooses **Any group (OR)** or **Every group (AND)**. For example,
+Choose groups from the browser's **Chemical groups** menu. The adjacent selector
+chooses **Any (OR)** or **All (AND)**. For example,
 select **Organic nitrogen compounds** and **Metabolites**, then choose AND to
 require both. The same choice is available in commands:
 
@@ -138,18 +138,17 @@ the newly selected groups fully: filtering an existing top-hit buffer cannot
 recover compounds that were never tested or retained. Groups still combine by
 the chosen OR/AND rule, including any selected detailed structural classes.
 
-The settings use collapsible **Density and blob**, **Chemical filters**,
-**Search options**, **Library** and **Search notes** sections. Settings scroll
-when space is tight; drag the divider to give more space to settings or results.
-Start/Stop stay outside the scrolling area. Hit details scroll independently,
-so long chemical names do not squeeze the results table down to its header.
+Map picking, resolution, compound source and chemical filters stay above
+**Top Hits**. **Search options...** opens a separate dialog for torsion sampling,
+screening speed, CPU workers, compound IDs and search notes. **Library** contains
+cache, install and update actions. Hit details scroll independently, so long
+chemical names do not squeeze the results table down to its header.
 Compound names appear beside their IDs, ahead of the numeric metrics. Hover
 over truncated names or column headings for full text and explanations. The
 progress bar tracks screening and the final torsion pass. Hit actions are enabled
 only when applicable; CSV export still permits stale results, marked as such.
 Entry fields ignore wheel/trackpad scrolling, including while focused. Click the
-arrows, type a value, or explicitly open a dropdown to change it; scrolling over
-closed controls scrolls the settings pane instead.
+arrows, type a value, or explicitly open a dropdown to change it.
 
 ## Library Download
 
@@ -157,14 +156,14 @@ On the first library search, Ligand Search downloads and verifies the
 [combined library](https://github.com/olibclarke/chimerax-trimmings/releases/tag/ligands-chebi257)
 (61 MB download, 275 MB installed). It includes 51,155 CCD components and
 14,888 additional ChEBI metabolites, plus chemical groups and PDB occurrence
-counts. Searches work offline after installation. CCD is the default search
-scope; choose **CCD + ChEBI metabolites** to include the additional compounds.
+counts. Searches work offline after installation. **CCD + ChEBI metabolites**
+is the default. Choose **CCD** to restrict the search to the CCD.
 
 The library is stored in `LigandSearch` inside ChimeraX's configured download
 cache (typically `~/Downloads/ChimeraX/LigandSearch` on macOS). Existing caches
 are reused and are never replaced by the prebuilt archive. To install the
-combined library alongside an older cache, choose a new **Cache folder** in
-**Library**, or pass `library` when opening the tool.
+combined library alongside an older cache, set a new **Cache folder** under
+**Library → Library status and cache...**, or pass `library` when opening the tool.
 
 **Library → Install library archive...** installs a completed combined-library
 archive into an empty cache folder. Use this if automatic download is blocked
@@ -206,14 +205,14 @@ Python packages are needed in ChimeraX, and fitting/searching uses the local cac
 
 ## ChEBI Metabolites
 
-Choose **CCD + ChEBI metabolites** under **Compound library**, or:
+With **CCD + ChEBI metabolites** selected (the default), try:
 
 ```chimerax
-ligandsearch #2 resolution 2.6 sources ccd_chebi groups metabolites
-ligandsearch #2 sources ccd_chebi groups "organic_nitrogen,metabolites" group_match all
+ligandsearch #2 resolution 2.6 groups metabolites
+ligandsearch #2 groups "organic_nitrogen,metabolites" group_match all
 ```
 
-The optional expansion uses defined molecules with a ChEBI metabolite-role
+The expansion uses defined molecules with a ChEBI metabolite-role
 annotation, including inherited annotations. Exact identity matches reuse CCD
 coordinates and appear only once. Additional compounds use PubChem3D conformers;
 2D records, changed stereochemistry/charge states and disconnected salts are not
@@ -221,10 +220,11 @@ silently substituted. Molecules without usable 3D coordinates are reported as
 unavailable, not included as unvalidated structures. No RDKit or Open Babel is
 needed.
 
-No separate ChEBI download is needed with the combined archive. For an older
-CCD-only cache, **Library → Expand/Update ChEBI metabolites** builds the expansion
-in place; this can take a long time. **Stop** preserves completed entries and
-updating again resumes the build. Searches can use a partial cache, with a warning.
+No separate ChEBI download is needed with the combined archive. With an older
+CCD-only cache, choose **CCD** for an immediate search, install the combined
+archive in a new cache, or use **Library → Expand/Update ChEBI metabolites** to
+build the expansion in place. **Stop** preserves completed entries so the build
+can resume. Searches can use a partial cache, with a warning.
 
 Both sources share the volume/PDB-frequency queue and density scorer; candidates
 are not prioritized merely because their coordinates came from CCD. Group
@@ -239,13 +239,13 @@ map or fitted coordinates to ChEBI, RCSB or PubChem.
 ## Sparse Conformers
 
 Enable **Sample torsions during screening** in the browser, or use `torsions true`.
-The browser enables **Search conformers** and the observed-coordinate
-conformer checkbox only while sparse torsion sampling is selected and no job
-is running.
+The browser enables **Search conformers (max 32)** only while sparse torsion
+sampling is selected and no job is running.
 
-The default cap is eight total conformers per ligand, including the original
-ideal conformer and, with `observed true`, the selected CCD observed conformer.
-Originals are retained; the library is not modified and needs no rebuild.
+CCD screening tries the ideal conformer and a distinct observed conformer when
+available, with or without torsion sampling. The default sampling cap is eight
+total conformers per ligand, including these originals. The library is not
+modified and needs no rebuild.
 
 Additional conformers apply a few reproducible single-bond rotations, including
 combinations of up to three torsions. Ring bonds, terminal heavy-atom bonds,
@@ -264,7 +264,8 @@ ligands, and more conformers can also increase the opportunity to fit noise.
 
 ### Final Top-Hit Search
 
-Enable **Final torsion search on top hits**, or use:
+Enable **Final torsion search on top hits** and set **Final conformers (max 256)**,
+or use:
 
 ```chimerax
 ligandsearch #2 fast true refine true refine_conformers 64 top 20
