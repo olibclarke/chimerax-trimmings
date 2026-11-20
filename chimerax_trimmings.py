@@ -1438,6 +1438,10 @@ _SHAPE_MAP_BEAM = 48  # Preserve competing sites/orientations between scales.
 _SHAPE_COMPACT_GRADIENT_ORIENTATIONS = 48  # In addition to the native PCA starts.
 _SHAPE_COMPACT_GRADIENT_FFT_SEEDS = 24
 _SHAPE_COMPACT_GRADIENT_FINAL_STARTS = 16
+_SHAPE_RETRY_COARSE_BANDS = ((9., 4.5), (13., 6.5))  # (coarse, fine), in Angstroms.
+_SHAPE_RETRY_MIN_FINE_SCORE = .05
+_SHAPE_RETRY_COARSE_MIN_SCORE = .50
+_SHAPE_RETRY_COARSE_MAX_POSES = 3
 _SHAPE_GRADIENT_JITTERS_PER_POSE = 3
 _SHAPE_GRADIENT_JITTER_FRACTIONS = (.10, .30)
 _SHAPE_SUBMAP_FITS = 4  # Finish several fits per submap before comparing submaps.
@@ -4731,6 +4735,36 @@ def _shape_gradient_jitter_seeds(source, target, center, radius_search, fitted_p
             for offset in shifts if np.linalg.norm((pose * source.center) + offset - cofr) <= radius_search]
 
 
+def _shape_retry_coarse_poses(source, reference, candidates, cutoff, maximum):
+    """Confirm a weak fine-band fit on two coarser scales, without refitting."""
+    from math import isfinite
+    from chimerax.geometry import translation
+
+    middle, coarse = _SHAPE_RETRY_COARSE_BANDS
+    if any(_shape_band_grid_voxels(source, *band) > _MAX_GRID_VOXELS for band in (middle, coarse)):
+        return None
+    probes = source.frame_landmarks
+    probes = probes[::max(1, (len(probes) + 63) // 64)] + source.center
+    shortlist = _shape_keep_map_poses(candidates, probes, .5, maximum=_SHAPE_RETRY_COARSE_MAX_POSES)
+    model_frame = translation(source.center)
+    mid_judge = _ShapeBandScorer(source, *middle, maximum)
+    coarse_judge = None
+    best = None
+    for candidate in shortlist:
+        _shape_checkpoint()
+        pose = candidate[1] * model_frame
+        mid_score = mid_judge.score(reference, pose)
+        if not isfinite(mid_score) or mid_score < cutoff:
+            continue
+        if coarse_judge is None:
+            coarse_judge = _ShapeBandScorer(source, *coarse, maximum)
+        coarse_score = coarse_judge.score(reference, pose)
+        if (isfinite(coarse_score) and coarse_score >= max(cutoff, _SHAPE_RETRY_COARSE_MIN_SCORE)
+                and (best is None or coarse_score > best[1][1])):
+            best = candidate, (mid_score, coarse_score)
+    return best
+
+
 def _fit_shape_with_gradient_retry(source, target, options, center, levels):
     from math import isfinite
     from types import SimpleNamespace
@@ -4745,52 +4779,86 @@ def _fit_shape_with_gradient_retry(source, target, options, center, levels):
                                 peak=target.peak, model=target.model)
     fine = max(3., 2 * max(data.step), options["retry_map_resolution"] or 0., options["resolution"] or 0.)
     coarse = 2 * fine
-    judge = _ShapeBandScorer(source, coarse, fine, min(5000, options["max_points"]))
+    maximum = min(5000, options["max_points"])
+    judge = _ShapeBandScorer(source, coarse, fine, maximum)
     model_frame = translation(source.center)
     cutoff = options["retry_cutoff"]
     scores = {}
     native_winners = {}
+    coarse_candidates = []
+    auto_coarse = options["retry_map_resolution"] is None and fine < _SHAPE_RETRY_COARSE_BANDS[0][1]
+    center_in_map = target.model.scene_position.inverse() * center
+
+    def in_search_sphere(pose):
+        return np.linalg.norm(pose * source.center - center_in_map) <= options["radius_search"]
 
     def band_score(pose, in_sphere=False):
-        if in_sphere:
-            center_in_map = target.model.scene_position.inverse() * center
-            if np.linalg.norm(pose * source.center - center_in_map) > options["radius_search"]:
-                return None
+        if in_sphere and not in_search_sphere(pose):
+            return None
         score = judge.score(reference, pose * model_frame)
         return score if isfinite(score) else None
 
     def passed(score):
         return score is not None and score >= cutoff
 
+    def keep_for_coarse(pose, score, native_score, stats):
+        if (score is not None and _SHAPE_RETRY_MIN_FINE_SCORE <= score < cutoff
+                and in_search_sphere(pose)):
+            coarse_candidates.append((score, pose, native_score, stats))
+
     def search(objective, search_levels, compact=False, seeds=None, key=None):
         key = objective if key is None else key
-        collect = objective == "gradient"
         try:
             pose, stats = _fit_shape_original_map_search(
                 source, target, dict(options, objective=objective), center,
-                shared_levels=search_levels, compact_gradient=compact, collect=collect,
+                shared_levels=search_levels, compact_gradient=compact, collect=True,
                 seed_poses=seeds)
         except _ShapeEmptyMapSearch:
             scores[key] = None
             return None
         native_winners[key] = pose
+        native_fit_score = stats["score"]
         score = band_score(pose, in_sphere=seeds is not None)
         candidates = stats.pop("candidates", ())
-        if collect and not passed(score):
-            # The native gradient rank and the local validation rank can
-            # disagree. Check the retained shortlist without another search.
-            for candidate in candidates[1:_SHAPE_COMPACT_GRADIENT_FINAL_STARTS]:
-                _shape_checkpoint()
-                alternative = Place(matrix=np.asarray(candidate["matrix"], dtype=float))
-                value = band_score(alternative, in_sphere=seeds is not None)
-                if value is not None and (score is None or value > score):
-                    pose, score = alternative, value
-                    stats["score"] = candidate["fit_score"]
+        if objective == "density" and score is not None and .05 <= score < cutoff:
+            # A strong whole-density fit at a coarse final scale can lack
+            # fine-band signal. Validate that same pose before restarting;
+            # don't let a broader band promote a weak native placement.
+            native_resolution = stats["resolutions"][-1]
+            coarse_fine = min(8., 1.15 * native_resolution)
+            if (options["retry_map_resolution"] is None and options["resolution"] is None and
+                    native_resolution >= 5. and coarse_fine > fine and native_fit_score >= .55):
+                coarse_judge = _ShapeBandScorer(source, 2 * coarse_fine, coarse_fine,
+                                               maximum)
+                value = coarse_judge.score(reference, native_winners[key] * model_frame)
+                if isfinite(value):
+                    scores["density_coarse"] = value
+                    if value >= max(cutoff, .33):
+                        stats["retry_validation_band"] = (2 * coarse_fine, coarse_fine)
+                        scores[key] = value
+                        return pose, stats
+        save_candidates = auto_coarse and seeds is None and not passed(score)
+        if save_candidates:
+            keep_for_coarse(pose, score, native_fit_score, stats)
+        # Recheck a few distinct alternatives even when the native winner
+        # passes. Keep the larger shortlist for an unsuccessful gradient pass.
+        limit = 3 if objective == "density" or passed(score) else _SHAPE_COMPACT_GRADIENT_FINAL_STARTS
+        for candidate in candidates[1:limit]:
+            _shape_checkpoint()
+            alternative = Place(matrix=np.asarray(candidate["matrix"], dtype=float))
+            value = band_score(alternative, in_sphere=seeds is not None)
+            if save_candidates:
+                keep_for_coarse(alternative, value, candidate["fit_score"], stats)
+            margin = .01 if passed(score) else 0.
+            if value is not None and (score is None or value > score + margin):
+                pose, score = alternative, value
+                stats["score"] = candidate["fit_score"]
         scores[key] = score
         return pose, stats
 
     density = search("density", levels)
     gradient = None
+    coarse_fit = None
     logger = source.model.session.logger
     retry_schedule = None
     gradient_key = "gradient"
@@ -4813,7 +4881,10 @@ def _fit_shape_with_gradient_retry(source, target, options, center, levels):
                             "using the standard gradient search on the same region.")
             logger.status("Shape alignment: weak density fit; retrying with standard gradient.")
         gradient = search("gradient", retry_levels, compact)
-        if not passed(scores["gradient"]):
+        if not passed(scores["gradient"]) and coarse_candidates:
+            logger.status("Shape alignment: checking the strongest poses in two coarser bands.")
+            coarse_fit = _shape_retry_coarse_poses(source, reference, coarse_candidates, cutoff, maximum)
+        if not passed(scores["gradient"]) and coarse_fit is None:
             # Keep the ROI fixed. A new start can escape a local minimum
             # without the cost of searching all translations again.
             jitter_levels = retry_levels[-2:]
@@ -4837,28 +4908,44 @@ def _fit_shape_with_gradient_retry(source, target, options, center, levels):
     if "jittered_gradient" in scores:
         comparison += f", displaced starts {describe('jittered_gradient')}"
     passed_gradient = passed(scores.get(gradient_key))
-    if passed_gradient:
+    if coarse_fit is not None:
+        (_, pose, native_score, fit_stats), coarse_scores = coarse_fit
+        scores["coarse_fallback"] = validation_score = coarse_scores[-1]
+        stats = dict(fit_stats, score=native_score, retry_validation_band=_SHAPE_RETRY_COARSE_BANDS[-1],
+                     retry_coarse_bands=_SHAPE_RETRY_COARSE_BANDS, retry_coarse_scores=coarse_scores)
+    elif passed_gradient:
         pose, stats = gradient
+        validation_score = scores[gradient_key]
     elif passed(scores["density"]):
         pose, stats = density
+        validation_score = scores["density"]
     else:
         raise UserError(f"Weak regional fit ({comparison}; cutoff {cutoff:g}, {fine:g}-{coarse:g} A band). "
                         "Model unchanged. Try placing CoFR on the intended site and using a smaller "
                         "radius_search; for lower-resolution density, supply map_resolution in Angstroms.")
     if options["retry_explicit"]:
-        stats.update(fit_score=stats["score"], score=scores[gradient_key if passed_gradient else "density"],
+        stats.update(fit_score=stats["score"], score=validation_score,
                      score_metric="model-local bandpass correlation")
-    elif passed_gradient:
+    elif stats["objective"] == "gradient":
         stats["score_metric"] = "whole gradient correlation"
+    validation_coarse, validation_fine = stats.get("retry_validation_band", (coarse, fine))
     stats.update(gradient_retry_attempted="gradient" in scores, retry_scores=scores,
-                 retry_cutoff=cutoff, retry_band=(coarse, fine), gradient_retry_schedule=retry_schedule)
+                 retry_cutoff=cutoff, retry_band=(validation_coarse, validation_fine),
+                 gradient_retry_schedule=retry_schedule)
     detail = f" after {retry_schedule} gradient retry" if retry_schedule else ""
-    logger.info(f"Shape alignment retry check ({fine:g}-{coarse:g} A): {comparison}; "
-                f"selected {stats['objective']}{detail}.")
+    if coarse_fit is not None:
+        bands = ', '.join(f"{low:g}-{high:g} A: {score:.3f}"
+                          for (high, low), score in zip(_SHAPE_RETRY_COARSE_BANDS, coarse_scores))
+        logger.info(f"Shape alignment: {comparison} in the {fine:g}-{coarse:g} A band; "
+                    f"accepted {stats['objective']} after coarser checks ({bands}).")
+    else:
+        logger.info(f"Shape alignment retry check ({validation_fine:.3g}-{validation_coarse:.3g} A): {comparison}; "
+                    f"selected {stats['objective']}{detail}.")
     return pose, stats
 
 
 def _fit_shape_density_inputs(source, target, options, center):
+    from math import isfinite
     from chimerax.core.errors import UserError
 
     if options.get("tiled"):
@@ -4945,7 +5032,23 @@ def _fit_shape_original_map_search(source, target, options, center, force_global
         nonlocal last_kept
         for blur in levels[first:]:
             if compact_gradient and blur == levels[-1]:
-                candidates = candidates[:_SHAPE_COMPACT_GRADIENT_FINAL_STARTS]
+                # Reserve a few of the fixed final slots for different
+                # orientations/sites, instead of spending them on one basin.
+                limit = _SHAPE_COMPACT_GRADIENT_FINAL_STARTS
+                head = candidates[:limit - 4]
+                if len(candidates) > limit:
+                    probes = source.frame_landmarks
+                    probes = probes[::max(1, (len(probes) + 63) // 64)]
+                    placed = [pose.transform_points(probes) for pose in head]
+                    for pose in candidates[limit - 4:]:
+                        xyz = pose.transform_points(probes)
+                        if all(np.mean(np.sum((xyz - old)**2, axis=1)) >= blur**2 for old in placed):
+                            head.append(pose)
+                            placed.append(xyz)
+                            if len(head) == limit:
+                                break
+                included = {id(pose) for pose in head}
+                candidates = (head + [pose for pose in candidates if id(pose) not in included])[:limit]
             _shape_map_status(source.model.session.logger,
                               f"Shape alignment: map {objective} at {blur:.3g} A ({len(candidates)} starts)...")
             seed_options = dict(fine_seeds=fine_seeds) if fine_seeds and blur == levels[-1] else {}
@@ -4973,17 +5076,9 @@ def _fit_shape_original_map_search(source, target, options, center, force_global
                     ranked.append((score, pose, fit_score))
             if scorer is not None:
                 ranked.sort(key=lambda row: row[0], reverse=True)
-            candidates, last_kept = [], []
             probes = points[np.linspace(0, len(points) - 1, min(64, len(points)), dtype=int)]
-            for entry in ranked:
-                _, pose, _ = entry
-                if any(np.sqrt(np.mean(np.sum((pose.transform_points(probes) - old.transform_points(probes)) ** 2, axis=1)))
-                       < blur / 3 for old in candidates):
-                    continue
-                candidates.append(pose)
-                last_kept.append(entry)
-                if len(candidates) == 48:
-                    break
+            last_kept = _shape_keep_map_poses(ranked, probes, blur / 3)
+            candidates = [pose for _, pose, _ in last_kept]
             if not last_kept:
                 raise _ShapeEmptyMapSearch()
         return last_kept[0][:2]
@@ -5182,9 +5277,11 @@ def _shape_align_with_map(session, source_item, target_item, options, center, ta
     if stats.get('center_trimmed'):
         extent = ' x '.join(f'{v:.3g}' for v in stats['reference_search_box_extent'])
         region = f'centered {extent} A reference-map search box; input map unchanged.'
+    validation = (f"coarser-band validation {stats['retry_coarse_scores'][-1]:.3f}; "
+                  if 'retry_coarse_scores' in stats else "")
     message = (f"Shape alignment #{model.id_string} ({stats['moving_input_type']}) to "
                f"#{reference.id_string} ({stats['reference_input_type']}): {metric} "
-               f"score {stats['score']:.3f}; " + (f"{len(records)}/{options['copies']} copies; " if multiple else '') +
+               f"score {stats['score']:.3f}; {validation}" + (f"{len(records)}/{options['copies']} copies; " if multiple else '') +
                f"{stats['seconds']:.2f} s; {region}" +
                (" (not moved)" if not options["move"] else ""))
     session.logger.info(message)

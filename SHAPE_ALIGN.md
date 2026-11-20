@@ -149,14 +149,20 @@ This compares the poses using the same model-local bandpass correlation
 (normally 3–6 Å, coarser if required by map sampling or the requested fitting
 resolution). For a lower-resolution region, give its resolution in Å with
 `map_resolution` (for example, `map_resolution 6.5`); this changes the
-comparison band without changing the search. The density pose skips retry if
-it reaches `retry_cutoff` (default `0.30`). The retry starts one scale finer and
+comparison band without changing the search. With automatic resolution, a
+strong whole-density fit at a coarse scale can get a second check in a coarser
+band before retrying. The density pose skips retry if it reaches
+`retry_cutoff` (default `0.30`). The retry starts one scale finer and
 refines fewer candidates. If there is no intermediate scale or the finer FFT
 would exceed the memory limit, it uses the standard gradient search on the
 same region. If the leading gradient pose fails validation, the command
-checks alternative hits it already found, then tries a few reproducible
-translation offsets of 10–30% of the moving model's enclosing radius. These
-start local refinements without moving CoFR or repeating the FFT search.
+checks alternative hits it already found. When `map_resolution` is omitted
+and sampling supports it, a weak fit with some fine-band support can also pass
+by agreeing in both the 4.5–9 and 6.5–13 Å bands. This rechecks up to three
+distinct poses without refitting; the coarsest band requires at least 0.50.
+If those checks fail, the command tries a few reproducible translation offsets
+of 10–30% of the moving model's enclosing radius. These start local refinements
+without moving CoFR or repeating the FFT search.
 If no pose passes the cutoff, the model stays in its starting position.
 Use `gradient_retry false` to skip the retry and its scoring check entirely.
 The cutoff is a heuristic, not a confidence estimate. Other search modes
