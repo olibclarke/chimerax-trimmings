@@ -11077,14 +11077,13 @@ def _structural_pick_item(pick):
     return None
 
 
-def _visible_atom_pick(view, x, y, exclude=None):
+def _visible_atom_pick(view, x, y):
     from chimerax.graphics import PickedTriangle
 
-    options = {} if exclude is None else {"exclude": exclude}
     depth = None
     while True:
         # Inspect each hit so an opaque surface can stop the ray.
-        pick = view.picked_object(x, y, beyond=depth, max_transparent_layers=0, **options)
+        pick = view.picked_object(x, y, beyond=depth, max_transparent_layers=0)
         if pick is None:
             return None
         # A molecular patch reports a PickedAtom but carries its surface triangle.
@@ -11103,127 +11102,34 @@ def _visible_atom_pick(view, x, y, exclude=None):
         depth = pick.distance
 
 
-def _ctrl_drag_pick_exclusion(view):
-    from chimerax.atomic import MolecularSurface
-
-    def transparent_subtree(drawing):
-        if drawing.texture is not None or drawing.multitexture or drawing._transparency() != (False, True):
-            return False
-        # The native ray picker can exclude an entire child subtree. Keep a
-        # molecular surface in the ray test if any of its clip caps can block it.
-        return all(not child.display or (getattr(child, "is_clip_cap", False) and transparent_subtree(child))
-                   for child in drawing.child_drawings())
-
-    skipped = {d for d in view.drawing.all_drawings(displayed_only=True)
-               if isinstance(d, MolecularSurface) and transparent_subtree(d)}
-    if skipped:
-        return lambda drawing: drawing in skipped or not drawing.pickable
-    return None
-
-
-def _visible_atom_box(view, start, end):
-    from chimerax.atomic import Atom, Atoms, Bond, Bonds, Pseudobond, Pseudobonds
+def _atom_box_pick(view, start, end):
+    from chimerax.atomic import Atoms, Bonds, Pseudobonds, concatenate
     from chimerax.atomic.shapedrawing import PickedAtomicShapes
     from chimerax.atomic.structure import PickedAtoms, PickedBonds, PickedPseudobonds, PickedResidues
-    from numpy import concatenate, flatnonzero, linspace
+    from chimerax.core.models import Surface
 
-    camera = view.camera
-    width, height = view.window_size
-    projection = camera.projection_matrix(view.near_far_distances(camera, None), None, (width, height))
-    scene_to_clip = camera.position.inverse().opengl_matrix() @ projection
-    left, right = sorted((start[0], end[0]))
-    top, bottom = sorted((start[1], end[1]))
-    visible = set()
-    exclude = _ctrl_drag_pick_exclusion(view)
+    def exclude(drawing):
+        return not drawing.pickable or isinstance(drawing, Surface)
 
-    def pixels(coords, position):
-        if position is not None:
-            coords = position * coords
-        projected = coords @ scene_to_clip[:3] + scene_to_clip[3]
-        indices = flatnonzero(projected[:, 3] > 0)
-        xy = projected[indices, :2] / projected[indices, 3, None]
-        xy = (xy + (1, -1)) * (width / 2, -height / 2)
-        inside = (left <= xy[:, 0]) & (xy[:, 0] <= right) & (top <= xy[:, 1]) & (xy[:, 1] <= bottom)
-        return indices[inside], xy[inside]
+    atoms, bonds, pseudobonds = [], [], []
+    for pick in view.rectangle_pick(*start, *end, exclude=exclude):
+        if isinstance(pick, PickedAtoms):
+            atoms.append(pick.atoms)
+        elif isinstance(pick, PickedBonds):
+            bonds.append(pick.bonds)
+        elif isinstance(pick, PickedPseudobonds):
+            pseudobonds.append(pick.pseudobonds)
+        elif isinstance(pick, PickedResidues):
+            atoms.append(pick.residues.atoms)
+        elif isinstance(pick, PickedAtomicShapes):
+            atoms.extend(shape.atoms for shape in pick.shapes if shape.atoms)
 
-    def sees(item, xy):
-        return _structural_pick_item(_visible_atom_pick(view, *xy, exclude=exclude)) == item
-
-    def centers(items, coords, drawing):
-        positions = (None,) if drawing is None else drawing.get_scene_positions(displayed_only=True)
-        for position in positions:
-            indices, screen_points = pixels(coords, position)
-            for index, xy in zip(indices, screen_points):
-                item = items[index]
-                if item not in visible and sees(item, xy):
-                    visible.add(item)
-
-    def mesh(item, drawing, triangles):
-        if item in visible or len(triangles) == 0:
-            return
-        vertices = drawing.vertices[triangles]
-        middle = vertices.mean(axis=1)
-        # Test actual drawn geometry, including narrow edge-only selections.
-        near_vertices = .98 * vertices + .02 * middle[:, None, :]
-        samples = concatenate((middle, near_vertices.reshape(-1, 3)))
-        for position in drawing.get_scene_positions(displayed_only=True):
-            _, xy = pixels(samples, position)
-            if len(xy) > 12:
-                xy = xy[linspace(0, len(xy) - 1, 12, dtype=int)]
-            if any(sees(item, point) for point in xy):
-                visible.add(item)
-                return
-
-    options = {} if exclude is None else {"exclude": exclude}
-    for group in view.rectangle_pick(left, top, right, bottom, **options):
-        if isinstance(group, PickedAtoms):
-            for structure, atoms in group.atoms.by_structure:
-                centers(atoms, atoms.coords, structure)
-        elif isinstance(group, PickedBonds):
-            for structure, bonds in group.bonds.by_structure:
-                a, b = bonds.atoms
-                centers(bonds, .5 * (a.coords + b.coords), structure)
-        elif isinstance(group, PickedPseudobonds):
-            for pbg, bonds in group.pseudobonds.by_group:
-                a, b = bonds.atoms
-                if pbg.structure is None:
-                    centers(bonds, .5 * (a.pb_scene_coords + b.pb_scene_coords), None)
-                else:
-                    centers(bonds, .5 * (a.pb_coords + b.pb_coords), pbg)
-        elif isinstance(group, PickedResidues):
-            residues = set(group.residues)
-            if not residues:
-                continue
-            # RibbonDrawing maps tessellated triangle ranges to native residues.
-            drawing = next(iter(residues)).structure._ribbons_drawing
-            if drawing is None:
-                continue
-            for index, first, last, _, _ in drawing._triangle_ranges.copy():
-                residue = drawing._residues[index]
-                if residue in residues:
-                    mesh(residue, drawing, drawing.triangles[first:last])
-        elif isinstance(group, PickedAtomicShapes):
-            drawing = group._drawing
-            for shape in group.shapes:
-                if shape.atoms:
-                    mesh(shape, drawing, drawing.triangles[shape.triangle_range])
-
-    atoms, bonds, pseudobonds = set(), [], []
-    for item in visible:
-        if isinstance(item, Atom):
-            atoms.add(item)
-        elif isinstance(item, Bond):
-            bonds.append(item)
-        elif isinstance(item, Pseudobond):
-            pseudobonds.append(item)
-        else:  # A residue or an atom-backed shape.
-            atoms.update(item.atoms)
-    picks = []
-    for items, collection, pick_type in ((atoms, Atoms, PickedAtoms), (bonds, Bonds, PickedBonds),
-                                         (pseudobonds, Pseudobonds, PickedPseudobonds)):
-        if items:
-            picks.append(pick_type(collection(list(items))))
-    return picks
+    # An atom can be hit by more than one representation or scene instance.
+    # Merge before applying selection so a toggle can't flip it twice.
+    return [pick_type(groups[0] if len(groups) == 1 else concatenate(groups, collection, remove_duplicates=True))
+            for groups, collection, pick_type in ((atoms, Atoms, PickedAtoms), (bonds, Bonds, PickedBonds),
+                                                   (pseudobonds, Pseudobonds, PickedPseudobonds))
+            if groups]
 
 
 def _hide_ctrl_pick_surface_highlights(session):
@@ -11281,7 +11187,7 @@ def _install_atom_selection(session):
             self._undraw_drag_rectangle()
             mode = "toggle" if event.shift_down() else "replace"
             if self._is_drag(event):
-                pick = _visible_atom_box(self.view, self.mouse_down_position, event.position())
+                pick = _atom_box_pick(self.view, self.mouse_down_position, event.position())
             else:
                 pick = _visible_atom_pick(self.view, *event.position())
             MouseMode.mouse_up(self, event)

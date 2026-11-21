@@ -14,11 +14,15 @@ _**Mouse modes:**_
 
 **Ctrl+Alt**-left-click: Picks & colors clicked blob (launches "Measure and Color Blobs" tool).
 
-**Ctrl**-left-click or drag: Selects visible atoms, bonds, cartoon residues, and atom-linked shapes through transparent contours and surfaces. Molecular surface patches are not selection targets, and transparent patches are not highlighted by these picks. Opaque surfaces block picking. Box selection checks visibility at projected atom or bond centers and samples the drawn geometry of cartoons and atom-linked shapes.
+**Ctrl**-left-click: Picks the frontmost atom, bond, cartoon residue, or atom-linked shape through transparent contours and surfaces. Opaque surfaces block the click.
+
+**Ctrl**-left-drag: Uses ChimeraX's native rectangle selection for atoms, bonds, cartoon residues, and atom-linked shapes, including those behind other objects. It respects clipping and does not select maps or surface patches.
+
+Neither gesture highlights transparent molecular surface patches.
 
 **Ctrl+Shift**-left-click or drag: Toggles the same selection.
 
-**Ctrl+Alt+Shift**-left-click: Uses ChimeraX's standard selection to toggle the object under the cursor, including maps and surfaces.
+**Ctrl+Alt+Shift**-left-click or drag: Uses ChimeraX's standard selection to toggle objects, including maps and surfaces.
 
 ### Restore standard ChimeraX selection
 
